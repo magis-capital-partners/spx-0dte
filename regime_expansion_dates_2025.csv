@@ -1,0 +1,36 @@
+date,bucket,note
+2025-04-02,tariff_shock,pre-announcement tariff risk
+2025-04-03,tariff_shock,post Liberation Day selloff
+2025-04-04,tariff_shock,NFP plus tariff selloff
+2025-04-07,tariff_shock,continued tariff volatility
+2025-04-09,tariff_reversal,tariff pause reversal day
+2025-04-10,cpi_event,CPI after tariff volatility
+2025-05-02,nfp_event,monthly jobs report
+2025-05-07,fomc_event,FOMC decision day
+2025-05-13,cpi_event,CPI release day
+2025-05-16,quiet_grind,post-event normalization sample
+2025-06-06,nfp_event,monthly jobs report
+2025-06-11,cpi_event,CPI release day
+2025-06-18,fomc_event,FOMC decision day
+2025-06-27,quiet_grind,late-month quiet sample
+2025-07-03,nfp_event,holiday-shortened jobs report week
+2025-07-15,cpi_event,CPI release day
+2025-07-23,quiet_grind,mid-summer quiet sample
+2025-07-30,fomc_event,FOMC decision day
+2025-08-01,nfp_event,monthly jobs report
+2025-08-12,cpi_event,CPI release day
+2025-08-20,quiet_grind,mid-August quiet sample
+2025-09-05,nfp_event,monthly jobs report
+2025-09-11,cpi_event,CPI release day
+2025-09-17,fomc_event,FOMC decision day
+2025-09-24,quiet_grind,post-FOMC normalization sample
+2025-10-03,nfp_event,monthly jobs report
+2025-10-15,cpi_event,CPI release day
+2025-10-22,quiet_grind,October non-event sample
+2025-10-29,fomc_event,FOMC decision day
+2025-11-07,nfp_event,monthly jobs report
+2025-11-13,cpi_event,CPI release day
+2025-11-21,quiet_grind,pre-holiday quiet sample
+2025-12-05,nfp_event,monthly jobs report
+2025-12-10,fomc_event,FOMC decision day
+2025-12-19,quiet_grind,December expiration-period sample

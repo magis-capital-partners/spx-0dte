@@ -1,0 +1,29 @@
+# --- Secrets ---
+.env
+*.env
+**/THETADATA_API_KEY*
+secrets.*
+
+# --- data/ holds ~4GB ThetaData downloads + reproducible run outputs. ---
+# Ignore everything under data/ except the MBH return benchmark, which is the
+# one small must-keep artifact (used by the dashboard + calibration).
+data/*
+!data/mbh_returns/
+*.parquet
+*.log
+
+# Dashboard data blob IS tracked (it is the Pages deploy artifact): see
+# dashboard/data/dashboard_data.json (not under data/, so not ignored).
+
+# --- Python ---
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+
+# --- Editor/OS ---
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/

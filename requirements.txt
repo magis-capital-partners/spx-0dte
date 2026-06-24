@@ -1,0 +1,9 @@
+# Core backtest engine (simulator/, runners, summarizer, dashboard builder)
+# uses only the Python standard library -- no install needed beyond Python 3.12+.
+
+# Data pipeline: ThetaData download + feature building
+polars>=0.20
+thetadata>=0.9.1
+
+# Live execution against Interactive Brokers (live/ib_executor.py)
+ib_insync>=0.9.86
