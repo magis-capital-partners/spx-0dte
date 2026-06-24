@@ -1,0 +1,319 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>SPX 0DTE Strategy Dashboard</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.9/babel.min.js"></script>
+<style>
+  :root {
+    --bg:#0b0f17; --panel:#131a26; --panel2:#1a2434; --ink:#e6edf6; --muted:#8aa0bd;
+    --line:#243245; --green:#3fb950; --red:#f85149; --blue:#58a6ff;
+    --amber:#d29922; --violet:#bc8cff;
+  }
+  * { box-sizing:border-box; }
+  body { margin:0; background:var(--bg); color:var(--ink); font:14px/1.45 -apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif; }
+  header { padding:18px 24px; border-bottom:1px solid var(--line); display:flex; align-items:center; gap:16px; flex-wrap:wrap; }
+  header h1 { font-size:18px; margin:0; font-weight:650; }
+  .sub { color:var(--muted); font-size:12px; }
+  .tabs { display:flex; gap:4px; padding:0 24px; border-bottom:1px solid var(--line); }
+  .tab { padding:10px 16px; cursor:pointer; color:var(--muted); border-bottom:2px solid transparent; }
+  .tab.active { color:var(--ink); border-bottom-color:var(--blue); }
+  main { padding:24px; max-width:1280px; margin:0 auto; }
+  .cards { display:grid; grid-template-columns:repeat(auto-fill,minmax(170px,1fr)); gap:12px; margin-bottom:20px; }
+  .card { background:var(--panel); border:1px solid var(--line); border-radius:10px; padding:14px 16px; }
+  .card .k { color:var(--muted); font-size:11px; text-transform:uppercase; letter-spacing:.04em; }
+  .card .v { font-size:22px; font-weight:650; margin-top:6px; }
+  .panel { background:var(--panel); border:1px solid var(--line); border-radius:12px; padding:18px; margin-bottom:20px; }
+  .panel h2 { font-size:14px; margin:0 0 14px; font-weight:600; }
+  table { width:100%; border-collapse:collapse; font-size:13px; }
+  th,td { text-align:right; padding:7px 10px; border-bottom:1px solid var(--line); white-space:nowrap; }
+  th:first-child, td:first-child { text-align:left; }
+  th { color:var(--muted); font-weight:500; font-size:11px; text-transform:uppercase; cursor:pointer; }
+  tr:hover td { background:var(--panel2); }
+  .pos { color:var(--green); } .neg { color:var(--red); }
+  .pill { display:inline-block; padding:2px 8px; border-radius:99px; font-size:11px; background:var(--panel2); color:var(--muted); }
+  .pill.halt { background:rgba(248,81,73,.15); color:var(--red); }
+  select, input { background:var(--panel2); color:var(--ink); border:1px solid var(--line); border-radius:8px; padding:7px 10px; font-size:13px; }
+  .row { display:flex; gap:12px; align-items:center; flex-wrap:wrap; margin-bottom:16px; }
+  .legend { display:flex; gap:16px; flex-wrap:wrap; font-size:12px; color:var(--muted); }
+  .legend span { display:inline-flex; align-items:center; gap:6px; }
+  .swatch { width:11px; height:11px; border-radius:3px; display:inline-block; }
+  .muted { color:var(--muted); }
+  .big { font-size:26px; font-weight:680; }
+  a { color:var(--blue); }
+</style>
+</head>
+<body>
+<div id="root"></div>
+<script type="text/babel">
+const { useState, useEffect, useMemo } = React;
+const COLORS = ["#58a6ff","#3fb950","#bc8cff","#d29922","#f85149","#56d4dd"];
+const fmt$ = (n) => (n<0?"-$":"$") + Math.abs(n).toLocaleString(undefined,{maximumFractionDigits:0});
+const fmtPct = (n,d=2) => (n==null||isNaN(n)?"–":n.toFixed(d)+"%");
+const cls = (n) => n>0?"pos":n<0?"neg":"";
+
+function LineChart({series, height=320, yLabel="Cumulative P&L ($)"}) {
+  // series: [{name, color, points:[{x:dateStr, y:number}]}]
+  const pad = {l:64,r:16,t:16,b:36};
+  const W=900, H=height;
+  const all = series.flatMap(s=>s.points);
+  if(!all.length) return <div className="muted">No data.</div>;
+  const xs = [...new Set(all.map(p=>p.x))].sort();
+  const xi = Object.fromEntries(xs.map((x,i)=>[x,i]));
+  const ys = all.map(p=>p.y);
+  let ymin=Math.min(0,...ys), ymax=Math.max(0,...ys);
+  if(ymin===ymax){ymax=ymin+1;}
+  const xToPx = (x)=> pad.l + (xs.length<=1?0:(xi[x]/(xs.length-1))*(W-pad.l-pad.r));
+  const yToPx = (y)=> pad.t + (1-(y-ymin)/(ymax-ymin))*(H-pad.t-pad.b);
+  const ticks = 5;
+  const yticks = Array.from({length:ticks+1},(_,i)=>ymin+(i/ticks)*(ymax-ymin));
+  const xticks = xs.filter((_,i)=> i % Math.ceil(xs.length/8) === 0);
+  return (
+    <svg viewBox={`0 0 ${W} ${H}`} style={{width:"100%",height:H}}>
+      {yticks.map((yt,i)=>(
+        <g key={i}>
+          <line x1={pad.l} x2={W-pad.r} y1={yToPx(yt)} y2={yToPx(yt)} stroke="#243245" strokeWidth="1"/>
+          <text x={pad.l-8} y={yToPx(yt)+4} fill="#8aa0bd" fontSize="11" textAnchor="end">{fmt$(yt)}</text>
+        </g>
+      ))}
+      {xticks.map((xt,i)=>(
+        <text key={i} x={xToPx(xt)} y={H-12} fill="#8aa0bd" fontSize="10" textAnchor="middle">{xt.slice(5)}</text>
+      ))}
+      {series.map((s,si)=>{
+        const d = s.points.map((p,i)=>`${i===0?"M":"L"}${xToPx(p.x)},${yToPx(p.y)}`).join(" ");
+        return <path key={si} d={d} fill="none" stroke={s.color} strokeWidth="2"/>;
+      })}
+    </svg>
+  );
+}
+
+function BarChart({data, height=260}) {
+  // data: [{x, y}]
+  const pad={l:64,r:16,t:16,b:36}; const W=900,H=height;
+  if(!data.length) return <div className="muted">No data.</div>;
+  const ys=data.map(d=>d.y); let ymin=Math.min(0,...ys), ymax=Math.max(0,...ys);
+  if(ymin===ymax) ymax=ymin+1;
+  const bw=(W-pad.l-pad.r)/data.length*0.7;
+  const xToPx=(i)=> pad.l + (i+0.5)/data.length*(W-pad.l-pad.r);
+  const yToPx=(y)=> pad.t + (1-(y-ymin)/(ymax-ymin))*(H-pad.t-pad.b);
+  const zero=yToPx(0);
+  return (
+    <svg viewBox={`0 0 ${W} ${H}`} style={{width:"100%",height:H}}>
+      <line x1={pad.l} x2={W-pad.r} y1={zero} y2={zero} stroke="#3a4a5e"/>
+      {data.map((d,i)=>{
+        const y=yToPx(d.y);
+        return <g key={i}>
+          <rect x={xToPx(i)-bw/2} y={Math.min(y,zero)} width={bw} height={Math.abs(y-zero)} fill={d.y>=0?"#3fb950":"#f85149"} opacity="0.85"/>
+          {data.length<=24 && <text x={xToPx(i)} y={H-12} fill="#8aa0bd" fontSize="9" textAnchor="middle">{String(d.x).slice(5)}</text>}
+        </g>;
+      })}
+    </svg>
+  );
+}
+
+function Cards({summary}) {
+  if(!summary) return null;
+  const items=[
+    ["CAGR (compounded)", fmtPct(summary.cagr_pct)],
+    ["Sharpe", summary.sharpe?.toFixed(2)],
+    ["Sortino", summary.sortino?.toFixed(2)],
+    ["Max drawdown", fmtPct(summary.max_drawdown_pct)],
+    ["Worst day", fmtPct(summary.worst_day_pct_equity)],
+    ["Net P&L", fmt$(summary.net_pnl)],
+    ["Stop rate", fmtPct((summary.stop_rate||0)*100,1)],
+    ["Max margin/eq", fmtPct(summary.max_margin_pct_equity)],
+    ["Trades", summary.trades],
+    ["Halted days", summary.halted_days],
+  ];
+  return <div className="cards">{items.map((it,i)=>(
+    <div className="card" key={i}><div className="k">{it[0]}</div><div className="v">{it[1]}</div></div>
+  ))}</div>;
+}
+
+function Overview({data}) {
+  const [activeRuns,setActiveRuns]=useState(data.runs.map(r=>r.id));
+  const toggle=(id)=> setActiveRuns(a=> a.includes(id)?a.filter(x=>x!==id):[...a,id]);
+  const series = data.runs.filter(r=>activeRuns.includes(r.id)).map((r,i)=>({
+    name:r.label, color:COLORS[data.runs.indexOf(r)%COLORS.length],
+    points:r.daily.map(d=>({x:d.date,y:d.cum_pnl}))
+  }));
+  const primary = data.runs[0];
+  return (
+    <div>
+      <Cards summary={primary?.summary}/>
+      <div className="panel">
+        <h2>Cumulative P&L — backtest runs</h2>
+        <div className="legend" style={{marginBottom:10}}>
+          {data.runs.map((r,i)=>(
+            <span key={r.id} onClick={()=>toggle(r.id)} style={{cursor:"pointer",opacity:activeRuns.includes(r.id)?1:0.4}}>
+              <span className="swatch" style={{background:COLORS[i%COLORS.length]}}></span>{r.label}
+              <span className="muted"> · {fmtPct(r.summary.cagr_pct)} CAGR · Sharpe {r.summary.sharpe?.toFixed(2)}</span>
+            </span>
+          ))}
+        </div>
+        <LineChart series={series}/>
+      </div>
+      <BenchmarkPanel data={data}/>
+      <div className="panel">
+        <h2>Run comparison</h2>
+        <table>
+          <thead><tr><th>Run</th><th>CAGR</th><th>Simple ann.</th><th>Sharpe</th><th>Sortino</th><th>Max DD</th><th>Worst day</th><th>Stop rate</th><th>Max margin/eq</th><th>Trades</th></tr></thead>
+          <tbody>{data.runs.map((r,i)=>(
+            <tr key={r.id}>
+              <td><span className="swatch" style={{background:COLORS[i%COLORS.length],marginRight:6}}></span>{r.label}</td>
+              <td className={cls(r.summary.cagr_pct)}>{fmtPct(r.summary.cagr_pct)}</td>
+              <td>{fmtPct(r.summary.simple_annualized_pct)}</td>
+              <td>{r.summary.sharpe?.toFixed(2)}</td>
+              <td>{r.summary.sortino?.toFixed(2)}</td>
+              <td className="neg">{fmtPct(r.summary.max_drawdown_pct)}</td>
+              <td className="neg">{fmtPct(r.summary.worst_day_pct_equity)}</td>
+              <td>{fmtPct((r.summary.stop_rate||0)*100,1)}</td>
+              <td>{fmtPct(r.summary.max_margin_pct_equity)}</td>
+              <td>{r.summary.trades}</td>
+            </tr>
+          ))}</tbody>
+        </table>
+      </div>
+    </div>
+  );
+}
+
+function monthKeysBetween(runs){
+  const dates = runs.flatMap(r=>r.daily.map(d=>d.date)).filter(Boolean).sort();
+  if(!dates.length) return [];
+  const set=new Set(dates.map(d=>d.slice(0,7)));
+  return [...set].sort();
+}
+
+function BenchmarkPanel({data}) {
+  const mbh = data.mbh_benchmark.monthly||{};
+  const run = data.runs[0];
+  if(!run) return null;
+  // Monthly strategy return = sum daily net / equity (simple) for that month.
+  const byMonth={};
+  run.daily.forEach(d=>{ const m=(d.date||"").slice(0,7); if(!m) return; byMonth[m]=(byMonth[m]||0)+d.net_pnl; });
+  const months = monthKeysBetween(data.runs);
+  const rows = months.map(m=>{
+    const stratPct = (byMonth[m]||0)/data.account_equity*100;
+    const mbhPct = mbh[m]!=null? mbh[m]*100 : null;
+    return {m, stratPct, mbhPct};
+  });
+  return (
+    <div className="panel">
+      <h2>Monthly: {run.label} vs MBH net (benchmark)</h2>
+      <table>
+        <thead><tr><th>Month</th><th>{run.label}</th><th>MBH net</th><th>Gap</th></tr></thead>
+        <tbody>{rows.map(r=>(
+          <tr key={r.m}>
+            <td>{r.m}</td>
+            <td className={cls(r.stratPct)}>{fmtPct(r.stratPct)}</td>
+            <td className={r.mbhPct==null?"muted":cls(r.mbhPct)}>{r.mbhPct==null?"–":fmtPct(r.mbhPct)}</td>
+            <td className={r.mbhPct==null?"muted":cls(r.stratPct-r.mbhPct)}>{r.mbhPct==null?"–":fmtPct(r.stratPct-r.mbhPct)}</td>
+          </tr>
+        ))}</tbody>
+      </table>
+      <p className="sub" style={{marginTop:10}}>MBH figures are net of fees from the fund's reported monthly returns. Strategy months are simulated, pre-fee, on ${data.account_equity.toLocaleString()} equity, and only cover the validation window.</p>
+    </div>
+  );
+}
+
+function Daily({data}) {
+  const [runId,setRunId]=useState(data.runs[0]?.id);
+  const run = data.runs.find(r=>r.id===runId)||data.runs[0];
+  const [sel,setSel]=useState(null);
+  const tradingDays = run? run.daily.filter(d=>d.trades>0).map(d=>d.date):[];
+  const day = sel||tradingDays[tradingDays.length-1];
+  const dayRow = run?.daily.find(d=>d.date===day);
+  const trades = run?.trades_by_date?.[day]||[];
+  const live = data.live?.days?.[day];
+  return (
+    <div>
+      <div className="row">
+        <label className="muted">Run</label>
+        <select value={runId} onChange={e=>{setRunId(e.target.value);setSel(null);}}>
+          {data.runs.map(r=><option key={r.id} value={r.id}>{r.label}</option>)}
+        </select>
+        <label className="muted">Trading day</label>
+        <select value={day||""} onChange={e=>setSel(e.target.value)}>
+          {tradingDays.map(d=><option key={d} value={d}>{d}</option>)}
+        </select>
+      </div>
+      {dayRow && <div className="cards">
+        <div className="card"><div className="k">Net P&L</div><div className={"v "+cls(dayRow.net_pnl)}>{fmt$(dayRow.net_pnl)}</div></div>
+        <div className="card"><div className="k">Return</div><div className={"v "+cls(dayRow.return_pct)}>{fmtPct(dayRow.return_pct)}</div></div>
+        <div className="card"><div className="k">Trades</div><div className="v">{dayRow.trades}</div></div>
+        <div className="card"><div className="k">Stopped</div><div className="v">{dayRow.stopped}</div></div>
+        <div className="card"><div className="k">Credit sold</div><div className="v">{fmt$(dayRow.gross_credit_sold)}</div></div>
+        <div className="card"><div className="k">Spread margin</div><div className="v">{fmt$(dayRow.approx_spread_margin)}</div></div>
+        <div className="card"><div className="k">Halted</div><div className="v">{dayRow.halted?<span className="pill halt">Yes</span>:"No"}</div></div>
+      </div>}
+      {dayRow && <div className="panel"><span className="muted">Regime: </span>{dayRow.regime} {dayRow.event_bucket && dayRow.event_bucket!=="unlabeled" && <span className="pill" style={{marginLeft:8}}>{dayRow.event_bucket}</span>}</div>}
+      <div className="panel">
+        <h2>Backtest tranches — {day}</h2>
+        <table>
+          <thead><tr><th>Entry</th><th>Side</th><th>Sleeve</th><th>Short</th><th>Long</th><th>Contr.</th><th>Credit</th><th>Δ short</th><th>Score</th><th>Stopped</th><th>Net P&L</th></tr></thead>
+          <tbody>{trades.map((t,i)=>(
+            <tr key={i}>
+              <td>{(t.entry_time||"").slice(11,16)}</td>
+              <td>{t.side}</td>
+              <td className="muted">{(t.model||"").replace("candidate_","")}</td>
+              <td>{t.short}</td><td>{t.long}</td>
+              <td>{t.contracts.toLocaleString()}</td>
+              <td>{t.entry_credit?.toFixed(2)}</td>
+              <td>{t.short_delta?.toFixed(3)}</td>
+              <td>{t.score?.toFixed(2)}</td>
+              <td>{t.stopped?<span className="pill halt">stop</span>:""}</td>
+              <td className={cls(t.net_pnl)}>{fmt$(t.net_pnl)}</td>
+            </tr>
+          ))}</tbody>
+        </table>
+      </div>
+      <div className="panel">
+        <h2>Live fills — {day} {live?"":<span className="sub">(no live data logged for this day)</span>}</h2>
+        {live ? (
+          <table>
+            <thead><tr><th>Time</th><th>Side</th><th>Sleeve</th><th>Short</th><th>Long</th><th>Contr.</th><th>Credit</th><th>Score</th><th>Mode</th></tr></thead>
+            <tbody>{live.entries.map((e,i)=>(
+              <tr key={i}>
+                <td>{(e.ts||"").slice(11,16)}</td><td>{e.side}</td><td className="muted">{e.sleeve}</td>
+                <td>{e.short_strike}</td><td>{e.long_strike}</td><td>{(e.contracts||0).toLocaleString()}</td>
+                <td>{e.credit}</td><td>{e.score}</td><td><span className="pill">{e.dry?"dry":"live"}</span></td>
+              </tr>
+            ))}</tbody>
+          </table>
+        ) : <p className="sub">Run <code>live/ib_executor.py</code> to log live/paper fills here for backtest-vs-live comparison.</p>}
+      </div>
+    </div>
+  );
+}
+
+function App() {
+  const [data,setData]=useState(null);
+  const [tab,setTab]=useState("overview");
+  const [err,setErr]=useState(null);
+  useEffect(()=>{ fetch("data/dashboard_data.json").then(r=>{if(!r.ok)throw new Error(r.status);return r.json();}).then(setData).catch(e=>setErr(String(e))); },[]);
+  if(err) return <main><div className="panel">Could not load <code>data/dashboard_data.json</code>: {err}. Run <code>python dashboard/build_dashboard_data.py</code> first.</div></main>;
+  if(!data) return <main><div className="muted">Loading…</div></main>;
+  return (
+    <div>
+      <header>
+        <h1>SPX 0DTE Strategy Dashboard</h1>
+        <span className="sub">${data.account_equity.toLocaleString()} equity · {data.runs.length} runs · built {new Date(data.generated_at).toLocaleString()}</span>
+      </header>
+      <div className="tabs">
+        <div className={"tab"+(tab==="overview"?" active":"")} onClick={()=>setTab("overview")}>Overview</div>
+        <div className={"tab"+(tab==="daily"?" active":"")} onClick={()=>setTab("daily")}>Daily drill-down · Backtest vs Live</div>
+      </div>
+      <main>
+        {tab==="overview"? <Overview data={data}/> : <Daily data={data}/>}
+      </main>
+    </div>
+  );
+}
+ReactDOM.createRoot(document.getElementById("root")).render(<App/>);
+</script>
+</body>
+</html>
