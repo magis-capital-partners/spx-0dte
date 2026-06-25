@@ -18,8 +18,8 @@ git branch -D gh-pages 2>$null
 git subtree split --prefix dashboard -b gh-pages
 git push -f origin gh-pages
 
-Write-Host "Done. Pages will rebuild from gh-pages in ~1 minute."
-Write-Host "URL: gh api repos/magis-capital-partners/spx-0dte-strategy/pages --jq .html_url"
+Write-Host "Done. If Pages source is GitHub Actions, the workflow deploys on push to main."
+Write-Host "Check URL: gh api repos/magis-capital-partners/spx-0dte/pages --jq .html_url"
 
 # Alternative (preferred long-term): grant the workflow scope once with
 #   gh auth refresh -h github.com -s workflow
