@@ -18,6 +18,7 @@ from mbh_simulator import (
     stop_diagnostics_to_rows,
     trade_margin,
     trades_to_rows,
+    tranche_summaries_to_rows,
 )
 
 
@@ -353,6 +354,7 @@ def main() -> None:
     trade_rows: List[dict] = []
     stop_rows: List[dict] = []
     candidate_reason_rows: List[dict] = []
+    tranche_rows: List[dict] = []
 
     for index in range(args.train_count, len(dates)):
         test_date = dates[index]
@@ -379,6 +381,11 @@ def main() -> None:
         reason_counts = Counter((record.status, record.reason, record.sleeve) for record in result.candidate_records)
         for (status, reason, sleeve), count in reason_counts.items():
             candidate_reason_rows.append({"date": test_date, "status": status, "reason": reason, "sleeve": sleeve, "count": count})
+
+        day_tranche_rows = tranche_summaries_to_rows(result.tranche_summaries)
+        for row in day_tranche_rows:
+            row["date"] = test_date
+            tranche_rows.append(row)
 
         core_trades = [trade for trade in result.trades if trade.model == "candidate_core"]
         exploratory_trades = [trade for trade in result.trades if trade.model == "candidate_exploratory"]
@@ -471,9 +478,11 @@ def main() -> None:
     write_result_csv(results_dir / "trades.csv", trade_rows)
     write_result_csv(results_dir / "stop_diagnostics.csv", stop_rows)
     write_result_csv(results_dir / "candidate_reason_summary.csv", candidate_reason_rows)
+    write_result_csv(results_dir / "tranche_snapshots.csv", tranche_rows)
     print(f"wrote {results_dir / 'daily_regime_validation.csv'}")
     print(f"wrote {results_dir / 'regime_summary.csv'}")
     print(f"wrote {results_dir / 'event_summary.csv'}")
+    print(f"wrote {results_dir / 'tranche_snapshots.csv'}")
 
 
 if __name__ == "__main__":

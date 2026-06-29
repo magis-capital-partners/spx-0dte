@@ -2,10 +2,13 @@ from __future__ import annotations
 
 import csv
 import math
+from collections import Counter
 from dataclasses import dataclass, field
 from datetime import datetime, time, timedelta
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Sequence, Set, Tuple
+
+from score_model import DEFAULT_SCORE_WEIGHTS, CandidateScoreWeights
 
 
 def parse_timestamp(value: str) -> datetime:
@@ -69,6 +72,11 @@ class SignalSnapshot:
     trend_score: float = 0.0
     realized_vs_implied_z: float = 0.0
     vix: Optional[float] = None
+    minutes_to_close_norm: float = 0.0
+    overnight_gap_z: float = 0.0
+    prior_day_return_z: float = 0.0
+    abs_skew_z: float = 0.0
+    abs_term_ratio_z: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -106,6 +114,34 @@ class CandidateRecord:
     long_quote: Optional[OptionQuote] = None
     contracts: int = 0
     sleeve: str = ""
+
+
+@dataclass
+class TrancheSummary:
+    timestamp: datetime
+    halted: bool = False
+    signal_available: bool = False
+    policy_contracts: int = 0
+    straddle_residual_z: float = 0.0
+    skew_z: float = 0.0
+    term_ratio_z: float = 0.0
+    trend_score: float = 0.0
+    realized_vs_implied_z: float = 0.0
+    skip_reason: str = ""
+    best_overall_score: Optional[float] = None
+    best_pass_score: Optional[float] = None
+    best_bull_put_score: Optional[float] = None
+    best_bear_call_score: Optional[float] = None
+    top_pass_bull_score: Optional[float] = None
+    top_pass_bear_score: Optional[float] = None
+    candidates_total: int = 0
+    candidates_pass: int = 0
+    candidates_rejected: int = 0
+    candidates_gated: int = 0
+    candidates_selected: int = 0
+    candidates_executed: int = 0
+    selected_summary: str = ""
+    top_reject_reason: str = ""
 
 
 @dataclass(frozen=True)
@@ -161,6 +197,11 @@ class StrategyConfig:
     candidate_min_score: float = 2.50
     candidate_half_score: float = 2.25
     candidate_full_score: float = 2.50
+    # Daily-harvest mode: deploy a small base clip on every passing tranche and
+    # scale size linearly with score instead of binary gate-at-2.50.
+    use_harvest_mode: bool = False
+    harvest_min_score: float = 1.75
+    harvest_base_size_fraction: float = 0.08
     candidate_max_sides: int = 1
     use_two_tier_engine: bool = False
     exploratory_min_score: float = 2.25
@@ -258,6 +299,7 @@ class StrategyConfig:
     candidate_max_abs_term_ratio_z: float = 1.25
     candidate_max_abs_realized_z: float = 1.50
     candidate_distance_weight: float = 12.0
+    candidate_score_weights: Optional[CandidateScoreWeights] = None
     max_open_trades_per_side: int = 2
     max_open_trades_same_side_strike: int = 1
     stop_cooldown_minutes: int = 30
@@ -267,6 +309,7 @@ class StrategyConfig:
     memory_term_ratio_skip_threshold: float = 1.50
     memory_skew_skip_threshold: float = 99.0
     memory_trend_skip_threshold: float = 99.0
+    record_tranche_summaries: bool = True
 
 
 @dataclass
@@ -330,6 +373,7 @@ class SimulationResult:
     halt_time: Optional[datetime] = None
     messages: List[str] = field(default_factory=list)
     candidate_records: List[CandidateRecord] = field(default_factory=list)
+    tranche_summaries: List[TrancheSummary] = field(default_factory=list)
 
     @property
     def return_on_equity(self) -> float:
@@ -533,6 +577,11 @@ def read_signals_csv(path: str | Path) -> List[SignalSnapshot]:
                     trend_score=float(row.get("trend_score") or 0.0),
                     realized_vs_implied_z=float(row.get("realized_vs_implied_z") or 0.0),
                     vix=_float_or_none(row.get("vix")),
+                    minutes_to_close_norm=float(row.get("minutes_to_close_norm") or 0.0),
+                    overnight_gap_z=float(row.get("overnight_gap_z") or 0.0),
+                    prior_day_return_z=float(row.get("prior_day_return_z") or 0.0),
+                    abs_skew_z=float(row.get("abs_skew_z") or 0.0),
+                    abs_term_ratio_z=float(row.get("abs_term_ratio_z") or 0.0),
                 )
             )
     return signals
@@ -707,16 +756,18 @@ def _candidate_score(
     distance = _clamp(distance_pct * config.candidate_distance_weight, 0.0, 1.5)
     stop = _clamp(1.0 - stop_loss_to_credit / max(config.candidate_max_stop_loss_to_credit, 0.01), -1.0, 1.0)
 
+    weights = config.candidate_score_weights or DEFAULT_SCORE_WEIGHTS
     return (
-        0.45 * premium
-        + 0.25 * term
-        + 0.20 * realized
-        + 0.40 * trend
-        + 0.35 * skew
-        + 0.20 * delta
-        + 0.35 * credit
-        + 0.25 * distance
-        + 0.25 * stop
+        weights.intercept
+        + weights.premium * premium
+        + weights.term * term
+        + weights.realized * realized
+        + weights.trend * trend
+        + weights.skew * skew
+        + weights.delta * delta
+        + weights.credit * credit
+        + weights.distance * distance
+        + weights.stop * stop
     )
 
 
@@ -775,9 +826,11 @@ def build_scored_candidates(
             elif stop_loss_to_credit > config.candidate_max_stop_loss_to_credit:
                 status = "rejected"
                 reason = "poor_stop_reward"
-            elif score < _effective_candidate_min_score(config):
-                status = "rejected"
-                reason = "low_score"
+            else:
+                min_score = config.harvest_min_score if config.use_harvest_mode else _effective_candidate_min_score(config)
+                if score < min_score:
+                    status = "rejected"
+                    reason = "low_score"
 
             records.append(
                 CandidateRecord(
@@ -813,6 +866,13 @@ def build_scored_candidates(
 
 
 def _candidate_contracts(base_contracts: int, score: float, config: StrategyConfig) -> int:
+    if config.use_harvest_mode:
+        if score < config.harvest_min_score:
+            return 0
+        span = max(config.candidate_full_score - config.harvest_min_score, 0.01)
+        score_frac = min(1.0, max(0.0, (score - config.harvest_min_score) / span))
+        scale = config.harvest_base_size_fraction + (1.0 - config.harvest_base_size_fraction) * score_frac
+        return max(1, round(base_contracts * scale))
     if score >= config.candidate_full_score:
         scale = 1.0
     elif score >= config.candidate_half_score:
@@ -1443,8 +1503,10 @@ def select_candidate_entries(
     signal: SignalSnapshot,
     base_contracts: int,
     config: StrategyConfig,
+    records: Optional[List[CandidateRecord]] = None,
 ) -> Tuple[List[CandidateRecord], List[CandidateRecord]]:
-    records = build_scored_candidates(snapshot, signal, config)
+    if records is None:
+        records = build_scored_candidates(snapshot, signal, config)
     if config.use_two_tier_engine:
         return select_two_tier_candidate_entries(records, base_contracts, config)
 
@@ -1479,7 +1541,8 @@ def select_two_tier_candidate_entries(
     used_exploratory_sides = set()
 
     for record in records:
-        if record.status != "pass" or record.score < config.candidate_min_score:
+        core_min = config.harvest_min_score if config.use_harvest_mode else config.candidate_min_score
+        if record.status != "pass" or record.score < core_min:
             continue
         if record.side in used_core_sides:
             continue
@@ -1823,6 +1886,62 @@ def allocator_contract_limit(
     return min(candidate.contracts, max_by_sleeve, max_by_portfolio)
 
 
+def _top_reject_reason(records: Sequence[CandidateRecord]) -> str:
+    reject_counts = Counter(record.reason for record in records if record.status == "rejected")
+    if not reject_counts:
+        return ""
+    return reject_counts.most_common(1)[0][0]
+
+
+def _summarize_tranche_from_records(
+    timestamp: datetime,
+    halted: bool,
+    signal: Optional[SignalSnapshot],
+    policy_contracts: int,
+    records: Sequence[CandidateRecord],
+    skip_reason: str = "",
+    executed_count: Optional[int] = None,
+) -> TrancheSummary:
+    pass_records = [record for record in records if record.status == "pass"]
+    bull_scores = [record.score for record in records if record.side == "bull_put"]
+    bear_scores = [record.score for record in records if record.side == "bear_call"]
+    top_pass_bull = max((record.score for record in pass_records if record.side == "bull_put"), default=None)
+    top_pass_bear = max((record.score for record in pass_records if record.side == "bear_call"), default=None)
+    selected = [record for record in records if record.status in {"selected", "risk_blocked", "blocked"}]
+    if executed_count is None:
+        executed_count = sum(1 for record in records if record.status == "selected" and record.contracts > 0)
+
+    return TrancheSummary(
+        timestamp=timestamp,
+        halted=halted,
+        signal_available=signal is not None,
+        policy_contracts=policy_contracts,
+        straddle_residual_z=signal.straddle_residual_z if signal else 0.0,
+        skew_z=signal.skew_z if signal else 0.0,
+        term_ratio_z=signal.term_ratio_z if signal else 0.0,
+        trend_score=signal.trend_score if signal else 0.0,
+        realized_vs_implied_z=signal.realized_vs_implied_z if signal else 0.0,
+        skip_reason=skip_reason,
+        best_overall_score=max((record.score for record in records), default=None),
+        best_pass_score=max((record.score for record in pass_records), default=None),
+        best_bull_put_score=max(bull_scores, default=None),
+        best_bear_call_score=max(bear_scores, default=None),
+        top_pass_bull_score=top_pass_bull,
+        top_pass_bear_score=top_pass_bear,
+        candidates_total=len(records),
+        candidates_pass=len(pass_records),
+        candidates_rejected=sum(1 for record in records if record.status == "rejected"),
+        candidates_gated=sum(1 for record in records if record.status == "gated"),
+        candidates_selected=len(selected),
+        candidates_executed=executed_count,
+        selected_summary="|".join(
+            f"{record.side}:{record.score:.4f}:{record.sleeve or 'core'}:{record.contracts}:{record.reason}"
+            for record in selected
+        ),
+        top_reject_reason=_top_reject_reason(records),
+    )
+
+
 def simulate_day(
     quotes: Sequence[OptionQuote],
     signals: Sequence[SignalSnapshot],
@@ -1864,6 +1983,7 @@ def simulate_day(
     side_stop_cooldown_until: Dict[str, datetime] = {}
     side_stop_counts: Dict[str, int] = {}
     intraday_memory_reasons: Set[str] = set()
+    tranche_summaries: List[TrancheSummary] = []
 
     for timestamp in timestamps:
         snapshot = grouped[timestamp]
@@ -1889,16 +2009,173 @@ def simulate_day(
         signal = signals_by_ts.get(timestamp)
         update_intraday_memory(signal, config, intraday_memory_reasons)
 
-        if halted:
-            continue
         if not is_entry_time(timestamp, config):
             continue
 
-        if config.use_candidate_engine and signal is not None:
-            base_contracts = policy.contracts(signal, config)
-            if base_contracts <= 0:
+        if not config.record_tranche_summaries:
+            if halted:
                 continue
-            selected_candidates, records = select_candidate_entries(snapshot, signal, base_contracts, config)
+            if config.use_candidate_engine and signal is not None:
+                base_contracts = policy.contracts(signal, config)
+                if base_contracts <= 0:
+                    continue
+                selected_candidates, records = select_candidate_entries(snapshot, signal, base_contracts, config)
+                condor_candidates, condor_records = select_condor_entries(snapshot, signal, base_contracts, config)
+                one_dte_candidates, one_dte_records = select_one_dte_entries(snapshot, signal, base_contracts, config)
+                trend_debit_candidates, trend_debit_records = select_trend_debit_entries(snapshot, signal, base_contracts, config)
+                hedge_candidates, hedge_records = select_long_put_hedge_entries(snapshot, signal, base_contracts, config)
+                selected_candidates.extend(condor_candidates)
+                selected_candidates.extend(one_dte_candidates)
+                selected_candidates.extend(trend_debit_candidates)
+                selected_candidates.extend(hedge_candidates)
+                candidate_records.extend(records)
+                candidate_records.extend(condor_records)
+                candidate_records.extend(one_dte_records)
+                candidate_records.extend(trend_debit_records)
+                candidate_records.extend(hedge_records)
+                for candidate in selected_candidates:
+                    if candidate.short_quote is None or candidate.long_quote is None:
+                        continue
+                    block_reason = entry_risk_block_reason(
+                        candidate,
+                        trades,
+                        timestamp,
+                        config,
+                        global_stop_cooldown_until,
+                        side_stop_cooldown_until,
+                        side_stop_counts,
+                        intraday_memory_reasons,
+                    )
+                    if block_reason:
+                        candidate.status = "risk_blocked"
+                        candidate.reason = block_reason
+                        candidate.contracts = 0
+                        continue
+                    if candidate.credit > 0:
+                        remaining_credit = daily_credit_cap - gross_credit_sold
+                        max_contracts_by_credit = math.floor(remaining_credit / (candidate.credit * config.multiplier))
+                        contracts = min(candidate.contracts, max_contracts_by_credit)
+                    else:
+                        contracts = candidate.contracts
+                    candidate.contracts = contracts
+                    contracts = allocator_contract_limit(candidate, sleeve_margin_used, portfolio_margin_used, config)
+                    candidate.contracts = contracts
+                    if contracts <= 0:
+                        candidate.status = "risk_blocked"
+                        candidate.reason = "allocator_margin_budget" if config.use_portfolio_allocator else "daily_credit_cap"
+                        if config.use_portfolio_allocator:
+                            continue
+                        halted = True
+                        halt_time = timestamp
+                        messages.append(f"Daily credit cap reached at {timestamp.isoformat()}")
+                        break
+                    trade = open_trade(
+                        next_trade_id,
+                        timestamp,
+                        candidate.side,
+                        f"candidate_{candidate.sleeve or 'core'}",
+                        contracts,
+                        candidate.short_quote,
+                        candidate.long_quote,
+                        config,
+                        candidate=candidate,
+                    )
+                    if trade is None:
+                        continue
+                    trades.append(trade)
+                    next_trade_id += 1
+                    if trade.entry_credit > 0:
+                        gross_credit_sold += trade.entry_credit * trade.contracts * config.multiplier
+                    opened_margin = trade_margin(trade, config)
+                    sleeve = candidate.sleeve or "core"
+                    sleeve_margin_used[sleeve] = sleeve_margin_used.get(sleeve, 0.0) + opened_margin
+                    portfolio_margin_used += opened_margin
+                continue
+            if signal is None:
+                continue
+            for instruction in policy.instructions(signal, config):
+                if instruction.contracts <= 0:
+                    continue
+                selected = select_spread(snapshot, instruction.side, config)
+                if selected is None:
+                    messages.append(f"No eligible {instruction.side} spread at {timestamp.isoformat()}")
+                    continue
+                short_quote, long_quote = selected
+                credit = short_quote.bid - long_quote.ask
+                if credit <= 0:
+                    messages.append(f"Skipped non-positive credit spread at {timestamp.isoformat()}")
+                    continue
+                remaining_credit = daily_credit_cap - gross_credit_sold
+                max_contracts_by_credit = math.floor(remaining_credit / (credit * config.multiplier))
+                contracts = min(instruction.contracts, max_contracts_by_credit)
+                if contracts <= 0:
+                    halted = True
+                    halt_time = timestamp
+                    messages.append(f"Daily credit cap reached at {timestamp.isoformat()}")
+                    break
+                trade = open_trade(
+                    next_trade_id,
+                    timestamp,
+                    instruction.side,
+                    instruction.model,
+                    contracts,
+                    short_quote,
+                    long_quote,
+                    config,
+                )
+                if trade is None:
+                    continue
+                trades.append(trade)
+                next_trade_id += 1
+                gross_credit_sold += trade.entry_credit * trade.contracts * config.multiplier
+            continue
+
+        base_contracts = policy.contracts(signal, config) if signal is not None else 0
+        if signal is None:
+            tranche_summaries.append(
+                _summarize_tranche_from_records(
+                    timestamp,
+                    halted,
+                    signal,
+                    base_contracts,
+                    [],
+                    skip_reason="no_signal",
+                )
+            )
+            continue
+
+        if config.use_candidate_engine:
+            records = build_scored_candidates(snapshot, signal, config)
+            if halted:
+                tranche_summaries.append(
+                    _summarize_tranche_from_records(
+                        timestamp,
+                        halted,
+                        signal,
+                        base_contracts,
+                        records,
+                        skip_reason="halted",
+                    )
+                )
+                candidate_records.extend(records)
+                continue
+            if base_contracts <= 0:
+                tranche_summaries.append(
+                    _summarize_tranche_from_records(
+                        timestamp,
+                        halted,
+                        signal,
+                        base_contracts,
+                        records,
+                        skip_reason="zero_policy_contracts",
+                    )
+                )
+                candidate_records.extend(records)
+                continue
+
+            selected_candidates, records = select_candidate_entries(
+                snapshot, signal, base_contracts, config, records=records
+            )
             condor_candidates, condor_records = select_condor_entries(snapshot, signal, base_contracts, config)
             one_dte_candidates, one_dte_records = select_one_dte_entries(snapshot, signal, base_contracts, config)
             trend_debit_candidates, trend_debit_records = select_trend_debit_entries(snapshot, signal, base_contracts, config)
@@ -1912,6 +2189,8 @@ def simulate_day(
             candidate_records.extend(one_dte_records)
             candidate_records.extend(trend_debit_records)
             candidate_records.extend(hedge_records)
+
+            executed_count = 0
             for candidate in selected_candidates:
                 if candidate.short_quote is None or candidate.long_quote is None:
                     continue
@@ -1966,12 +2245,50 @@ def simulate_day(
                     continue
                 trades.append(trade)
                 next_trade_id += 1
+                executed_count += 1
                 if trade.entry_credit > 0:
                     gross_credit_sold += trade.entry_credit * trade.contracts * config.multiplier
                 opened_margin = trade_margin(trade, config)
                 sleeve = candidate.sleeve or "core"
                 sleeve_margin_used[sleeve] = sleeve_margin_used.get(sleeve, 0.0) + opened_margin
                 portfolio_margin_used += opened_margin
+
+            tranche_summaries.append(
+                _summarize_tranche_from_records(
+                    timestamp,
+                    halted,
+                    signal,
+                    base_contracts,
+                    records,
+                    skip_reason="" if executed_count else "no_trade",
+                    executed_count=executed_count,
+                )
+            )
+            continue
+
+        if halted:
+            tranche_summaries.append(
+                _summarize_tranche_from_records(
+                    timestamp,
+                    halted,
+                    signal,
+                    base_contracts,
+                    [],
+                    skip_reason="halted",
+                )
+            )
+            continue
+        if base_contracts <= 0:
+            tranche_summaries.append(
+                _summarize_tranche_from_records(
+                    timestamp,
+                    halted,
+                    signal,
+                    base_contracts,
+                    [],
+                    skip_reason="zero_policy_contracts",
+                )
+            )
             continue
 
         for instruction in policy.instructions(signal, config):
@@ -2038,6 +2355,7 @@ def simulate_day(
         halt_time=halt_time,
         messages=messages,
         candidate_records=candidate_records,
+        tranche_summaries=tranche_summaries,
     )
 
 
@@ -2110,6 +2428,40 @@ def candidate_records_to_rows(records: Sequence[CandidateRecord]) -> List[Dict[s
                 "term_ratio_z": round(record.term_ratio_z, 6),
                 "trend_score": round(record.trend_score, 6),
                 "realized_vs_implied_z": round(record.realized_vs_implied_z, 6),
+            }
+        )
+    return rows
+
+
+def tranche_summaries_to_rows(summaries: Sequence[TrancheSummary]) -> List[Dict[str, object]]:
+    rows: List[Dict[str, object]] = []
+    for summary in summaries:
+        rows.append(
+            {
+                "timestamp": summary.timestamp.isoformat(),
+                "halted": summary.halted,
+                "signal_available": summary.signal_available,
+                "policy_contracts": summary.policy_contracts,
+                "straddle_residual_z": round(summary.straddle_residual_z, 6),
+                "skew_z": round(summary.skew_z, 6),
+                "term_ratio_z": round(summary.term_ratio_z, 6),
+                "trend_score": round(summary.trend_score, 6),
+                "realized_vs_implied_z": round(summary.realized_vs_implied_z, 6),
+                "skip_reason": summary.skip_reason,
+                "best_overall_score": round(summary.best_overall_score, 6) if summary.best_overall_score is not None else "",
+                "best_pass_score": round(summary.best_pass_score, 6) if summary.best_pass_score is not None else "",
+                "best_bull_put_score": round(summary.best_bull_put_score, 6) if summary.best_bull_put_score is not None else "",
+                "best_bear_call_score": round(summary.best_bear_call_score, 6) if summary.best_bear_call_score is not None else "",
+                "top_pass_bull_score": round(summary.top_pass_bull_score, 6) if summary.top_pass_bull_score is not None else "",
+                "top_pass_bear_score": round(summary.top_pass_bear_score, 6) if summary.top_pass_bear_score is not None else "",
+                "candidates_total": summary.candidates_total,
+                "candidates_pass": summary.candidates_pass,
+                "candidates_rejected": summary.candidates_rejected,
+                "candidates_gated": summary.candidates_gated,
+                "candidates_selected": summary.candidates_selected,
+                "candidates_executed": summary.candidates_executed,
+                "selected_summary": summary.selected_summary,
+                "top_reject_reason": summary.top_reject_reason,
             }
         )
     return rows
