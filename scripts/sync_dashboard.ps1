@@ -25,10 +25,10 @@ if (-not (Test-Path $DashboardRoot)) {
 
 Write-Host "Building dashboard data..."
 python "$Root\dashboard\build_dashboard_data.py" `
-  --run "baseline=data/baseline_repro:Baseline (prior best, no governor)" `
-  --run "flatten=data/exp1_flatten:1x + flatten governor" `
-  --run "best=data/exp2_scale2x:2x deploy + flatten" `
-  --run "aggressive=data/exp6_2p5x_deepflat:2.5x + deep flatten" `
+  --run "baseline=data/profile_baseline:Baseline (prior best, no governor)" `
+  --run "flatten=data/profile_flatten:1x + flatten governor" `
+  --run "best=data/profile_best:2x deploy + flatten" `
+  --run "aggressive=data/profile_aggressive:2.5x + deep flatten (aggressive)" `
   --account-equity $Equity `
   --out "$Root\dashboard\data\dashboard_data.json"
 
