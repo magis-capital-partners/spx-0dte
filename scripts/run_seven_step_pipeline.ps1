@@ -36,9 +36,9 @@ $Python = "C:\Users\drewg\AppData\Local\Programs\Python\Python312\python.exe"
 if (-not (Test-Path $Python)) { $Python = "python" }
 
 function Invoke-Py {
-    param([string[]]$Args)
-    & $Python @Args
-    if ($LASTEXITCODE -ne 0) { throw "Command failed: python $($Args -join ' ')" }
+    param([Parameter(ValueFromRemainingArguments = $true)][string[]]$PyArgs)
+    & $Python @PyArgs
+    if ($LASTEXITCODE -ne 0) { throw "Command failed: python $($PyArgs -join ' ')" }
 }
 
 if (-not $SkipDownload -and -not $env:THETADATA_API_KEY) {
