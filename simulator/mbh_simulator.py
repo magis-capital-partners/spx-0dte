@@ -310,6 +310,21 @@ class StrategyConfig:
     memory_skew_skip_threshold: float = 99.0
     memory_trend_skip_threshold: float = 99.0
     record_tranche_summaries: bool = True
+    use_short_leg_stops: bool = True
+    # Side-specific fixed wing widths (0 = use wing_width / target_delta defaults).
+    put_wing_width: float = 0.0
+    call_wing_width: float = 0.0
+    # Net-long overlay: buy extra long wings beyond the spread protective leg.
+    use_net_long_overlay: bool = False
+    put_long_overlay_ratio: float = 1.0
+    call_long_overlay_ratio: float = 1.0
+    overlay_wing_extra_width: float = 50.0
+    # Stop calibration modes (Test 3B+).
+    stop_mode: str = "short_ask"  # short_ask | short_mid | spread_value
+    stop_fill_slippage: float = 0.0
+    stop_confirmation_count: int = 1
+    spread_stop_loss_multiple: float = 1.5
+    block_same_strike_after_stop: bool = False
 
 
 @dataclass
@@ -345,6 +360,8 @@ class Trade:
     stopped: bool = False
     stop_time: Optional[datetime] = None
     stop_fill: Optional[float] = None
+    long_stop_exit: Optional[float] = None
+    stop_confirm_count: int = 0
     exit_reason: str = "open"
     closed_early: bool = False
     close_fee_legs: int = 0
@@ -354,6 +371,8 @@ class Trade:
 
     @property
     def open_fee_legs(self) -> int:
+        if self.side in ("long_put_overlay", "long_call_overlay"):
+            return 1
         return 2
 
     @property
@@ -642,10 +661,21 @@ def select_spread(
 
     candidates.sort(key=lambda item: item[0])
     for _, short_quote in candidates:
-        long_quote = select_long_wing(trading_snapshot, short_quote, long_direction, config)
+        long_quote = select_long_wing(trading_snapshot, short_quote, long_direction, config, side=side)
         if long_quote is not None:
             return short_quote, long_quote
     return None
+
+
+def _wing_params_for_side(side: str, config: StrategyConfig) -> tuple[float, float, float, str]:
+    """Return (target_width, min_width, max_width, selection_mode) for a spread side."""
+    if side == "bull_put" and config.put_wing_width > 0:
+        width = config.put_wing_width
+        return width, max(25.0, width - 25.0), width + 50.0, "fixed_width"
+    if side == "bear_call" and config.call_wing_width > 0:
+        width = config.call_wing_width
+        return width, max(25.0, width - 15.0), width + 25.0, "fixed_width"
+    return config.wing_width, config.min_wing_width, config.max_wing_width, config.wing_selection_mode
 
 
 def select_long_wing(
@@ -653,7 +683,9 @@ def select_long_wing(
     short_quote: OptionQuote,
     long_direction: int,
     config: StrategyConfig,
+    side: str = "",
 ) -> Optional[OptionQuote]:
+    target_width, min_width, max_width, selection_mode = _wing_params_for_side(side, config)
     same_expiry_type = [
         quote
         for quote in snapshot
@@ -662,23 +694,23 @@ def select_long_wing(
     wings = []
     for quote in same_expiry_type:
         distance = (quote.strike - short_quote.strike) * long_direction
-        if distance < config.min_wing_width or distance > config.max_wing_width:
+        if distance < min_width or distance > max_width:
             continue
         wings.append((distance, quote))
 
     if not wings:
         return None
 
-    if config.wing_selection_mode == "fixed_width":
-        return min(wings, key=lambda item: abs(item[0] - config.wing_width))[1]
+    if selection_mode == "fixed_width":
+        return min(wings, key=lambda item: abs(item[0] - target_width))[1]
 
-    if config.wing_selection_mode == "target_delta":
+    if selection_mode == "target_delta":
         with_delta = [(abs(abs(quote.delta or 0.0) - config.target_long_abs_delta), distance, quote) for distance, quote in wings if quote.delta is not None]
         if with_delta:
             with_delta.sort(key=lambda item: (item[0], item[1]))
             return with_delta[0][2]
 
-    return min(wings, key=lambda item: abs(item[0] - config.wing_width))[1]
+    return min(wings, key=lambda item: abs(item[0] - target_width))[1]
 
 
 def _clamp(value: float, low: float, high: float) -> float:
@@ -798,7 +830,7 @@ def build_scored_candidates(
             abs_delta = abs(short_quote.delta)
             if not (config.min_abs_delta <= abs_delta <= config.max_abs_delta):
                 continue
-            long_quote = select_long_wing(trading_snapshot, short_quote, long_direction, config)
+            long_quote = select_long_wing(trading_snapshot, short_quote, long_direction, config, side=side)
             if long_quote is None:
                 continue
 
@@ -1098,7 +1130,7 @@ def _select_condor_leg(
         abs_delta = abs(short_quote.delta)
         if not (config.condor_min_abs_delta <= abs_delta <= config.condor_max_abs_delta):
             continue
-        long_quote = select_long_wing(trading_snapshot, short_quote, long_direction, config)
+        long_quote = select_long_wing(trading_snapshot, short_quote, long_direction, config, side=side)
         if long_quote is None:
             continue
         width = abs(long_quote.strike - short_quote.strike)
@@ -1184,7 +1216,7 @@ def _select_one_dte_leg(
         abs_delta = abs(short_quote.delta)
         if not (config.one_dte_min_abs_delta <= abs_delta <= config.one_dte_max_abs_delta):
             continue
-        long_quote = select_long_wing(trading_snapshot, short_quote, long_direction, config)
+        long_quote = select_long_wing(trading_snapshot, short_quote, long_direction, config, side=side)
         if long_quote is None:
             continue
         width = abs(long_quote.strike - short_quote.strike)
@@ -1587,6 +1619,98 @@ def select_two_tier_candidate_entries(
     return selected, records
 
 
+def _overlay_ratio_for_side(side: str, config: StrategyConfig) -> float:
+    if side == "bull_put":
+        return config.put_long_overlay_ratio
+    if side == "bear_call":
+        return config.call_long_overlay_ratio
+    return 1.0
+
+
+def open_net_long_overlay(
+    parent_trade: Trade,
+    snapshot: Sequence[OptionQuote],
+    config: StrategyConfig,
+    trade_id: int,
+    timestamp: datetime,
+) -> Optional[Trade]:
+    if not config.use_net_long_overlay:
+        return None
+    ratio = _overlay_ratio_for_side(parent_trade.side, config)
+    if ratio <= 1.0:
+        return None
+    extra_contracts = max(1, round(parent_trade.contracts * (ratio - 1.0)))
+    option_type = parent_trade.long_type
+    if parent_trade.side == "bull_put":
+        target_strike = parent_trade.long_strike - config.overlay_wing_extra_width
+        overlay_side = "long_put_overlay"
+        same_type = [
+            quote
+            for quote in snapshot
+            if quote.expiry == parent_trade.expiry and normalize_option_type(quote.option_type) == option_type and quote.strike <= target_strike + 5
+        ]
+        if not same_type:
+            return None
+        long_quote = max(same_type, key=lambda quote: quote.strike)
+    else:
+        target_strike = parent_trade.long_strike + config.overlay_wing_extra_width
+        overlay_side = "long_call_overlay"
+        same_type = [
+            quote
+            for quote in snapshot
+            if quote.expiry == parent_trade.expiry and normalize_option_type(quote.option_type) == option_type and quote.strike >= target_strike - 5
+        ]
+        if not same_type:
+            return None
+        long_quote = min(same_type, key=lambda quote: quote.strike)
+
+    long_buy = long_quote.ask
+    if long_buy <= 0:
+        return None
+
+    return Trade(
+        trade_id=trade_id,
+        entry_time=timestamp,
+        expiry=parent_trade.expiry,
+        side=overlay_side,
+        model="net_long_overlay",
+        contracts=extra_contracts,
+        short_type=option_type,
+        short_strike=0.0,
+        long_type=option_type,
+        long_strike=long_quote.strike,
+        short_entry_sell=0.0,
+        long_entry_buy=long_buy,
+        entry_credit=-long_buy,
+        stop_price=0.0,
+        entry_spot=parent_trade.entry_spot,
+        short_delta=0.0,
+        long_delta=long_quote.delta,
+        spread_width=0.0,
+        candidate_reason="net_long_overlay",
+    )
+
+
+def register_opened_trade(
+    trades: List[Trade],
+    next_trade_id: int,
+    timestamp: datetime,
+    snapshot: Sequence[OptionQuote],
+    config: StrategyConfig,
+    trade: Optional[Trade],
+) -> int:
+    if trade is None:
+        return next_trade_id
+    trades.append(trade)
+    next_trade_id += 1
+    if config.use_net_long_overlay and trade.entry_credit > 0:
+        overlay = open_net_long_overlay(trade, snapshot, config, next_trade_id, timestamp)
+        if overlay is not None:
+            trades.append(overlay)
+            next_trade_id += 1
+    return next_trade_id
+
+
 def open_trade(
     trade_id: int,
     timestamp: datetime,
@@ -1687,8 +1811,14 @@ def mark_trade(trade: Trade, snapshot: Sequence[OptionQuote], config: StrategyCo
     long_quote = lookup.get((trade.expiry, trade.long_type, trade.long_strike))
     long_mark = long_quote.bid if long_quote else _intrinsic(trade.long_type, trade.long_strike, spot)
 
+    if trade.side in ("long_put_overlay", "long_call_overlay"):
+        per_contract = long_mark - trade.long_entry_buy
+        return per_contract * trade.contracts * config.multiplier
+
     if trade.stopped:
         stop_fill = trade.stop_fill or 0.0
+        if trade.long_stop_exit is not None:
+            long_mark = trade.long_stop_exit
         per_contract = trade.short_entry_sell - stop_fill - trade.long_entry_buy + long_mark
     else:
         short_quote = lookup.get((trade.expiry, trade.short_type, trade.short_strike))
@@ -1710,24 +1840,53 @@ def process_stops(
     trades: Sequence[Trade],
     timestamp: datetime,
     snapshot: Sequence[OptionQuote],
+    config: StrategyConfig,
 ) -> List[Trade]:
+    if not config.use_short_leg_stops:
+        return []
     lookup = quote_lookup_by_expiry(snapshot)
     spot = snapshot_spot(snapshot)
     newly_stopped: List[Trade] = []
     for trade in trades:
         if trade.stopped or trade.exit_reason != "open":
             continue
+        if trade.side in ("long_put_overlay", "long_call_overlay"):
+            continue
         if trade.entry_credit < 0:
             continue
         short_quote = lookup.get((trade.expiry, trade.short_type, trade.short_strike))
         if short_quote is None:
             continue
-        if short_quote.ask >= trade.stop_price:
-            trade.stopped = True
-            trade.stop_time = timestamp
-            trade.stop_fill = short_quote.ask
-            trade.stop_spot = spot
-            newly_stopped.append(trade)
+        long_quote = lookup.get((trade.expiry, trade.long_type, trade.long_strike))
+
+        triggered = False
+        if config.stop_mode == "spread_value" and long_quote is not None:
+            close_debit = short_quote.ask - long_quote.bid
+            loss = close_debit - trade.entry_credit
+            triggered = loss >= config.spread_stop_loss_multiple * max(trade.entry_credit, 0.01)
+        elif config.stop_mode == "short_mid":
+            mid = (short_quote.bid + short_quote.ask) / 2.0
+            triggered = mid >= trade.stop_price
+        else:
+            triggered = short_quote.ask >= trade.stop_price
+
+        if triggered:
+            trade.stop_confirm_count += 1
+        else:
+            trade.stop_confirm_count = 0
+
+        if trade.stop_confirm_count < config.stop_confirmation_count:
+            continue
+
+        trade.stopped = True
+        trade.stop_time = timestamp
+        trade.stop_spot = spot
+        if config.stop_mode == "spread_value" and long_quote is not None:
+            trade.stop_fill = short_quote.ask + config.stop_fill_slippage
+            trade.long_stop_exit = long_quote.bid
+        else:
+            trade.stop_fill = short_quote.ask + config.stop_fill_slippage
+        newly_stopped.append(trade)
     return newly_stopped
 
 
@@ -1749,10 +1908,21 @@ def settle_trade(
         return
     is_expiring_today = trade.expiry == trade.entry_time.date().isoformat()
     quote_lookup = quote_lookup_by_expiry(close_snapshot)
-    short_close = quote_lookup.get((trade.expiry, trade.short_type, trade.short_strike))
     long_close = quote_lookup.get((trade.expiry, trade.long_type, trade.long_strike))
-    short_exit = _intrinsic(trade.short_type, trade.short_strike, close_spot)
     long_exit = _intrinsic(trade.long_type, trade.long_strike, close_spot)
+
+    if trade.side in ("long_put_overlay", "long_call_overlay"):
+        if not is_expiring_today and long_close is not None:
+            long_exit = long_close.bid
+        per_contract = long_exit - trade.long_entry_buy
+        trade.exit_reason = "overlay_long_settled" if is_expiring_today else "overlay_long_marked"
+        trade.gross_pnl = per_contract * trade.contracts * config.multiplier
+        trade.fees = trade.open_fee_legs * trade.contracts * config.fee_per_contract
+        trade.net_pnl = trade.gross_pnl - trade.fees
+        return
+
+    short_close = quote_lookup.get((trade.expiry, trade.short_type, trade.short_strike))
+    short_exit = _intrinsic(trade.short_type, trade.short_strike, close_spot)
     if not is_expiring_today:
         if short_close is not None:
             short_exit = short_close.ask
@@ -1761,8 +1931,12 @@ def settle_trade(
 
     if trade.stopped:
         stop_fill = trade.stop_fill if trade.stop_fill is not None else trade.stop_price
+        if trade.long_stop_exit is not None:
+            long_exit = trade.long_stop_exit
+            trade.exit_reason = "spread_value_stop"
+        else:
+            trade.exit_reason = "short_stopped_long_settled" if is_expiring_today else "short_stopped_long_marked"
         per_contract = trade.short_entry_sell - stop_fill - trade.long_entry_buy + long_exit
-        trade.exit_reason = "short_stopped_long_settled" if is_expiring_today else "short_stopped_long_marked"
     else:
         per_contract = trade.short_entry_sell - short_exit - trade.long_entry_buy + long_exit
         trade.exit_reason = "settled_at_close" if is_expiring_today else "marked_at_close"
@@ -1810,6 +1984,15 @@ def entry_risk_block_reason(
     ]
     if len(same_strike) >= config.max_open_trades_same_side_strike:
         return "same_strike_concentration_limit"
+    if config.block_same_strike_after_stop:
+        for trade in trades:
+            if (
+                trade.stopped
+                and trade.side == candidate.side
+                and trade.short_type == candidate.short_type
+                and trade.short_strike == candidate.short_strike
+            ):
+                return "same_strike_after_stop"
     if candidate.sleeve == "exploratory":
         if timestamp.time() > config.exploratory_entry_end and candidate.score < config.candidate_min_score:
             return "exploratory_late_low_score"
@@ -1987,7 +2170,7 @@ def simulate_day(
 
     for timestamp in timestamps:
         snapshot = grouped[timestamp]
-        newly_stopped = process_stops(trades, timestamp, snapshot)
+        newly_stopped = process_stops(trades, timestamp, snapshot, config)
         for stopped_trade in newly_stopped:
             side_stop_counts[stopped_trade.side] = side_stop_counts.get(stopped_trade.side, 0) + 1
             if config.stop_cooldown_minutes > 0:
@@ -2082,8 +2265,9 @@ def simulate_day(
                     )
                     if trade is None:
                         continue
-                    trades.append(trade)
-                    next_trade_id += 1
+                    next_trade_id = register_opened_trade(
+                        trades, next_trade_id, timestamp, snapshot, config, trade
+                    )
                     if trade.entry_credit > 0:
                         gross_credit_sold += trade.entry_credit * trade.contracts * config.multiplier
                     opened_margin = trade_margin(trade, config)
@@ -2243,8 +2427,9 @@ def simulate_day(
                 )
                 if trade is None:
                     continue
-                trades.append(trade)
-                next_trade_id += 1
+                next_trade_id = register_opened_trade(
+                    trades, next_trade_id, timestamp, snapshot, config, trade
+                )
                 executed_count += 1
                 if trade.entry_credit > 0:
                     gross_credit_sold += trade.entry_credit * trade.contracts * config.multiplier

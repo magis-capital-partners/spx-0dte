@@ -114,36 +114,102 @@ function BarChart({data, height=260}) {
   );
 }
 
-function Cards({summary}) {
+function Cards({summary, extra=[]}) {
   if(!summary) return null;
   const items=[
     ["CAGR (compounded)", fmtPct(summary.cagr_pct)],
     ["Sharpe", summary.sharpe?.toFixed(2)],
     ["Sortino", summary.sortino?.toFixed(2)],
+    ["Calmar", summary.calmar?.toFixed(2)],
     ["Max drawdown", fmtPct(summary.max_drawdown_pct)],
+    ["Ann. vol (daily)", fmtPct(summary.ann_vol_pct)],
     ["Worst day", fmtPct(summary.worst_day_pct_equity)],
+    ["Best day", fmtPct(summary.best_day_pct_equity)],
     ["Net P&L", fmt$(summary.net_pnl)],
+    ["Spread win %", summary.spread_win_rate!=null? fmtPct(summary.spread_win_rate*100,1):"–"],
     ["Stop rate", fmtPct((summary.stop_rate||0)*100,1)],
+    ["Avg credit/day", fmtPct(summary.avg_daily_credit_pct_equity)+" eq"],
     ["Max margin/eq", fmtPct(summary.max_margin_pct_equity)],
     ["Trades", summary.trades],
     ["Halted days", summary.halted_days],
+    ...extra,
   ];
   return <div className="cards">{items.map((it,i)=>(
     <div className="card" key={i}><div className="k">{it[0]}</div><div className="v">{it[1]}</div></div>
   ))}</div>;
 }
 
+function RunMeta({run}) {
+  if(!run?.meta?.description) return null;
+  return (
+    <div className="panel">
+      <h2>{run.label}</h2>
+      <p style={{margin:"0 0 8px"}}>{run.meta.description}</p>
+      {run.meta.note && <p className="sub" style={{margin:0}}>{run.meta.note}</p>}
+    </div>
+  );
+}
+
+function VolPanel({run, targets}) {
+  if(!run) return null;
+  const s = run.summary;
+  const dailyRet = run.daily.map(d=>d.return_pct);
+  const pos = dailyRet.filter(x=>x>0);
+  const neg = dailyRet.filter(x=>x<0);
+  const rows = [
+    ["Mean daily return", fmtPct(s.daily_return_mean_pct, 3)],
+    ["Daily return σ", fmtPct(s.daily_return_std_pct, 3)],
+    ["Annualized vol", fmtPct(s.ann_vol_pct)],
+    ["Downside ann. vol", fmtPct(s.ann_downside_vol_pct)],
+    ["Profit factor (days)", s.profit_factor?.toFixed(2)],
+    ["Day win rate", fmtPct(s.win_rate_days*100,1)],
+    ["Positive days", pos.length],
+    ["Negative days", neg.length],
+    ["Avg |up| day", pos.length? fmtPct(pos.reduce((a,b)=>a+b,0)/pos.length, 3):"–"],
+    ["Avg |down| day", neg.length? fmtPct(Math.abs(neg.reduce((a,b)=>a+b,0)/neg.length), 3):"–"],
+  ];
+  const t = targets||{};
+  return (
+    <div className="panel">
+      <h2>Volatility & return distribution — {run.label}</h2>
+      <table>
+        <thead><tr><th>Metric</th><th>Backtest</th><th>MBH target</th></tr></thead>
+        <tbody>
+          {rows.map(([k,v])=> <tr key={k}><td>{k}</td><td>{v}</td><td className="muted">–</td></tr>)}
+          <tr><td>CAGR</td><td className={cls(s.cagr_pct)}>{fmtPct(s.cagr_pct)}</td><td className="muted">{t.cagr_pct? `${t.cagr_pct[0]}–${t.cagr_pct[1]}%`:"30–40%"}</td></tr>
+          <tr><td>Sharpe</td><td>{s.sharpe?.toFixed(2)}</td><td className="muted">~{t.sharpe||2.5}</td></tr>
+          <tr><td>Max drawdown</td><td className="neg">{fmtPct(s.max_drawdown_pct)}</td><td className="muted">–</td></tr>
+          <tr><td>Worst day</td><td className="neg">{fmtPct(s.worst_day_pct_equity)}</td><td className="muted">~{t.worst_day_pct? `${t.worst_day_pct[1]}%`:"-4 to -5%"}</td></tr>
+          <tr><td>Avg credit/day</td><td>{fmtPct(s.avg_daily_credit_pct_equity)}</td><td className="muted">~{t.daily_credit_pct||1.5}%</td></tr>
+        </tbody>
+      </table>
+    </div>
+  );
+}
+
 function Overview({data}) {
+  const primaryId = data.primary_run_id || data.runs[0]?.id;
+  const [focusId,setFocusId] = useState(primaryId);
   const [activeRuns,setActiveRuns]=useState(data.runs.map(r=>r.id));
   const toggle=(id)=> setActiveRuns(a=> a.includes(id)?a.filter(x=>x!==id):[...a,id]);
+  const focus = data.runs.find(r=>r.id===focusId) || data.runs[0];
   const series = data.runs.filter(r=>activeRuns.includes(r.id)).map((r,i)=>({
     name:r.label, color:COLORS[data.runs.indexOf(r)%COLORS.length],
     points:r.daily.map(d=>({x:d.date,y:d.cum_pnl}))
   }));
-  const primary = data.runs[0];
+  const equitySeries = focus ? [{name:"Equity", color:COLORS[0], points:focus.daily.map(d=>({x:d.date,y:d.equity}))}] : [];
+  const ddSeries = focus ? [{name:"Drawdown", color:"#f85149", points:focus.daily.map(d=>({x:d.date,y:-(d.drawdown_pct||0)/100*data.account_equity}))}] : [];
+  const dailyBars = focus ? focus.daily.map(d=>({x:d.date, y:d.net_pnl})) : [];
   return (
     <div>
-      <Cards summary={primary?.summary}/>
+      <div className="row">
+        <label className="muted">Primary run</label>
+        <select value={focusId} onChange={e=>setFocusId(e.target.value)}>
+          {data.runs.map(r=><option key={r.id} value={r.id}>{r.label}</option>)}
+        </select>
+      </div>
+      <RunMeta run={focus}/>
+      <Cards summary={focus?.summary}/>
       <div className="panel">
         <h2>Cumulative P&L — backtest runs</h2>
         <div className="legend" style={{marginBottom:10}}>
@@ -156,11 +222,24 @@ function Overview({data}) {
         </div>
         <LineChart series={series}/>
       </div>
-      <BenchmarkPanel data={data}/>
+      <div className="panel">
+        <h2>Equity curve — {focus?.label}</h2>
+        <LineChart series={equitySeries} yLabel="Equity ($)"/>
+      </div>
+      <div className="panel">
+        <h2>Drawdown ($ underwater from peak) — {focus?.label}</h2>
+        <LineChart series={ddSeries} height={240} yLabel="Drawdown ($)"/>
+      </div>
+      <div className="panel">
+        <h2>Daily P&L — {focus?.label}</h2>
+        <BarChart data={dailyBars}/>
+      </div>
+      <VolPanel run={focus} targets={data.mbh_targets}/>
+      <BenchmarkPanel data={{...data, runs:[focus].filter(Boolean)}}/>
       <div className="panel">
         <h2>Run comparison</h2>
         <table>
-          <thead><tr><th>Run</th><th>CAGR</th><th>Simple ann.</th><th>Sharpe</th><th>Sortino</th><th>Max DD</th><th>Worst day</th><th>Stop rate</th><th>Max margin/eq</th><th>Trades</th></tr></thead>
+          <thead><tr><th>Run</th><th>CAGR</th><th>Simple ann.</th><th>Sharpe</th><th>Sortino</th><th>Max DD</th><th>Worst day</th><th>Stop rate</th><th>Max margin/eq</th><th>Ann vol</th><th>Calmar</th><th>Trades</th></tr></thead>
           <tbody>{data.runs.map((r,i)=>(
             <tr key={r.id}>
               <td><span className="swatch" style={{background:COLORS[i%COLORS.length],marginRight:6}}></span>{r.label}</td>
@@ -172,6 +251,8 @@ function Overview({data}) {
               <td className="neg">{fmtPct(r.summary.worst_day_pct_equity)}</td>
               <td>{fmtPct((r.summary.stop_rate||0)*100,1)}</td>
               <td>{fmtPct(r.summary.max_margin_pct_equity)}</td>
+              <td>{fmtPct(r.summary.ann_vol_pct)}</td>
+              <td>{r.summary.calmar?.toFixed(2)}</td>
               <td>{r.summary.trades}</td>
             </tr>
           ))}</tbody>

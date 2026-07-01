@@ -28,10 +28,8 @@ if (-not (Test-Path $Python)) { $Python = "python" }
 
 Write-Host "Building dashboard data..."
 & $Python "$Root\dashboard\build_dashboard_data.py" `
-  --run "best=data/profile_best:2x deploy + flatten (recommended)" `
-  --run "flatten=data/profile_flatten:1x + flatten governor" `
-  --run "baseline=data/profile_baseline:Baseline (prior best, no governor)" `
-  --run "aggressive=data/profile_aggressive:2.5x + deep flatten (aggressive)" `
+  --run "3d_flatten=data/dashboard_runs/3d_flatten_3_5:3D flatten -3.5% (calibrated winner)" `
+  --run "test1=data/unconditional_baseline:Test 1 — unconditional baseline (2x stop)" `
   --account-equity $Equity `
   --out "$Root\dashboard\data\dashboard_data.json"
 

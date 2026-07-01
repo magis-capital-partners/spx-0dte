@@ -1,31 +1,31 @@
 """Build the SPX 0DTE dashboard data blob from backtest runs + MBH benchmark + live fills.
 
 Outputs dashboard/data/dashboard_data.json, consumed by the static index.html
-(React SPA, served via GitHub Pages). Mirrors the etf-dashboard pattern: a
-Python builder writes one JSON, the front-end renders it with no server.
+(React SPA, served via GitHub Pages).
 
 Usage:
-  python dashboard/build_dashboard_data.py \
-    --run best_2p5x=data/exp5_2p5x:"2.5x + flatten" \
-    --run flatten=data/exp1_flatten:"1x + flatten" \
-    --run baseline=data/baseline_repro:"Baseline (prior best)"
+  python dashboard/build_dashboard_data.py \\
+    --run 3d_flatten=data/dashboard_runs/3d_flatten_3_5:"3D flatten -3.5% (calibrated)" \\
+    --run test1=data/unconditional_baseline:"Test 1 unconditional baseline"
 """
 from __future__ import annotations
 
 import argparse
 import csv
 import json
+import math
 import sys
-from datetime import datetime, date
+from datetime import datetime
 from pathlib import Path
-from typing import Dict, List, Optional
+from statistics import mean, pstdev
+from typing import Dict, List, Optional, Tuple
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "simulator"))
-from summarize_run import summarize  # noqa: E402
 
 MONTHS = ["January", "February", "March", "April", "May", "June",
           "July", "August", "September", "October", "November", "December"]
+TRADING_DAYS = 252
 
 
 def safe_float(value: object, default: float = 0.0) -> float:
@@ -37,6 +37,15 @@ def safe_float(value: object, default: float = 0.0) -> float:
         return default
 
 
+def safe_int(value: object, default: int = 0) -> int:
+    try:
+        if value in {"", None}:
+            return default
+        return int(float(value))
+    except (TypeError, ValueError):
+        return default
+
+
 def read_rows(path: Path) -> List[dict]:
     if not path.exists() or path.stat().st_size == 0:
         return []
@@ -44,8 +53,142 @@ def read_rows(path: Path) -> List[dict]:
         return list(csv.DictReader(handle))
 
 
+def find_daily_csv(results_dir: Path) -> Optional[Path]:
+    for name in ("daily_regime_validation.csv", "daily_summary.csv"):
+        path = results_dir / name
+        if path.exists() and path.stat().st_size > 0:
+            return path
+    return None
+
+
+def credit_and_margin_by_date(trades: List[dict]) -> Tuple[Dict[str, float], Dict[str, float]]:
+    credit: Dict[str, float] = {}
+    margin: Dict[str, float] = {}
+    for t in trades:
+        if t.get("model") == "net_long_overlay":
+            continue
+        d = t.get("date") or (t.get("entry_time") or "")[:10]
+        if not d:
+            continue
+        c = safe_float(t.get("entry_credit")) * safe_int(t.get("contracts")) * 100
+        credit[d] = credit.get(d, 0.0) + c
+        width = safe_float(t.get("spread_width"))
+        entry = safe_float(t.get("entry_credit"))
+        m = max(width - entry, 0.0) * safe_int(t.get("contracts")) * 100
+        margin[d] = margin.get(d, 0.0) + m
+    return credit, margin
+
+
+def summarize_daily(
+    rows: List[dict],
+    account_equity: float,
+    credit_by_date: Dict[str, float],
+    margin_by_date: Dict[str, float],
+    compound: bool = True,
+) -> dict:
+    days = len(rows)
+    if days == 0:
+        return {"days": 0}
+
+    trades = sum(safe_int(r.get("trades")) for r in rows)
+    stops = sum(safe_int(r.get("stopped_trades")) for r in rows)
+    pnl = sum(safe_float(r.get("net_pnl")) for r in rows)
+    credit = sum(credit_by_date.get(r.get("date", ""), safe_float(r.get("gross_credit_sold"))) for r in rows)
+    margins = [margin_by_date.get(r.get("date", ""), safe_float(r.get("approx_spread_margin"))) for r in rows]
+    max_margin = max(margins, default=0.0)
+    avg_margin = mean(margins) if margins else 0.0
+
+    daily_returns: List[float] = []
+    equity = account_equity
+    peak = account_equity
+    max_drawdown = 0.0
+    worst_day_pnl = 0.0
+    for row in rows:
+        day_pnl = safe_float(row.get("net_pnl"))
+        worst_day_pnl = min(worst_day_pnl, day_pnl)
+        base = equity if compound else account_equity
+        ret = day_pnl / base if base else 0.0
+        daily_returns.append(ret)
+        if compound:
+            equity += day_pnl
+        peak = max(peak, equity)
+        if peak > 0:
+            max_drawdown = max(max_drawdown, (peak - equity) / peak)
+
+    total_return = (equity / account_equity) - 1.0 if compound else (pnl / account_equity)
+    years = days / TRADING_DAYS
+    if compound and total_return > -1.0 and years > 0:
+        cagr = (1.0 + total_return) ** (1.0 / years) - 1.0
+    else:
+        cagr = total_return / years if years else 0.0
+
+    simple_annualized = (pnl / account_equity) * (TRADING_DAYS / days) if account_equity and days else 0.0
+    mean_daily = mean(daily_returns) if daily_returns else 0.0
+    std_daily = pstdev(daily_returns) if len(daily_returns) > 1 else 0.0
+    sharpe = (mean_daily / std_daily) * math.sqrt(TRADING_DAYS) if std_daily > 0 else 0.0
+    downside = [r for r in daily_returns if r < 0]
+    downside_std = pstdev(downside) if len(downside) > 1 else 0.0
+    sortino = (mean_daily / downside_std) * math.sqrt(TRADING_DAYS) if downside_std > 0 else 0.0
+    ann_vol = std_daily * math.sqrt(TRADING_DAYS) if std_daily > 0 else 0.0
+    ann_downside_vol = downside_std * math.sqrt(TRADING_DAYS) if downside_std > 0 else 0.0
+    calmar = (cagr / max_drawdown) if max_drawdown > 0 else 0.0
+
+    wins = [r for r in daily_returns if r > 0]
+    losses = [r for r in daily_returns if r < 0]
+    gross_win = sum(wins)
+    gross_loss = abs(sum(losses))
+    profit_factor = (gross_win / gross_loss) if gross_loss > 0 else 0.0
+
+    trade_pnls = []
+    positive_days = sum(1 for r in daily_returns if r > 0)
+    halted_days = sum(1 for row in rows if str(row.get("halted")).lower() in {"true", "1"})
+
+    return {
+        "days": days,
+        "trades": trades,
+        "stopped_trades": stops,
+        "stop_rate": round(stops / trades, 6) if trades else 0.0,
+        "net_pnl": round(pnl, 2),
+        "ending_equity": round(equity, 2),
+        "total_return_pct": round(total_return * 100.0, 4),
+        "cagr_pct": round(cagr * 100.0, 4),
+        "simple_annualized_pct": round(simple_annualized * 100.0, 4),
+        "sharpe": round(sharpe, 4),
+        "sortino": round(sortino, 4),
+        "calmar": round(calmar, 4),
+        "ann_vol_pct": round(ann_vol * 100.0, 4),
+        "ann_downside_vol_pct": round(ann_downside_vol * 100.0, 4),
+        "daily_return_mean_pct": round(mean_daily * 100.0, 4),
+        "daily_return_std_pct": round(std_daily * 100.0, 4),
+        "profit_factor": round(profit_factor, 4),
+        "max_drawdown_pct": round(max_drawdown * 100.0, 4),
+        "worst_day": round(worst_day_pnl, 2),
+        "worst_day_pct_equity": round(worst_day_pnl / account_equity * 100.0, 4) if account_equity else 0.0,
+        "best_day_pct_equity": round(max(safe_float(r.get("net_pnl")) for r in rows) / account_equity * 100.0, 4) if account_equity else 0.0,
+        "win_rate_days": round(positive_days / days, 4) if days else 0.0,
+        "gross_credit_sold": round(credit, 2),
+        "avg_daily_credit": round(credit / days, 2) if days else 0.0,
+        "avg_daily_credit_pct_equity": round(credit / days / account_equity * 100.0, 4) if days and account_equity else 0.0,
+        "max_margin": round(max_margin, 2),
+        "max_margin_pct_equity": round(max_margin / account_equity * 100.0, 4) if account_equity else 0.0,
+        "avg_margin": round(avg_margin, 2),
+        "avg_margin_pct_equity": round(avg_margin / account_equity * 100.0, 4) if account_equity else 0.0,
+        "halted_days": halted_days,
+        "spread_win_rate": None,
+        "spread_expectancy": None,
+    }
+
+
+def enrich_trade_stats(summary: dict, trades: List[dict]) -> None:
+    spread = [t for t in trades if t.get("model") != "net_long_overlay"]
+    if not spread:
+        return
+    wins = sum(1 for t in spread if safe_float(t.get("net_pnl")) > 0)
+    summary["spread_win_rate"] = round(wins / len(spread), 4)
+    summary["spread_expectancy"] = round(sum(safe_float(t.get("net_pnl")) for t in spread) / len(spread), 2)
+
+
 def parse_mbh_benchmark(path: Path) -> Dict[str, float]:
-    """Return {YYYY-MM: net_return_fraction} from All_Time_Net_Returns.csv."""
     monthly: Dict[str, float] = {}
     if not path.exists():
         return monthly
@@ -66,49 +209,62 @@ def parse_mbh_benchmark(path: Path) -> Dict[str, float]:
     return monthly
 
 
-def build_run(run_id: str, results_dir: Path, label: str, account_equity: float) -> Optional[dict]:
-    daily_path = results_dir / "daily_regime_validation.csv"
-    if not daily_path.exists():
-        print(f"  skip {run_id}: no daily file at {daily_path}")
+def build_run(run_id: str, results_dir: Path, label: str, account_equity: float, meta: Optional[dict] = None) -> Optional[dict]:
+    daily_path = find_daily_csv(results_dir)
+    if not daily_path:
+        print(f"  skip {run_id}: no daily file in {results_dir}")
         return None
+
     rows = read_rows(daily_path)
-    summary = summarize(results_dir, account_equity, compound=True)
+    trade_rows = read_rows(results_dir / "trades.csv")
+    credit_by_date, margin_by_date = credit_and_margin_by_date(trade_rows)
+    summary = summarize_daily(rows, account_equity, credit_by_date, margin_by_date, compound=True)
+    if summary.get("days", 0) == 0:
+        print(f"  skip {run_id}: empty daily rows")
+        return None
+    enrich_trade_stats(summary, trade_rows)
 
     daily: List[dict] = []
     cum = 0.0
     equity = account_equity
+    peak = account_equity
     for row in rows:
+        d = row.get("date", "")
         net = safe_float(row.get("net_pnl"))
         cum += net
         equity += net
+        peak = max(peak, equity)
+        dd_pct = ((peak - equity) / peak * 100.0) if peak > 0 else 0.0
+        ret_pct = net / account_equity * 100.0
         daily.append({
-            "date": row.get("date"),
+            "date": d,
             "net_pnl": round(net, 2),
             "cum_pnl": round(cum, 2),
             "equity": round(equity, 2),
-            "return_pct": round(net / account_equity * 100.0, 4),
-            "trades": int(safe_float(row.get("trades"))),
-            "stopped": int(safe_float(row.get("stopped_trades"))),
-            "halted": str(row.get("halted")) == "True",
+            "return_pct": round(ret_pct, 4),
+            "drawdown_pct": round(dd_pct, 4),
+            "trades": safe_int(row.get("trades")),
+            "stopped": safe_int(row.get("stopped_trades")),
+            "halted": str(row.get("halted")).lower() in {"true", "1"},
             "regime": row.get("regime", ""),
             "event_bucket": row.get("event_bucket", ""),
-            "gross_credit_sold": round(safe_float(row.get("gross_credit_sold")), 2),
-            "approx_spread_margin": round(safe_float(row.get("approx_spread_margin")), 2),
+            "gross_credit_sold": round(credit_by_date.get(d, safe_float(row.get("gross_credit_sold"))), 2),
+            "approx_spread_margin": round(margin_by_date.get(d, safe_float(row.get("approx_spread_margin"))), 2),
         })
 
     trades_by_date: Dict[str, List[dict]] = {}
-    for t in read_rows(results_dir / "trades.csv"):
-        d = t.get("date")
+    for t in trade_rows:
+        d = t.get("date") or (t.get("entry_time") or "")[:10]
         trades_by_date.setdefault(d, []).append({
             "entry_time": t.get("entry_time"),
             "side": t.get("side"),
             "model": t.get("model"),
-            "contracts": int(safe_float(t.get("contracts"))),
+            "contracts": safe_int(t.get("contracts")),
             "short": t.get("short"),
             "long": t.get("long"),
             "entry_credit": safe_float(t.get("entry_credit")),
             "score": safe_float(t.get("candidate_score")),
-            "stopped": str(t.get("stopped")) == "True",
+            "stopped": str(t.get("stopped")).lower() in {"true", "1"},
             "exit_reason": t.get("exit_reason"),
             "net_pnl": round(safe_float(t.get("net_pnl")), 2),
             "short_delta": safe_float(t.get("short_delta")),
@@ -117,6 +273,7 @@ def build_run(run_id: str, results_dir: Path, label: str, account_equity: float)
     return {
         "id": run_id,
         "label": label,
+        "meta": meta or {},
         "summary": summary,
         "daily": daily,
         "trades_by_date": trades_by_date,
@@ -124,7 +281,6 @@ def build_run(run_id: str, results_dir: Path, label: str, account_equity: float)
 
 
 def build_live(live_dir: Path, account_equity: float) -> dict:
-    """Read live fills logged by live/ib_executor.py into a comparable shape."""
     days: Dict[str, dict] = {}
     if not live_dir.exists():
         return {"days": {}}
@@ -162,23 +318,47 @@ def main() -> None:
     parser.add_argument("--out", default=str(Path(__file__).resolve().parent / "data" / "dashboard_data.json"))
     args = parser.parse_args()
 
+    default_runs = [
+        "3d_flatten=data/dashboard_runs/3d_flatten_3_5:3D flatten -3.5% (calibrated winner)",
+        "test1=data/unconditional_baseline:Test 1 — unconditional baseline (2x stop)",
+    ]
+    specs = args.run or default_runs
+
     runs = []
-    for spec in args.run:
+    for spec in specs:
         id_part, rest = spec.split("=", 1)
         dir_part, _, label = rest.partition(":")
         results_dir = (ROOT / dir_part).resolve() if not Path(dir_part).is_absolute() else Path(dir_part)
-        run = build_run(id_part, results_dir, label or id_part, args.account_equity)
+        meta = {}
+        if id_part == "3d_flatten":
+            meta = {
+                "description": "Wide wings 200/75, 3.0x stop + 2-bar confirm, halt -2.25%, flatten -3.5%",
+                "credit_cap_pct": 50.0,
+                "mbh_credit_target_pct": 1.5,
+                "note": "Credit cap set to 50% (non-binding); actual ~1.1% equity/day sold",
+            }
+        run = build_run(id_part, results_dir, label or id_part, args.account_equity, meta)
         if run:
             runs.append(run)
-            print(f"  added run {id_part}: CAGR {run['summary'].get('cagr_pct')}% "
-                  f"Sharpe {run['summary'].get('sharpe')} ({len(run['daily'])} days)")
+            s = run["summary"]
+            print(f"  added {id_part}: CAGR {s.get('cagr_pct')}% Sharpe {s.get('sharpe')} "
+                  f"maxDD {s.get('max_drawdown_pct')}% ({len(run['daily'])} days)")
 
     blob = {
         "generated_at": datetime.now().isoformat(),
         "account_equity": args.account_equity,
+        "primary_run_id": runs[0]["id"] if runs else None,
         "runs": runs,
         "mbh_benchmark": {"monthly": parse_mbh_benchmark(Path(args.mbh_returns))},
         "live": build_live(Path(args.live_dir), args.account_equity),
+        "mbh_targets": {
+            "cagr_pct": [30, 40],
+            "win_rate_pct": 65,
+            "worst_day_pct": [-5, -4],
+            "sharpe": 2.5,
+            "daily_credit_pct": 1.5,
+            "margin_pct": 40,
+        },
     }
 
     out_path = Path(args.out)
