@@ -1,0 +1,19 @@
+{
+  "version": 1,
+  "users": [
+    {
+      "id": "dgoldman",
+      "name": "D Goldman",
+      "salt_b64": "+LfT4SIwsBqVerumrTGYEA==",
+      "hash_b64": "wrXXZ7WPMLV8fJiGtP/FxxmHKIbuJW9KtLJzoTaFPgs=",
+      "iterations": 250000
+    },
+    {
+      "id": "mcricenti",
+      "name": "M Cricenti",
+      "salt_b64": "vOkyqLcay67Xs5MtsCAuyQ==",
+      "hash_b64": "xHdEQ4DFGUURCcvTcxGnT7RgeUS0rgbG4qjBMQiUcgI=",
+      "iterations": 250000
+    }
+  ]
+}

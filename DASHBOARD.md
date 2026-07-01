@@ -1,22 +1,44 @@
-# Dashboard (separate private repo)
+# Dashboard (in this repo)
 
-The interactive site lives in **[magis-capital-partners/spx-0dte-dashboard](https://github.com/magis-capital-partners/spx-0dte-dashboard)** — not in this repo.
+The interactive site is deployed from **`dashboard/`** in this private repo via GitHub Actions.
 
-| Repo | Contents | Visibility |
-|------|----------|------------|
-| **spx-0dte** (this repo) | Simulator, live IB executor, research | Private |
-| **spx-0dte-dashboard** | Static React dashboard + backtest JSON | Private + password login |
+| Layer | What it does |
+|-------|----------------|
+| **Private repo** | Simulator, research, and live code stay private. Only the static `dashboard/` folder is published. |
+| **Public GitHub Pages** | Clean URL: **https://magis-capital-partners.github.io/spx-0dte/** (Enterprise: repo private, Pages public). |
+| **`data/investors.json` login** | App-level password gate (PBKDF2, same scheme as etf-dashboard). Required when `users` is non-empty. |
 
-## Refresh dashboard data after backtests
+> Layer 2 is a UI gate; JSON files remain fetchable if someone bypasses login. For stronger control, use org repo ACLs or a custom domain with Cloudflare Access.
+
+## Refresh + deploy
 
 ```powershell
 .\scripts\sync_dashboard.ps1 -Push
 ```
 
-## Enterprise access
+Rebuilds `dashboard/data/dashboard_data.json`, commits `dashboard/`, pushes `main`, and triggers **Deploy dashboard to GitHub Pages**.
 
-1. **GitHub Enterprise SSO** — grant read access to `spx-0dte-dashboard`; private Pages requires org login.
-2. **Dashboard password** — add users via `hash_investor_password.py` in the dashboard repo (see its README).
-3. **Custom domain** (optional) — Settings → Pages on the dashboard repo for a clean URL while staying private.
+Preview locally:
 
-Local dashboard sources under `dashboard/` are kept for building only; deploy from **spx-0dte-dashboard**.
+```powershell
+cd dashboard
+python -m http.server 8000
+```
+
+## Add a login user
+
+```powershell
+$env:INVESTOR_PASSWORD = "choose-a-strong-password"
+python dashboard/scripts/hash_investor_password.py --id drew --name "Drew" --merge dashboard/data/investors.json
+git add dashboard/data/investors.json
+git commit -m "Add dashboard login user"
+git push
+```
+
+Never commit plaintext passwords — only the hashed JSON.
+
+## Legacy
+
+The separate **`spx-0dte-dashboard`** repo is deprecated; use this repo only. Archive that repo when convenient.
+
+Manual fallback (no Actions): `.\dashboard\deploy_pages.ps1` pushes `dashboard/` to the `gh-pages` branch.

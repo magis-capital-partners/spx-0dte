@@ -44,6 +44,14 @@
   .muted { color:var(--muted); }
   .big { font-size:26px; font-weight:680; }
   a { color:var(--blue); }
+  .login-wrap { min-height:100vh; display:flex; align-items:center; justify-content:center; padding:24px; }
+  .login-card { width:100%; max-width:340px; background:var(--panel); border:1px solid var(--line); border-radius:12px; padding:28px 26px; }
+  .login-field { margin-bottom:14px; }
+  .login-field label { display:block; font-size:11px; text-transform:uppercase; letter-spacing:.04em; color:var(--muted); margin-bottom:5px; }
+  .login-field input { width:100%; }
+  .login-btn { width:100%; margin-top:8px; padding:10px; border-radius:8px; border:none; background:var(--blue); color:#fff; font-weight:650; cursor:pointer; }
+  .login-btn:disabled { opacity:.55; cursor:not-allowed; }
+  .login-error { margin-top:12px; color:var(--red); font-size:12px; }
 </style>
 </head>
 <body>
@@ -371,7 +379,74 @@ function Daily({data}) {
   );
 }
 
-function App() {
+const AUTH_KEY = "spx0dte_dashboard_auth_v1";
+
+function b64ToBytes(b64) {
+  const bin = atob(b64);
+  const out = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
+  return out;
+}
+
+function bytesToB64(bytes) {
+  let s = "";
+  bytes.forEach(b => { s += String.fromCharCode(b); });
+  return btoa(s);
+}
+
+async function verifyInvestor(user, password) {
+  const enc = new TextEncoder();
+  const salt = b64ToBytes(user.salt_b64);
+  const iterations = user.iterations || 250000;
+  const key = await crypto.subtle.importKey("raw", enc.encode(password), "PBKDF2", false, ["deriveBits"]);
+  const bits = await crypto.subtle.deriveBits({ name: "PBKDF2", salt, iterations, hash: "SHA-256" }, key, 256);
+  return bytesToB64(new Uint8Array(bits)) === user.hash_b64;
+}
+
+function LoginGate({ users, onAuthed }) {
+  const [userId,setUserId]=useState("");
+  const [password,setPassword]=useState("");
+  const [busy,setBusy]=useState(false);
+  const [error,setError]=useState("");
+  async function submit(e) {
+    e.preventDefault();
+    setError("");
+    const uid = userId.trim().toLowerCase();
+    const user = users.find(u => String(u.id || "").toLowerCase() === uid);
+    if (!user) { setError("Invalid login."); return; }
+    setBusy(true);
+    try {
+      const ok = await verifyInvestor(user, password);
+      if (!ok) { setError("Invalid login."); return; }
+      sessionStorage.setItem(AUTH_KEY, JSON.stringify({ id: user.id, name: user.name || user.id }));
+      onAuthed({ id: user.id, name: user.name || user.id });
+    } catch (err) {
+      setError(String(err));
+    } finally {
+      setBusy(false);
+    }
+  }
+  return (
+    <div className="login-wrap">
+      <form className="login-card" onSubmit={submit}>
+        <h1 style={{margin:"0 0 8px", fontSize:18}}>SPX 0DTE Dashboard</h1>
+        <p className="sub" style={{margin:"0 0 18px"}}>Sign in to view backtest results.</p>
+        <div className="login-field">
+          <label htmlFor="login-id">User id</label>
+          <input id="login-id" value={userId} onChange={e=>setUserId(e.target.value)} autoComplete="username" />
+        </div>
+        <div className="login-field">
+          <label htmlFor="login-pw">Password</label>
+          <input id="login-pw" type="password" value={password} onChange={e=>setPassword(e.target.value)} autoComplete="current-password" />
+        </div>
+        <button className="login-btn" type="submit" disabled={busy}>{busy ? "Checking…" : "Sign in"}</button>
+        {error ? <div className="login-error">{error}</div> : null}
+      </form>
+    </div>
+  );
+}
+
+function App({ viewer }) {
   const [data,setData]=useState(null);
   const [tab,setTab]=useState("overview");
   const [err,setErr]=useState(null);
@@ -382,7 +457,7 @@ function App() {
     <div>
       <header>
         <h1>SPX 0DTE Strategy Dashboard</h1>
-        <span className="sub">${data.account_equity.toLocaleString()} equity · {data.runs.length} runs · built {new Date(data.generated_at).toLocaleString()}</span>
+        <span className="sub">${data.account_equity.toLocaleString()} equity · {data.runs.length} runs · built {new Date(data.generated_at).toLocaleString()}{viewer ? ` · ${viewer.name}` : ""}</span>
       </header>
       <div className="tabs">
         <div className={"tab"+(tab==="overview"?" active":"")} onClick={()=>setTab("overview")}>Overview</div>
@@ -394,7 +469,27 @@ function App() {
     </div>
   );
 }
-ReactDOM.createRoot(document.getElementById("root")).render(<App/>);
+
+function Root() {
+  const [auth,setAuth]=useState(null);
+  const [users,setUsers]=useState(null);
+  const [authErr,setAuthErr]=useState(null);
+  useEffect(()=>{
+    const saved = sessionStorage.getItem(AUTH_KEY);
+    if (saved) {
+      try { setAuth(JSON.parse(saved)); } catch (_) { sessionStorage.removeItem(AUTH_KEY); }
+    }
+    fetch("data/investors.json")
+      .then(r => r.ok ? r.json() : { version: 1, users: [] })
+      .then(doc => setUsers(Array.isArray(doc.users) ? doc.users : []))
+      .catch(e => setAuthErr(String(e)));
+  },[]);
+  if (authErr) return <main><div className="panel">Could not load login config: {authErr}</div></main>;
+  if (users === null) return <main><div className="muted">Loading…</div></main>;
+  if (users.length > 0 && !auth) return <LoginGate users={users} onAuthed={setAuth} />;
+  return <App viewer={auth} />;
+}
+ReactDOM.createRoot(document.getElementById("root")).render(<Root/>);
 </script>
 </body>
 </html>
