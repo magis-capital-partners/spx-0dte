@@ -5,8 +5,7 @@ Outputs dashboard/data/dashboard_data.json, consumed by the static index.html
 
 Usage:
   python dashboard/build_dashboard_data.py \\
-    --run 3d_flatten=data/dashboard_runs/3d_flatten_3_5:"3D flatten -3.5% (calibrated)" \\
-    --run test1=data/unconditional_baseline:"Test 1 unconditional baseline"
+    --run linear_decay_downsize=data/dashboard_runs/linear_decay_downsize:"3D + linear decay downsize"
 """
 from __future__ import annotations
 
@@ -319,8 +318,7 @@ def main() -> None:
     args = parser.parse_args()
 
     default_runs = [
-        "3d_flatten=data/dashboard_runs/3d_flatten_3_5:3D flatten -3.5% (calibrated winner)",
-        "test1=data/unconditional_baseline:Test 1 — unconditional baseline (2x stop)",
+        "linear_decay_downsize=data/dashboard_runs/linear_decay_downsize:3D + linear decay downsize (sell early, less late)",
     ]
     specs = args.run or default_runs
 
@@ -330,12 +328,18 @@ def main() -> None:
         dir_part, _, label = rest.partition(":")
         results_dir = (ROOT / dir_part).resolve() if not Path(dir_part).is_absolute() else Path(dir_part)
         meta = {}
-        if id_part == "3d_flatten":
+        if id_part == "linear_decay_downsize":
             meta = {
-                "description": "Wide wings 200/75, 3.0x stop + 2-bar confirm, halt -2.25%, flatten -3.5%",
+                "description": (
+                    "3D_flatten_3.5 substrate (wide wings 200/75, 3x stop + 2-bar confirm, "
+                    "halt -2.25%, flatten -3.5%) with time-of-day sizing: sell more early, less late"
+                ),
+                "sizing_schedule": (
+                    "09:32-10:29 1.25x (39), 10:30-11:29 1.0x (31), 11:30-12:29 0.85x (26), "
+                    "12:30-13:29 0.6x (19), 13:30-14:29 0.45x (14), 14:30-15:30 0.25x (8)"
+                ),
                 "credit_cap_pct": 50.0,
                 "mbh_credit_target_pct": 1.5,
-                "note": "Credit cap set to 50% (non-binding); actual ~1.1% equity/day sold",
             }
         run = build_run(id_part, results_dir, label or id_part, args.account_equity, meta)
         if run:
