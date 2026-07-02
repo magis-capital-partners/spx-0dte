@@ -97,3 +97,51 @@ def scale_profile(profile: dict, account_equity: float, contract_scale: float = 
     equity_scale = account_equity / BASE_EQUITY if BASE_EQUITY else 1.0
     scaled["baseline_contracts"] = max(1, round(profile["baseline_contracts"] * equity_scale * contract_scale))
     return scaled
+
+
+def _canonical_registry():
+    """Lazy import of the canonical simulator registry.
+
+    Kept lazy so merely importing ``PROFILES`` (as several simulator modules do)
+    does not pull the whole backtest import chain, and so path setup only runs
+    when the live executor actually resolves a config.
+    """
+    try:
+        from profiles import PROFILE_BUILDERS, SCHEMES
+    except ImportError:  # pragma: no cover - path bootstrap for live/ context
+        import sys
+        from pathlib import Path
+
+        sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "simulator"))
+        from profiles import PROFILE_BUILDERS, SCHEMES
+    return PROFILE_BUILDERS, SCHEMES
+
+
+def resolve_strategy_config(live) -> tuple:
+    """Turn a ``LiveConfig`` into a concrete ``(StrategyConfig, schedule)``.
+
+    Canonical profiles (from ``simulator/profiles.py``) build the full validated
+    config and are scaled by ``contract_scale``. Legacy allocator profiles fall
+    back to the ``PROFILES`` kwargs path. ``schedule`` is a Test-3G time-of-day
+    weighting list or ``None`` for a flat book.
+    """
+    from dataclasses import replace
+
+    profile_builders, schemes = _canonical_registry()
+    schedule = None
+    if live.sizing_scheme and live.sizing_scheme in schemes:
+        schedule = schemes[live.sizing_scheme]
+
+    if live.profile in profile_builders:
+        config = profile_builders[live.profile](account_equity=live.account_equity)
+        scaled = max(1, round(config.baseline_contracts * live.contract_scale))
+        return replace(config, baseline_contracts=scaled), schedule
+
+    if live.profile in PROFILES:
+        from mbh_simulator import StrategyConfig
+
+        kwargs = scale_profile(PROFILES[live.profile], live.account_equity, live.contract_scale)
+        return StrategyConfig(account_equity=live.account_equity, **kwargs), schedule
+
+    known = sorted(set(profile_builders) | set(PROFILES))
+    raise SystemExit(f"unknown profile {live.profile!r}; choose from {known}")

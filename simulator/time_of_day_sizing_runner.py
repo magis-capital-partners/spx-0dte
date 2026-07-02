@@ -44,97 +44,12 @@ from regime_validation import apply_rolling_baseline, discover_dates
 from stop_calibration_runner import base_config, portfolio_stats
 from unconditional_baseline import trade_stats
 
+# Canonical registry — single source of truth (see simulator/profiles.py).
+from profiles import SCHEMES, WINNERS, Schedule, schedule_multiplier  # noqa: F401
+
 ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_PROCESSED = ROOT / "data" / "processed"
 DEFAULT_RESULTS = ROOT / "data" / "time_of_day_sizing"
-
-# Frozen 3D winner (matches simulator/export_dashboard_run.py WINNERS + dashboard).
-WINNERS = {
-    "stop_multiple": 3.0,
-    "stop_confirmation_count": 2,
-    "same_side_stop_cooldown_minutes": 0,
-    "max_stops_per_side": 999,
-    "daily_loss_limit_pct": 0.0225,
-    "flatten_on_daily_loss": True,
-    "flatten_loss_limit_pct": 0.035,
-}
-
-# --- Time-of-day weighting schemes ------------------------------------------
-# Each schedule is an ordered list of (upper_bound_time, multiplier). For an
-# entry at time t we use the multiplier of the first segment with t < bound.
-# The final segment (time(23, 59)) is the afternoon catch-all. Multipliers are
-# applied to the 31-contract baseline and rounded; 0.0 halts new entries in that
-# window. Segments are chosen so the tranche cadence (09:32..15:17, every 15m)
-# maps cleanly onto the buckets.
-Schedule = List[Tuple[time, float]]
-
-SCHEMES: Dict[str, Schedule] = {
-    # Control: flat 1.0x == production 3D_flatten_3.5. Sanity check vs dashboard.
-    "control_flat": [
-        (time(23, 59), 1.0),
-    ],
-    # Pure reshaping, ~size-neutral: heavier morning, lighter afternoon.
-    "linear_decay_neutral": [
-        (time(10, 30), 1.50),
-        (time(11, 30), 1.25),
-        (time(12, 30), 1.00),
-        (time(13, 30), 0.75),
-        (time(14, 30), 0.60),
-        (time(23, 59), 0.50),
-    ],
-    # Same shape but net-downsized (avg ~0.75x): reshapes AND shrinks the book.
-    "linear_decay_downsize": [
-        (time(10, 30), 1.25),
-        (time(11, 30), 1.00),
-        (time(12, 30), 0.85),
-        (time(13, 30), 0.60),
-        (time(14, 30), 0.45),
-        (time(23, 59), 0.25),
-    ],
-    # Three mild blocks: morning heavier, afternoon lighter.
-    "step_3block_mild": [
-        (time(11, 30), 1.25),
-        (time(13, 30), 1.00),
-        (time(23, 59), 0.50),
-    ],
-    # Three aggressive blocks.
-    "step_3block_aggressive": [
-        (time(11, 0), 1.50),
-        (time(13, 0), 0.75),
-        (time(23, 59), 0.33),
-    ],
-    # Front-load the morning, taper hard into the afternoon.
-    "front_load_morning": [
-        (time(12, 0), 1.25),
-        (time(14, 0), 0.50),
-        (time(23, 59), 0.25),
-    ],
-    # Full morning size, half midday, halt new entries after 14:00.
-    "morning_heavy_afternoon_off": [
-        (time(12, 0), 1.00),
-        (time(14, 0), 0.50),
-        (time(23, 59), 0.00),
-    ],
-    # Simple downsize: half size after noon.
-    "half_after_noon": [
-        (time(12, 0), 1.00),
-        (time(23, 59), 0.50),
-    ],
-    # Four-step smooth taper.
-    "taper_4step": [
-        (time(10, 30), 1.50),
-        (time(12, 0), 1.00),
-        (time(13, 30), 0.60),
-        (time(23, 59), 0.30),
-    ],
-}
-
-
-def schedule_multiplier(t: time, schedule: Schedule) -> float:
-    for bound, mult in schedule:
-        if t < bound:
-            return mult
-    return schedule[-1][1]
 
 
 class TimeOfDaySizePolicy(DefaultSignalPolicy):

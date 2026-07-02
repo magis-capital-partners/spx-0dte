@@ -16,16 +16,8 @@ from stop_calibration_runner import (
 from time_of_day_sizing_runner import SCHEMES, TimeOfDaySizePolicy, WINNERS as TOD_WINNERS
 from unconditional_baseline import trade_stats
 
-# Frozen winners from full 391-day calibration (2026-06-30)
-WINNERS = {
-    "stop_multiple": 3.0,
-    "stop_confirmation_count": 2,
-    "same_side_stop_cooldown_minutes": 0,
-    "max_stops_per_side": 999,
-    "daily_loss_limit_pct": 0.0225,
-    "flatten_on_daily_loss": True,
-    "flatten_loss_limit_pct": 0.035,
-}
+# Canonical frozen winners — single source of truth (see simulator/profiles.py).
+from profiles import WINNERS
 
 PRESETS = {
     "3d_flatten_3_5": {
