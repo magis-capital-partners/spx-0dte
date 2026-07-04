@@ -1,0 +1,8 @@
+{
+  "start_date": "2019-01-02",
+  "eras": [
+    {"name": "mwf", "end": "2022-04-17", "weekdays": [0, 2, 4]},
+    {"name": "mwtf", "end": "2022-05-10", "weekdays": [0, 1, 2, 4]},
+    {"name": "daily", "end": null, "weekdays": [0, 1, 2, 3, 4]}
+  ]
+}

@@ -40,6 +40,22 @@ Key `LiveConfig` fields:
 | `mode` | `dry` (log only) / `paper` (7497) / `live` (7496, requires `allow_live=True`) |
 | `dry_with_ib` | In dry mode, still connect to read the live chain (places nothing) |
 | `poll_seconds`, `host`, `port`, `client_id`, `baselines_path` | IB connection / loop |
+| `delayed_quote_fallback` | Fill missing bid/ask from last/mid when on delayed data (type 3) |
+
+## Session artifacts
+
+Each run writes to `data/live/<date>/`:
+
+| File | Contents |
+|---|---|
+| `config.json` | Fully-resolved live + strategy config |
+| `fills.jsonl` | Entries, stops, halts, session start/end |
+| `tranches.jsonl` | One JSON record per 15-min tranche (pass/skip reason, scores) |
+| `ib.log` | Full ib_insync library output |
+| `ib_errors.jsonl` | Structured IB error/warning codes |
+
+On each tranche boundary the console prints a `[tranche]` line (sold or skip reason).
+The `[chain]` line every ~60s now includes the strike span fetched (should cover wing legs).
 
 ## Architecture
 
@@ -58,6 +74,8 @@ Key `LiveConfig` fields:
                 │     FLATTEN open positions at deeper limit   │
                 │  8. 0DTE cash-settles at close (no EOD MKT)  │
                 │  9. config.json snapshot + fills.jsonl log   │
+                │ 10. ib.log + ib_errors.jsonl (IB warnings)   │
+                │ 11. tranches.jsonl (per-tranche diagnostics) │
                 └─────────────────────────────────────────────┘
 ```
 

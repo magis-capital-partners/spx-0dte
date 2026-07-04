@@ -22,7 +22,7 @@ if (-not (Test-Path $Git)) { $Git = "git" }
 if (-not $DeployOnly) {
   Write-Host "Building dashboard data..."
   & $Python "$Root\dashboard\build_dashboard_data.py" `
-    --run "linear_decay_downsize=data/dashboard_runs/linear_decay_downsize:3D + linear decay downsize (sell early, less late)" `
+    --run "linear_decay_downsize=data/dashboard_runs/linear_decay_downsize:3D + linear decay · full history (2019–2026)" `
     --account-equity $Equity `
     --out "$Root\dashboard\data\dashboard_data.json"
 }

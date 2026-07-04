@@ -134,7 +134,11 @@ def resolve_strategy_config(live) -> tuple:
 
     if live.profile in profile_builders:
         config = profile_builders[live.profile](account_equity=live.account_equity)
-        scaled = max(1, round(config.baseline_contracts * live.contract_scale))
+        if live.contracts_per_tranche > 0:
+            scaled = live.contracts_per_tranche
+        else:
+            equity_scale = live.account_equity / BASE_EQUITY if BASE_EQUITY else 1.0
+            scaled = max(1, round(config.baseline_contracts * equity_scale * live.contract_scale))
         return replace(config, baseline_contracts=scaled), schedule
 
     if live.profile in PROFILES:

@@ -4,11 +4,15 @@
 **/THETADATA_API_KEY*
 secrets.*
 
-# --- data/ holds ~4GB ThetaData downloads + reproducible run outputs. ---
-# Ignore everything under data/ except the MBH return benchmark, which is the
-# one small must-keep artifact (used by the dashboard + calibration).
+# --- data/ holds ThetaData downloads + run outputs (local cache, not in git). ---
+# Tracked exceptions: README, inventory manifest, calendar rules — see data/README.md
 data/*
 !data/mbh_returns/
+!data/README.md
+!data/inventory/
+!data/inventory/**
+!data/calendar/
+!data/calendar/**
 *.parquet
 *.log
 

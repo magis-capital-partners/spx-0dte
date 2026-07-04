@@ -1,0 +1,29 @@
+---
+description: Use local SPXW data cache; never re-download ThetaData unless user explicitly requests
+alwaysApply: true
+---
+
+# Local ThetaData cache — do not re-download
+
+Before any SPXW history work, read **`data/inventory/manifest.json`** and **`data/README.md`**.
+
+## Rules
+
+1. **Backtests use local processed data** at `data/processed/symbol=SPXW/date=*/`.
+   No API key or download is needed to re-run `historical_3d_backtest.py` or dashboard exports.
+
+2. **Do not run** `thetadata_downloader.py`, `backfill_history.py --download`, or
+   `historical_3d_backtest.py --download` unless the user **explicitly** asks to fetch
+   missing dates. Re-downloading costs ThetaData credits.
+
+3. **If processed data is missing** but raw parquet exists, run `--build` only:
+   `python simulator/backfill_history.py --build --start-date ... --end-date ...`
+
+4. **After any backfill/build**, refresh the manifest:
+   `python scripts/update_data_inventory.py`
+
+5. **Never commit** parquet, large CSV chains, API keys, or `data/raw`/`data/processed`
+   blobs to git. Only `data/inventory/manifest.json`, `data/README.md`, and
+   `data/calendar/` metadata are tracked.
+
+6. Usable same-day history starts ~**2019**, not 2016. Check manifest date ranges.

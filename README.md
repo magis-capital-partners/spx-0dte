@@ -46,6 +46,10 @@ The simulator does not claim to know MBH's proprietary model. It exposes the sig
 
 ## ThetaData Usage
 
+**Local cache:** SPXW history is stored under `data/raw/` and `data/processed/`.
+See **`data/README.md`** and **`data/inventory/manifest.json`**. Backtests re-use this
+cache — do not re-download unless filling explicit gaps.
+
 The downloader reads the API key from `THETADATA_API_KEY`. Do not hard-code the key into scripts.
 
 Example:

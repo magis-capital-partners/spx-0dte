@@ -318,7 +318,7 @@ def main() -> None:
     args = parser.parse_args()
 
     default_runs = [
-        "linear_decay_downsize=data/dashboard_runs/linear_decay_downsize:3D + linear decay downsize (sell early, less late)",
+        "linear_decay_downsize=data/dashboard_runs/linear_decay_downsize:3D + linear decay · full history (2019–2026)",
     ]
     specs = args.run or default_runs
 
@@ -332,7 +332,8 @@ def main() -> None:
             meta = {
                 "description": (
                     "3D_flatten_3.5 substrate (wide wings 200/75, 3x stop + 2-bar confirm, "
-                    "halt -2.25%, flatten -3.5%) with time-of-day sizing: sell more early, less late"
+                    "halt -2.25%, flatten -3.5%) with time-of-day sizing: sell more early, less late. "
+                    "Mon/Wed/Fri only before Apr 2022; all weekdays thereafter."
                 ),
                 "sizing_schedule": (
                     "09:32-10:29 1.25x (39), 10:30-11:29 1.0x (31), 11:30-12:29 0.85x (26), "
@@ -343,6 +344,24 @@ def main() -> None:
             }
         run = build_run(id_part, results_dir, label or id_part, args.account_equity, meta)
         if run:
+            daily = run.get("daily") or []
+            if daily:
+                run["meta"]["date_range"] = f"{daily[0]['date']} → {daily[-1]['date']}"
+                run["meta"]["oos_days"] = len(daily)
+            summary_path = results_dir / "summary.json"
+            if summary_path.exists():
+                try:
+                    hist = json.loads(summary_path.read_text(encoding="utf-8"))
+                    run["meta"]["note"] = (
+                        f"Expiration-era calendar backtest · eligible metrics · "
+                        f"{hist.get('first_oos_date', '')} OOS start · "
+                        f"{hist.get('headline', {}).get('cagr_pct', '')}% CAGR (eligible path)"
+                    )
+                    for era in hist.get("era_summaries") or []:
+                        if era.get("era"):
+                            run["meta"].setdefault("era_summaries", []).append(era)
+                except json.JSONDecodeError:
+                    pass
             runs.append(run)
             s = run["summary"]
             print(f"  added {id_part}: CAGR {s.get('cagr_pct')}% Sharpe {s.get('sharpe')} "

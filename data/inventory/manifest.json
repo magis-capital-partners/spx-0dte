@@ -1,0 +1,67 @@
+{
+  "updated_at": "2026-07-03T16:52:22.156082+00:00",
+  "policy": "SPXW history is cached locally under data/raw and data/processed. Use this cache for backtests. Do NOT call ThetaData or pass --download unless the user explicitly asks to fill manifest gaps.",
+  "raw": {
+    "path": "data/raw/thetadata/symbol=SPXW",
+    "description": "Parquet Greeks from ThetaData (source for rebuilds)",
+    "count": 890,
+    "first_date": "2019-01-02",
+    "last_date": "2026-07-02",
+    "by_year": {
+      "2019": 147,
+      "2020": 33,
+      "2021": 1,
+      "2022": 3,
+      "2023": 182,
+      "2024": 242,
+      "2025": 169,
+      "2026": 113
+    }
+  },
+  "processed": {
+    "path": "data/processed/symbol=SPXW",
+    "description": "Simulator inputs: normalized_option_quotes.csv + signals.csv per day",
+    "count": 668,
+    "first_date": "2019-01-02",
+    "last_date": "2026-07-02",
+    "by_year": {
+      "2019": 147,
+      "2023": 155,
+      "2024": 147,
+      "2025": 131,
+      "2026": 88
+    }
+  },
+  "cache_status": {
+    "raw_not_built_count": 222,
+    "raw_not_built_by_year": {
+      "2020": 33,
+      "2021": 1,
+      "2022": 3,
+      "2023": 27,
+      "2024": 95,
+      "2025": 38,
+      "2026": 25
+    },
+    "missing_processed_by_year": {
+      "2020": 33,
+      "2021": 1,
+      "2022": 3,
+      "2023": 27,
+      "2024": 95,
+      "2025": 38,
+      "2026": 25
+    }
+  },
+  "agent_commands": {
+    "refresh_inventory": "python scripts/update_data_inventory.py",
+    "backtest_no_download": "python simulator/historical_3d_backtest.py --start-date 2019-01-02 --end-date 2026-07-02",
+    "build_from_raw_only": "python simulator/backfill_history.py --build --start-date 2019-01-02 --end-date 2026-07-02",
+    "enrich": "python simulator/feature_enricher.py --symbol SPXW"
+  },
+  "do_not": [
+    "Do not run thetadata_downloader.py or backfill_history.py --download unless the user explicitly requests new dates.",
+    "Do not assume data starts in 2016; ThetaData usable same-day SPXW Greeks begin ~2019.",
+    "Do not commit parquet/CSV chain files to git; they stay local under data/."
+  ]
+}

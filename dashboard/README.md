@@ -33,10 +33,17 @@ python -m http.server 8000
 
 ## Refresh data after backtests
 
+Full historical run (local cache, no ThetaData download):
+
 ```powershell
-python simulator/export_dashboard_run.py --preset linear_decay_downsize
+python simulator/historical_3d_backtest.py --start-date 2019-01-02 --end-date 2026-07-02 `
+  --results-dir data/dashboard_runs/linear_decay_downsize
 python dashboard/build_dashboard_data.py
-git add dashboard/data/dashboard_data.json
-git commit -m "dashboard: refresh backtest data"
-git push
+# or: .\scripts\sync_dashboard.ps1
+```
+
+Deploy to Pages:
+
+```powershell
+.\scripts\sync_dashboard.ps1 -Push
 ```

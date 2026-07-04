@@ -22,6 +22,7 @@ Modes:
 from __future__ import annotations
 
 import json
+import logging
 import sys
 import time as _time
 from dataclasses import asdict, dataclass
@@ -37,6 +38,9 @@ from mbh_simulator import (  # noqa: E402  (path injection above)
     OptionQuote,
     SignalSnapshot,
     StrategyConfig,
+    TrancheSummary,
+    _summarize_tranche_from_records,
+    build_scored_candidates,
     candidate_margin_per_contract,
     is_entry_time,
     select_candidate_entries,
@@ -94,22 +98,118 @@ class OpenSpread:
 # --------------------------------------------------------------------------- #
 # IB market data implementation (skeleton)
 # --------------------------------------------------------------------------- #
-class IBSignalProvider:
-    """Pulls the live SPXW 0DTE (+ next-expiry) chain from IB and builds an
-    OptionQuote snapshot. Signal z-scores require historical baselines; load
-    them from the backtest pipeline (``LiveConfig.baselines_path``) and combine
-    with the live ATM straddle / skew / term readings.
+# IB codes that are normal on paper (delayed data, farm OK messages) — file only.
+_QUIET_IB_ERROR_CODES = frozenset({10090, 10167, 2104, 2106, 2158})
 
-    The chain fetch and quote mapping are implemented; the z-score assembly is
-    intentionally a single clearly-marked seam so you can wire your preferred
-    baseline source without touching order/risk logic.
+
+def setup_ib_logging(today: str) -> Path:
+    """Send ib_insync library logs to data/live/<date>/ib.log, not the console.
+
+    IB warning 10090 is logged at INFO by ib_insync's wrapper; routing the
+    ``ib_insync`` logger to a file keeps CMD clean while preserving full detail.
+    """
+    day_dir = LIVE_DIR / today
+    day_dir.mkdir(parents=True, exist_ok=True)
+    ib_log = day_dir / "ib.log"
+
+    ib_logger = logging.getLogger("ib_insync")
+    ib_logger.handlers.clear()
+    ib_logger.propagate = False
+    ib_logger.setLevel(logging.DEBUG)
+
+    handler = logging.FileHandler(ib_log, encoding="utf-8")
+    handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
+    ib_logger.addHandler(handler)
+
+    # Belt-and-suspenders: ib_insync also hooks the root console at INFO by default.
+    if HAS_IB:
+        from ib_insync import util
+        util.logToConsole(logging.ERROR)
+
+    return ib_log
+
+
+def register_ib_error_handler(ib: "IB", today: str) -> None:
+    """Structured IB error/warning log at data/live/<date>/ib_errors.jsonl."""
+    errors_path = LIVE_DIR / today / "ib_errors.jsonl"
+
+    def _on_error(reqId: int, errorCode: int, errorString: str, contract) -> None:
+        record = {
+            "ts": datetime.now().isoformat(),
+            "reqId": reqId,
+            "errorCode": errorCode,
+            "errorString": errorString,
+            "contract": str(contract) if contract else None,
+            "quiet": errorCode in _QUIET_IB_ERROR_CODES,
+        }
+        errors_path.parent.mkdir(parents=True, exist_ok=True)
+        with errors_path.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(record) + "\n")
+        if errorCode not in _QUIET_IB_ERROR_CODES:
+            label = getattr(contract, "localSymbol", None) or getattr(contract, "symbol", "")
+            print(f"IB error {errorCode} (reqId {reqId}): {errorString}"
+                  + (f" [{label}]" if label else ""))
+
+    ib.errorEvent += _on_error
+
+
+def _nearest_listed_strike(listed: Sequence[float], target: float) -> Optional[float]:
+    if not listed:
+        return None
+    return min(listed, key=lambda strike: abs(strike - target))
+
+
+def _ticker_bid_ask(ticker, *, delayed_fallback: bool) -> Tuple[float, float]:
+    """Return (bid, ask), optionally filling gaps from last/mid on delayed feeds."""
+    bid = float(ticker.bid) if ticker.bid and ticker.bid > 0 else 0.0
+    ask = float(ticker.ask) if ticker.ask and ticker.ask > 0 else 0.0
+    if not delayed_fallback or (bid > 0 and ask > 0):
+        return bid, ask
+
+    last = float(ticker.last) if ticker.last and ticker.last > 0 else 0.0
+    close = float(ticker.close) if ticker.close and ticker.close > 0 else 0.0
+    try:
+        mid = float(ticker.marketPrice()) if ticker.marketPrice() and ticker.marketPrice() > 0 else 0.0
+    except Exception:
+        mid = 0.0
+    ref = last or mid or close
+    if ref <= 0:
+        return bid, ask
+
+    if bid <= 0 and ask > 0:
+        bid = min(ref, ask * 0.98)
+    elif ask <= 0 and bid > 0:
+        ask = max(ref, bid * 1.02)
+    else:
+        bid = ref * 0.98
+        ask = ref * 1.02
+    return max(bid, 0.0), max(ask, 0.0)
+
+
+class IBSignalProvider:
+    """Pulls the live SPXW 0DTE chain from IB and builds an OptionQuote snapshot.
+
+    Uses snapshot quotes (``reqTickers``) capped to stay under IB's ~100-line limit.
+    Strike selection is wing-aware so 200/75pt spreads include both short and long legs.
     """
 
-    def __init__(self, ib: "IB", baselines_path: Optional[Path] = None):
+    def __init__(
+        self,
+        ib: "IB",
+        live: LiveConfig,
+        config: StrategyConfig,
+        baselines_path: Optional[Path] = None,
+    ):
         self.ib = ib
+        self.live = live
+        self.config = config
         self.baselines = self._load_baselines(baselines_path) if baselines_path else None
         self._spx = Index("SPX", "CBOE", "USD")
         self.ib.qualifyContracts(self._spx)
+        self._last_chain_log = 0.0
+        self._delayed_fallback = (
+            live.delayed_quote_fallback and live.market_data_type != 1
+        )
 
     @staticmethod
     def _load_baselines(path: Path) -> dict:
@@ -119,39 +219,122 @@ class IBSignalProvider:
 
     def _spx_spot(self) -> float:
         [ticker] = self.ib.reqTickers(self._spx)
-        return float(ticker.marketPrice() or ticker.close)
+        return float(ticker.marketPrice() or ticker.close or 0.0)
+
+    def _today_expiry(self, spxw) -> Optional[str]:
+        """Return YYYYMMDD for today's 0DTE, or the nearest listed expiry."""
+        today = datetime.now().date().strftime("%Y%m%d")
+        if today in spxw.expirations:
+            return today
+        future = sorted(e for e in spxw.expirations if e >= today)
+        return future[0] if future else None
+
+    def _select_strikes(self, spxw, spot: float) -> List[float]:
+        """Pick strikes for short legs AND fixed-width wings within the line budget."""
+        max_strikes = max(8, self.live.max_chain_lines // 2)
+        lo = spot - self.live.chain_points_below
+        hi = spot + self.live.chain_points_above
+        listed = sorted(s for s in spxw.strikes if lo <= s <= hi)
+        if not listed:
+            return []
+
+        cfg = self.config
+        put_wing = cfg.put_wing_width if cfg.put_wing_width > 0 else cfg.wing_width
+        call_wing = cfg.call_wing_width if cfg.call_wing_width > 0 else cfg.wing_width
+
+        # Typical ~20Δ shorts sit ~50–120 pts from spot on 0DTE; anchor there and
+        # force-include the corresponding long-wing strikes.
+        short_offsets = (50.0, 80.0, 110.0)
+        priority: List[float] = []
+        seen: set[float] = set()
+
+        def add(strike: Optional[float]) -> None:
+            if strike is None or strike not in listed or strike in seen:
+                return
+            seen.add(strike)
+            priority.append(strike)
+
+        for offset in short_offsets:
+            put_short = _nearest_listed_strike(listed, spot - offset)
+            call_short = _nearest_listed_strike(listed, spot + offset)
+            if put_short is not None:
+                add(put_short)
+                add(_nearest_listed_strike(listed, put_short - put_wing))
+            if call_short is not None:
+                add(call_short)
+                add(_nearest_listed_strike(listed, call_short + call_wing))
+
+        for strike in sorted(listed, key=lambda s: abs(s - spot)):
+            add(strike)
+            if len(priority) >= max_strikes:
+                break
+
+        return sorted(priority[:max_strikes])
+
+    def _req_tickers_batched(self, contracts: List[Contract], batch_size: int = 40) -> List:
+        """Snapshot quotes in batches (reqTickers auto-closes; no manual cancel)."""
+        tickers: List = []
+        for i in range(0, len(contracts), batch_size):
+            batch = contracts[i:i + batch_size]
+            tickers.extend(self.ib.reqTickers(*batch))
+        return tickers
+
+    def _log_chain_health(self, spot: float, quotes: Sequence[OptionQuote]) -> None:
+        """Periodic one-line status so you know data is flowing."""
+        now_ts = _time.time()
+        if now_ts - self._last_chain_log < 60:
+            return
+        self._last_chain_log = now_ts
+        with_delta = sum(1 for q in quotes if q.delta is not None)
+        with_bidask = sum(1 for q in quotes if q.bid > 0 and q.ask > 0)
+        strikes = sorted({q.strike for q in quotes})
+        span = f"{strikes[0]:.0f}-{strikes[-1]:.0f}" if strikes else "n/a"
+        fb = " fallback=on" if self._delayed_fallback else ""
+        print(f"[chain] spot={spot:.1f} quotes={len(quotes)} strikes={span} "
+              f"bid/ask={with_bidask} delta={with_delta}{fb}")
 
     def fetch(self, now: datetime) -> Tuple[List[OptionQuote], Optional[SignalSnapshot]]:
         spot = self._spx_spot()
-        today = now.date().isoformat()
+        if spot <= 0:
+            return [], None
+
         chains = self.ib.reqSecDefOptParams("SPX", "", "IND", self._spx.conId)
-        spxw = next((c for c in chains if c.tradingClass == "SPXW"), chains[0] if chains else None)
+        spxw = next((c for c in chains if c.tradingClass == "SPXW"), None)
         if spxw is None:
             return [], None
 
-        # Focus on strikes within a band around spot to limit data lines.
-        band = 0.06
-        strikes = sorted(s for s in spxw.strikes if abs(s - spot) <= spot * band)
-        expiry = today.replace("-", "")
+        expiry = self._today_expiry(spxw)
+        if expiry is None:
+            return [], None
+
+        strikes = self._select_strikes(spxw, spot)
+        if not strikes:
+            return [], None
+
         contracts: List[Contract] = []
         for strike in strikes:
             for right in ("P", "C"):
-                opt = Option("SPX", expiry, strike, right, "CBOE", tradingClass="SPXW")
-                contracts.append(opt)
-        self.ib.qualifyContracts(*contracts)
-        tickers = self.ib.reqTickers(*contracts)
+                contracts.append(
+                    Option("SPX", expiry, strike, right, "CBOE", tradingClass="SPXW")
+                )
 
+        # qualifyContracts drops strikes that don't exist for this expiry (Error 200).
+        self.ib.qualifyContracts(*contracts)
+        qualified = [c for c in contracts if c.conId]
+        if not qualified:
+            return [], None
+
+        tickers = self._req_tickers_batched(qualified)
+
+        today_iso = now.date().isoformat()
         quotes: List[OptionQuote] = []
-        for opt, tk in zip(contracts, tickers):
-            bid = float(tk.bid) if tk.bid and tk.bid > 0 else 0.0
-            ask = float(tk.ask) if tk.ask and tk.ask > 0 else 0.0
-            delta = None
-            if tk.modelGreeks is not None:
-                delta = tk.modelGreeks.delta
+        for opt, tk in zip(qualified, tickers):
+            bid, ask = _ticker_bid_ask(tk, delayed_fallback=self._delayed_fallback)
+            delta = tk.modelGreeks.delta if tk.modelGreeks is not None else None
             quotes.append(
                 OptionQuote(
                     timestamp=now,
-                    expiry=today,
+                    expiry=today_iso,
                     option_type="CALL" if opt.right == "C" else "PUT",
                     strike=float(opt.strike),
                     bid=bid,
@@ -161,6 +344,7 @@ class IBSignalProvider:
                 )
             )
 
+        self._log_chain_health(spot, quotes)
         signal = self._build_signal(now, quotes, spot)
         return quotes, signal
 
@@ -181,6 +365,55 @@ class IBSignalProvider:
 # --------------------------------------------------------------------------- #
 # Order construction
 # --------------------------------------------------------------------------- #
+def _round_spx_premium(price: float) -> float:
+    """SPX/SPXW options use $0.05 minimum increment for premiums under $3."""
+    if price <= 0:
+        return price
+    tick = 0.05 if price < 3.0 else 0.10
+    return round(round(price / tick) * tick, 2)
+
+
+def _candidate_option_type(candidate: CandidateRecord) -> str:
+    """Vertical spreads use the same option type on both legs."""
+    return candidate.short_type
+
+
+def _trade_rejection_reason(trade) -> str:
+    """Return a non-empty reason when IB rejected or cancelled the order."""
+    for entry in reversed(trade.log):
+        msg = entry.message or ""
+        code = getattr(entry, "errorCode", 0) or 0
+        if code in {201, 202, 203, 110} or "reject" in msg.lower() or "not allowed" in msg.lower():
+            return msg or f"error {code}"
+        if msg and "permission" in msg.lower():
+            return msg
+    status = (trade.orderStatus.status or "").lower()
+    if status in {"cancelled", "inactive", "apicancelled"} or "reject" in status:
+        return trade.orderStatus.status or "rejected"
+    return ""
+
+
+def _wait_for_combo_order(ib: "IB", trade, *, timeout_sec: float = 8.0) -> Tuple[str, str]:
+    """Poll until the combo is filled, rejected, or times out.
+
+    Returns ``(state, reason)`` where state is ``filled``, ``rejected``, or
+    ``pending``.
+    """
+    deadline = _time.time() + timeout_sec
+    while _time.time() < deadline:
+        ib.sleep(0.25)
+        reason = _trade_rejection_reason(trade)
+        if reason:
+            return "rejected", reason
+        status = (trade.orderStatus.status or "").lower()
+        filled = float(trade.orderStatus.filled or 0)
+        if status == "filled" or filled >= float(trade.order.totalQuantity):
+            return "filled", ""
+        if status in {"cancelled", "inactive", "apicancelled"}:
+            return "rejected", status
+    return "pending", ""
+
+
 def build_combo(ib: "IB", candidate: CandidateRecord, today: str) -> "Contract":
     """Build an SPXW vertical-spread BAG combo: sell the short leg, buy the wing."""
     expiry = today.replace("-", "")
@@ -209,13 +442,16 @@ def _short_option(ib: "IB", candidate: CandidateRecord, today: str) -> "Option":
 
 
 def place_spread(ib: "IB", candidate: CandidateRecord, contracts: int, config: StrategyConfig,
-                 today: str, dry: bool) -> OpenSpread:
+                 today: str, dry: bool) -> Tuple[OpenSpread, bool]:
     """Place the spread as a net-credit limit combo.
+
+    IB combo convention: **open** any vertical with ``BUY`` and a **negative**
+    limit price (net credit). ``SELL`` on the bag inverts leg actions and triggers
+    error 201 (riskless combination).
 
     The short-leg stop is managed synthetically in the run loop (mark + N-bar
     confirmation) so it matches the backtest; a wide native STP is attached only
-    as a crash backstop. The stop level mirrors the simulator:
-    ``short_entry_sell * stop_multiple`` on the short-leg ask.
+    as a crash backstop.
     """
     short_sell = candidate.short_quote.bid if candidate.short_quote else 0.0
     long_buy = candidate.long_quote.ask if candidate.long_quote else 0.0
@@ -227,22 +463,55 @@ def place_spread(ib: "IB", candidate: CandidateRecord, contracts: int, config: S
         stop_price=short_sell * config.stop_multiple,
     )
     if dry:
-        return spread
+        return spread, True
 
     bag, short_leg_opt = build_combo(ib, candidate, today)
-    # SELL the combo to collect the net credit (limit at the candidate credit).
-    combo_order = LimitOrder("SELL", contracts, round(candidate.credit, 2))
+    credit = _round_spx_premium(candidate.credit)
+    combo_order = LimitOrder("BUY", contracts, -credit)
+    combo_order.tif = "DAY"
     trade = ib.placeOrder(bag, combo_order)
     spread.combo_order_id = trade.order.orderId
 
-    # Native STP backstop only (well beyond the synthetic trigger) in case the
-    # process dies; the loop's synthetic stop is the primary, confirmation-gated
-    # exit that matches the backtest.
-    backstop = round(spread.stop_price * 1.5, 2)
+    state, reason = _wait_for_combo_order(ib, trade)
+    if state == "pending":
+        ib.cancelOrder(trade.order)
+        ib.sleep(0.5)
+        reason = _trade_rejection_reason(trade) or "timeout_unfilled"
+        state = "rejected"
+    if state != "filled":
+        log_event(today, {
+            "event": "order_rejected",
+            "side": candidate.side,
+            "short_strike": candidate.short_strike,
+            "long_strike": candidate.long_strike,
+            "contracts": contracts,
+            "credit": credit,
+            "status": trade.orderStatus.status,
+            "reason": reason,
+        })
+        print(f"[{datetime.now().isoformat()}] ORDER REJECTED {candidate.side} "
+              f"{candidate.short_strike}/{candidate.long_strike} "
+              f"status={trade.orderStatus.status} reason={reason}")
+        return spread, False
+
+    # Native STP backstop only after the combo fills (well beyond the synthetic
+    # trigger) in case the process dies; the loop's synthetic stop is primary.
+    backstop = _round_spx_premium(spread.stop_price * 1.5)
     if backstop > 0:
-        stop_trade = ib.placeOrder(short_leg_opt, StopOrder("BUY", contracts, backstop))
+        stop_order = StopOrder("BUY", contracts, backstop)
+        stop_order.tif = "DAY"
+        stop_trade = ib.placeOrder(short_leg_opt, stop_order)
         spread.stop_order_id = stop_trade.order.orderId
-    return spread
+        stop_reason = _trade_rejection_reason(stop_trade)
+        if stop_reason:
+            ib.cancelOrder(stop_trade.order)
+            log_event(today, {
+                "event": "stop_backstop_rejected",
+                "short_strike": candidate.short_strike,
+                "backstop": backstop,
+                "reason": stop_reason,
+            })
+    return spread, True
 
 
 def manage_stops(ib: "IB", open_spreads: Sequence[OpenSpread], quotes: Sequence[OptionQuote],
@@ -292,7 +561,8 @@ def flatten_all(ib: "IB", open_spreads: Sequence[OpenSpread], today: str, dry: b
             continue
         if not dry and HAS_IB:
             bag, _short_leg_opt = build_combo(ib, spread.candidate, today)
-            ib.placeOrder(bag, Order(action="BUY", totalQuantity=spread.contracts, orderType="MKT"))
+            # Close an opened combo with SELL (inverse of opening BUY).
+            ib.placeOrder(bag, Order(action="SELL", totalQuantity=spread.contracts, orderType="MKT"))
         spread.closed = True
 
 
@@ -306,6 +576,37 @@ def log_event(today: str, event: dict) -> None:
     event = {"ts": datetime.now().isoformat(), **event}
     with path.open("a", encoding="utf-8") as handle:
         handle.write(json.dumps(event) + "\n")
+
+
+def log_tranche(today: str, record: dict) -> None:
+    day_dir = LIVE_DIR / today
+    day_dir.mkdir(parents=True, exist_ok=True)
+    path = day_dir / "tranches.jsonl"
+    payload = {"ts": datetime.now().isoformat(), **record}
+    with path.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(payload, default=str) + "\n")
+
+
+def _tranche_log_dict(summary: TrancheSummary) -> dict:
+    row = asdict(summary)
+    row["timestamp"] = summary.timestamp.isoformat()
+    return row
+
+
+def _format_tranche_console(summary: TrancheSummary, executed: int) -> str:
+    clock = summary.timestamp.strftime("%H:%M")
+    if summary.skip_reason:
+        return (f"[tranche] {clock} SKIP {summary.skip_reason} "
+                f"(policy={summary.policy_contracts})")
+    if executed > 0:
+        return (f"[tranche] {clock} ENTRY x{executed} "
+                f"{summary.selected_summary or 'selected'}")
+    reason = summary.top_reject_reason or "no_pass"
+    best = summary.best_pass_score
+    best_txt = f"{best:.3f}" if best is not None else "n/a"
+    return (f"[tranche] {clock} SKIP {reason} "
+            f"candidates={summary.candidates_total} pass={summary.candidates_pass} "
+            f"best_pass={best_txt}")
 
 
 def write_session_snapshot(today: str, live: LiveConfig, config: StrategyConfig, sizing_scheme: str) -> None:
@@ -334,6 +635,101 @@ def _tranche_base_contracts(config: StrategyConfig, sizing_schedule, now: dateti
     if sizing_schedule:
         base = round(base * schedule_multiplier(now.time(), sizing_schedule))
     return max(0, base)
+
+
+def _process_tranche(
+    *,
+    now: datetime,
+    today: str,
+    quotes: Sequence[OptionQuote],
+    signal: Optional[SignalSnapshot],
+    config: StrategyConfig,
+    sizing_schedule,
+    live: LiveConfig,
+    ib: Optional["IB"],
+    dry: bool,
+    entries_halted: bool,
+    open_spreads: List[OpenSpread],
+    gross_credit_sold: float,
+    daily_credit_cap: float,
+    sleeve_margin_used: dict,
+    portfolio_margin_used: float,
+) -> Tuple[int, float, float, float]:
+    """Evaluate one entry tranche; log diagnostics; place any selected spreads."""
+    base_contracts = _tranche_base_contracts(config, sizing_schedule, now)
+    skip_reason = ""
+    if entries_halted:
+        skip_reason = "entries_halted"
+    elif signal is None:
+        skip_reason = "no_signal"
+    elif not quotes:
+        skip_reason = "empty_chain"
+    elif base_contracts <= 0:
+        skip_reason = "zero_base_contracts"
+
+    records: List[CandidateRecord] = []
+    selected: List[CandidateRecord] = []
+    if not skip_reason:
+        records = build_scored_candidates(quotes, signal, config)
+        selected, records = select_candidate_entries(
+            quotes, signal, base_contracts, config, records=records
+        )
+
+    executed = 0
+    credit_added = 0.0
+    margin_added = 0.0
+    order_rejected = False
+    for cand in selected:
+        if cand.short_quote is None or cand.long_quote is None:
+            continue
+        contracts = _size_with_caps(
+            cand, config, gross_credit_sold + credit_added,
+            daily_credit_cap, sleeve_margin_used, portfolio_margin_used + margin_added,
+        )
+        contracts = min(contracts, live.max_contracts_per_tranche)
+        if contracts <= 0:
+            cand.status = "blocked"
+            cand.reason = "risk_blocked_size_cap"
+            continue
+        spread, placed = place_spread(ib, cand, contracts, config, today, dry)
+        if not placed:
+            if not dry:
+                order_rejected = True
+            continue
+        open_spreads.append(spread)
+        executed += 1
+        if cand.credit > 0:
+            credit_added += cand.credit * contracts * config.multiplier
+        margin = candidate_margin_per_contract(cand, config) * contracts
+        sleeve = cand.sleeve or "core"
+        sleeve_margin_used[sleeve] = sleeve_margin_used.get(sleeve, 0.0) + margin
+        margin_added += margin
+        log_event(today, {"event": "entry", "side": cand.side, "sleeve": sleeve,
+                          "short_strike": cand.short_strike, "long_strike": cand.long_strike,
+                          "contracts": contracts, "credit": round(cand.credit, 2),
+                          "score": round(cand.score, 3), "dry": dry})
+        print(f"[{now.isoformat()}] ENTRY {cand.side} {cand.short_strike}/{cand.long_strike} "
+              f"x{contracts} credit={cand.credit:.2f} score={cand.score:.2f}"
+              f"{' (dry)' if dry else ''}")
+
+    if not skip_reason and executed == 0 and selected:
+        skip_reason = "order_rejected" if order_rejected else "risk_blocked_size_cap"
+
+    summary = _summarize_tranche_from_records(
+        now,
+        entries_halted,
+        signal,
+        base_contracts,
+        records,
+        skip_reason=skip_reason,
+        executed_count=executed,
+    )
+    tranche_row = _tranche_log_dict(summary)
+    tranche_row["executed"] = executed
+    log_tranche(today, tranche_row)
+    print(f"[{now.isoformat()}] {_format_tranche_console(summary, executed)}")
+
+    return executed, credit_added, margin_added, portfolio_margin_used + margin_added
 
 
 def run(live: LiveConfig = ACTIVE) -> None:
@@ -366,9 +762,21 @@ def run(live: LiveConfig = ACTIVE) -> None:
         if not HAS_IB:
             raise SystemExit("ib_insync required for IB connection: pip install ib_insync")
         ib = IB()
+        ib_log = setup_ib_logging(today)
         port = live.port or (7497 if live.mode == "paper" else 7496)
         ib.connect(live.host, port, clientId=live.client_id)
-        provider = IBSignalProvider(ib, Path(live.baselines_path) if live.baselines_path else None)
+        ib.reqMarketDataType(live.market_data_type)
+        register_ib_error_handler(ib, today)
+        print(f"IB connected (port {port}, market_data_type={live.market_data_type} "
+              f"{'live' if live.market_data_type == 1 else 'delayed' if live.market_data_type == 3 else 'other'})")
+        print(f"IB messages -> {ib_log} and data/live/{today}/ib_errors.jsonl")
+        print(f"Tranche diagnostics -> data/live/{today}/tranches.jsonl")
+        provider = IBSignalProvider(
+            ib,
+            live,
+            config,
+            Path(live.baselines_path) if live.baselines_path else None,
+        )
 
     open_spreads: List[OpenSpread] = []
     gross_credit_sold = 0.0
@@ -408,35 +816,26 @@ def run(live: LiveConfig = ACTIVE) -> None:
 
             # 3. Entries on tranche boundaries (once per tranche).
             tranche_key = (now.hour, now.minute)
-            if (not entries_halted and signal is not None and is_entry_time(now, config)
-                    and tranche_key not in traded_tranches):
+            if is_entry_time(now, config) and tranche_key not in traded_tranches:
                 traded_tranches.add(tranche_key)
-                base_contracts = _tranche_base_contracts(config, sizing_schedule, now)
-                if base_contracts > 0:
-                    selected, _records = select_candidate_entries(quotes, signal, base_contracts, config)
-                    for cand in selected:
-                        if cand.short_quote is None or cand.long_quote is None:
-                            continue
-                        contracts = _size_with_caps(cand, config, gross_credit_sold, daily_credit_cap,
-                                                    sleeve_margin_used, portfolio_margin_used)
-                        contracts = min(contracts, live.max_contracts_per_tranche)
-                        if contracts <= 0:
-                            continue
-                        spread = place_spread(ib, cand, contracts, config, today, dry)
-                        open_spreads.append(spread)
-                        if cand.credit > 0:
-                            gross_credit_sold += cand.credit * contracts * config.multiplier
-                        margin = candidate_margin_per_contract(cand, config) * contracts
-                        sleeve = cand.sleeve or "core"
-                        sleeve_margin_used[sleeve] = sleeve_margin_used.get(sleeve, 0.0) + margin
-                        portfolio_margin_used += margin
-                        log_event(today, {"event": "entry", "side": cand.side, "sleeve": sleeve,
-                                          "short_strike": cand.short_strike, "long_strike": cand.long_strike,
-                                          "contracts": contracts, "credit": round(cand.credit, 2),
-                                          "score": round(cand.score, 3), "dry": dry})
-                        print(f"[{now.isoformat()}] ENTRY {cand.side} {cand.short_strike}/{cand.long_strike} "
-                              f"x{contracts} credit={cand.credit:.2f} score={cand.score:.2f}"
-                              f"{' (dry)' if dry else ''}")
+                executed, credit_added, _, portfolio_margin_used = _process_tranche(
+                    now=now,
+                    today=today,
+                    quotes=quotes,
+                    signal=signal,
+                    config=config,
+                    sizing_schedule=sizing_schedule,
+                    live=live,
+                    ib=ib,
+                    dry=dry,
+                    entries_halted=entries_halted,
+                    open_spreads=open_spreads,
+                    gross_credit_sold=gross_credit_sold,
+                    daily_credit_cap=daily_credit_cap,
+                    sleeve_margin_used=sleeve_margin_used,
+                    portfolio_margin_used=portfolio_margin_used,
+                )
+                gross_credit_sold += credit_added
 
             _time.sleep(live.poll_seconds)
     except Exception as exc:  # safety: never leave positions unmanaged
@@ -488,14 +887,15 @@ def _mark_book(open_spreads: Sequence[OpenSpread], quotes: Sequence[OptionQuote]
         if spread.closed:
             continue
         cand = spread.candidate
-        lq = lookup.get((cand.long_type, cand.long_strike))
+        opt_type = _candidate_option_type(cand)
+        lq = lookup.get((opt_type, cand.long_strike))
         if lq is None:
             continue
         if spread.stopped:
             # Short already bought back; only the long wing marks from here.
             per_contract = spread.short_entry_sell - spread.stop_price - spread.long_entry_buy + lq.bid
         else:
-            sq = lookup.get((cand.short_type, cand.short_strike))
+            sq = lookup.get((opt_type, cand.short_strike))
             if sq is None:
                 continue
             per_contract = spread.short_entry_sell - sq.ask - spread.long_entry_buy + lq.bid

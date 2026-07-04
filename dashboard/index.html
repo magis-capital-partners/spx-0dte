@@ -153,6 +153,15 @@ function RunMeta({run}) {
     <div className="panel">
       <h2>{run.label}</h2>
       <p style={{margin:"0 0 8px"}}>{run.meta.description}</p>
+      {run.meta.date_range && (
+        <p className="sub" style={{margin:"0 0 8px"}}>
+          Backtest window: <strong>{run.meta.date_range}</strong>
+          {run.meta.oos_days ? ` · ${run.meta.oos_days} OOS days` : ""}
+        </p>
+      )}
+      {run.meta.sizing_schedule && (
+        <p className="sub" style={{margin:"0 0 8px"}}>Sizing: {run.meta.sizing_schedule}</p>
+      )}
       {run.meta.note && <p className="sub" style={{margin:0}}>{run.meta.note}</p>}
     </div>
   );
@@ -453,11 +462,13 @@ function App({ viewer }) {
   useEffect(()=>{ fetch("data/dashboard_data.json").then(r=>{if(!r.ok)throw new Error(r.status);return r.json();}).then(setData).catch(e=>setErr(String(e))); },[]);
   if(err) return <main><div className="panel">Could not load <code>data/dashboard_data.json</code>: {err}. Run <code>python dashboard/build_dashboard_data.py</code> first.</div></main>;
   if(!data) return <main><div className="muted">Loading…</div></main>;
+  const primary = data.runs.find(r=>r.id===data.primary_run_id) || data.runs[0];
+  const windowLabel = primary?.meta?.date_range ? ` · ${primary.meta.date_range}` : "";
   return (
     <div>
       <header>
         <h1>SPX 0DTE Strategy Dashboard</h1>
-        <span className="sub">${data.account_equity.toLocaleString()} equity · {data.runs.length} runs · built {new Date(data.generated_at).toLocaleString()}{viewer ? ` · ${viewer.name}` : ""}</span>
+        <span className="sub">${data.account_equity.toLocaleString()} equity · {data.runs.length} run(s){windowLabel} · built {new Date(data.generated_at).toLocaleString()}{viewer ? ` · ${viewer.name}` : ""}</span>
       </header>
       <div className="tabs">
         <div className={"tab"+(tab==="overview"?" active":"")} onClick={()=>setTab("overview")}>Overview</div>
