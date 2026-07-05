@@ -314,11 +314,13 @@ def main() -> None:
     parser.add_argument("--account-equity", type=float, default=13_000_000)
     parser.add_argument("--mbh-returns", default=str(ROOT / "data" / "mbh_returns" / "All_Time_Net_Returns.csv"))
     parser.add_argument("--live-dir", default=str(ROOT / "data" / "live"))
+    parser.add_argument("--primary-run-id", default="", help="Default focus run (default: first --run).")
     parser.add_argument("--out", default=str(Path(__file__).resolve().parent / "data" / "dashboard_data.json"))
     args = parser.parse_args()
 
     default_runs = [
-        "linear_decay_downsize=data/dashboard_runs/linear_decay_downsize:3D + linear decay · full history (2019–2026)",
+        "p3_trend1_skew075=data/dashboard_runs/p3_trend1_skew075:#1 Trend + Skew gates",
+        "linear_decay_downsize=data/dashboard_runs/linear_decay_downsize:Baseline 3D + linear decay",
     ]
     specs = args.run or default_runs
 
@@ -333,7 +335,7 @@ def main() -> None:
                 "description": (
                     "3D_flatten_3.5 substrate (wide wings 200/75, 3x stop + 2-bar confirm, "
                     "halt -2.25%, flatten -3.5%) with time-of-day sizing: sell more early, less late. "
-                    "Mon/Wed/Fri only before Apr 2022; all weekdays thereafter."
+                    "Mon/Wed/Fri only before Apr 2022; all weekdays thereafter. Unconditional gates off."
                 ),
                 "sizing_schedule": (
                     "09:32-10:29 1.25x (39), 10:30-11:29 1.0x (31), 11:30-12:29 0.85x (26), "
@@ -341,6 +343,22 @@ def main() -> None:
                 ),
                 "credit_cap_pct": 50.0,
                 "mbh_credit_target_pct": 1.5,
+            }
+        elif id_part == "p3_trend1_skew075":
+            meta = {
+                "description": (
+                    "Improvement-plan #1: same 3D substrate + linear_decay_downsize sizing, but re-enables "
+                    "entry gates disabled in the unconditional baseline — blocks bear_calls when trend_score > 1.0 "
+                    "or skew_z > 0.75 (adverse uptrend / elevated call skew)."
+                ),
+                "gates": (
+                    "candidate_max_adverse_trend=1.0 · candidate_max_adverse_skew=0.75"
+                ),
+                "sizing_schedule": (
+                    "09:32-10:29 1.25x, 10:30-11:29 1.0x, 11:30-12:29 0.85x, "
+                    "12:30-13:29 0.6x, 13:30-14:29 0.45x, 14:30-15:30 0.25x"
+                ),
+                "credit_cap_pct": 50.0,
             }
         run = build_run(id_part, results_dir, label or id_part, args.account_equity, meta)
         if run:
@@ -367,10 +385,11 @@ def main() -> None:
             print(f"  added {id_part}: CAGR {s.get('cagr_pct')}% Sharpe {s.get('sharpe')} "
                   f"maxDD {s.get('max_drawdown_pct')}% ({len(run['daily'])} days)")
 
+    primary_id = args.primary_run_id or (runs[0]["id"] if runs else None)
     blob = {
         "generated_at": datetime.now().isoformat(),
         "account_equity": args.account_equity,
-        "primary_run_id": runs[0]["id"] if runs else None,
+        "primary_run_id": primary_id,
         "runs": runs,
         "mbh_benchmark": {"monthly": parse_mbh_benchmark(Path(args.mbh_returns))},
         "live": build_live(Path(args.live_dir), args.account_equity),

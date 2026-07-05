@@ -36,8 +36,7 @@ python -m http.server 8000
 Full historical run (local cache, no ThetaData download):
 
 ```powershell
-python simulator/historical_3d_backtest.py --start-date 2019-01-02 --end-date 2026-07-02 `
-  --results-dir data/dashboard_runs/linear_decay_downsize
+python simulator/export_dashboard_run.py --preset p3_trend1_skew075
 python dashboard/build_dashboard_data.py
 # or: .\scripts\sync_dashboard.ps1
 ```

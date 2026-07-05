@@ -162,6 +162,9 @@ function RunMeta({run}) {
       {run.meta.sizing_schedule && (
         <p className="sub" style={{margin:"0 0 8px"}}>Sizing: {run.meta.sizing_schedule}</p>
       )}
+      {run.meta.gates && (
+        <p className="sub" style={{margin:"0 0 8px"}}>Entry gates: {run.meta.gates}</p>
+      )}
       {run.meta.note && <p className="sub" style={{margin:0}}>{run.meta.note}</p>}
     </div>
   );

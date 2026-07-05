@@ -22,7 +22,9 @@ if (-not (Test-Path $Git)) { $Git = "git" }
 if (-not $DeployOnly) {
   Write-Host "Building dashboard data..."
   & $Python "$Root\dashboard\build_dashboard_data.py" `
-    --run "linear_decay_downsize=data/dashboard_runs/linear_decay_downsize:3D + linear decay · full history (2019–2026)" `
+    --run "p3_trend1_skew075=data/dashboard_runs/p3_trend1_skew075:#1 Trend + Skew gates" `
+    --run "linear_decay_downsize=data/dashboard_runs/linear_decay_downsize:Baseline 3D + linear decay" `
+    --primary-run-id "p3_trend1_skew075" `
     --account-equity $Equity `
     --out "$Root\dashboard\data\dashboard_data.json"
 }
