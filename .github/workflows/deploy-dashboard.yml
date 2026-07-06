@@ -4,7 +4,7 @@ on:
   push:
     branches: [main]
     paths:
-      - "dashboard/**"
+      - "docs/**"
       - ".github/workflows/deploy-dashboard.yml"
   workflow_dispatch:
 
@@ -28,6 +28,6 @@ jobs:
       - uses: actions/configure-pages@v5
       - uses: actions/upload-pages-artifact@v3
         with:
-          path: dashboard
+          path: docs
       - id: deployment
         uses: actions/deploy-pages@v4

@@ -21,22 +21,22 @@ if (-not (Test-Path $Git)) { $Git = "git" }
 
 if (-not $DeployOnly) {
   Write-Host "Building dashboard data..."
-  & $Python "$Root\dashboard\build_dashboard_data.py" `
+  & $Python "$Root\docs\build_dashboard_data.py" `
     --run "p3_trend1_skew075=data/dashboard_runs/p3_trend1_skew075:#1 Trend + Skew gates" `
     --run "linear_decay_downsize=data/dashboard_runs/linear_decay_downsize:Baseline 3D + linear decay" `
     --primary-run-id "p3_trend1_skew075" `
     --account-equity $Equity `
-    --out "$Root\dashboard\data\dashboard_data.json"
+    --out "$Root\docs\data\dashboard_data.json"
 }
 
 if (-not $Push) {
-  Write-Host "Done. Preview: cd dashboard; python -m http.server 8000"
+  Write-Host "Done. Preview: cd docs; python -m http.server 8000"
   Write-Host "Deploy: .\scripts\sync_dashboard.ps1 -Push"
   exit 0
 }
 
 Push-Location $Root
-& $Git add dashboard/
+& $Git add docs/
 $staged = & $Git diff --cached --name-only
 if (-not $staged) {
   Write-Host "No dashboard changes to commit."
@@ -46,5 +46,5 @@ if (-not $staged) {
 & $Git -c user.name="Drew Goldman" -c user.email="dag5wd@virginia.edu" commit -m "dashboard: refresh backtest data and deploy"
 & $Git push origin main
 Pop-Location
-Write-Host "Pushed main. GitHub Pages serves dashboard/ from main (allow ~1 min to propagate)."
+Write-Host "Pushed main. Set Pages to branch main, folder /docs (allow ~1 min to propagate)."
 Write-Host "Site: https://magis-capital-partners.github.io/spx-0dte/"
