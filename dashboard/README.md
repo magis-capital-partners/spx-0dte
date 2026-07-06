@@ -12,9 +12,7 @@ Static React dashboard for backtest runs, MBH benchmark comparison, and (when wi
 
 ## Deployment
 
-**GitHub Actions** (recommended). Pushes to `main` that touch `dashboard/**` trigger `.github/workflows/deploy-dashboard.yml`.
-
-One-time: **Settings → Pages → Build and deployment → Source: GitHub Actions**.
+**GitHub Pages** deploys from the **`/dashboard`** folder on **`main`** (Settings → Pages → Deploy from a branch). Pushing updates to `dashboard/` on `main` refreshes the live site — no separate deploy step.
 
 ```powershell
 .\scripts\sync_dashboard.ps1 -Push

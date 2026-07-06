@@ -1,6 +1,6 @@
 # Dashboard (in this repo)
 
-The interactive site is deployed from **`dashboard/`** in this private repo via GitHub Actions.
+The interactive site is deployed from the **`dashboard/`** folder on **`main`** (GitHub Pages → branch deploy).
 
 | Layer | What it does |
 |-------|----------------|
@@ -16,7 +16,7 @@ The interactive site is deployed from **`dashboard/`** in this private repo via 
 .\scripts\sync_dashboard.ps1 -Push
 ```
 
-Rebuilds `dashboard/data/dashboard_data.json`, commits `dashboard/`, pushes `main`, and triggers **Deploy dashboard to GitHub Pages**.
+Rebuilds `dashboard/data/dashboard_data.json`, commits `dashboard/`, and pushes `main` (Pages serves `/dashboard` on `main`).
 
 Preview locally:
 

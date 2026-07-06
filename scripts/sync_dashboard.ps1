@@ -2,7 +2,7 @@
 #
 # Usage (from repo root):
 #   .\scripts\sync_dashboard.ps1              # rebuild dashboard/data/dashboard_data.json only
-#   .\scripts\sync_dashboard.ps1 -Push        # commit dashboard/ + push main (Actions deploys Pages)
+#   .\scripts\sync_dashboard.ps1 -Push        # commit dashboard/ + push main (Pages serves /dashboard on main)
 #   .\scripts\sync_dashboard.ps1 -DeployOnly  # push existing dashboard/ without rebuilding
 
 param(
@@ -46,5 +46,5 @@ if (-not $staged) {
 & $Git -c user.name="Drew Goldman" -c user.email="dag5wd@virginia.edu" commit -m "dashboard: refresh backtest data and deploy"
 & $Git push origin main
 Pop-Location
-Write-Host "Pushed main. GitHub Actions will deploy Pages from dashboard/."
+Write-Host "Pushed main. GitHub Pages serves dashboard/ from main (allow ~1 min to propagate)."
 Write-Host "Site: https://magis-capital-partners.github.io/spx-0dte/"
