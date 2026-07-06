@@ -23,7 +23,6 @@ if (-not $DeployOnly) {
   Write-Host "Building dashboard data..."
   & $Python "$Root\docs\build_dashboard_data.py" `
     --run "p3_trend1_skew075=data/dashboard_runs/p3_trend1_skew075:#1 Trend + Skew gates" `
-    --run "linear_decay_downsize=data/dashboard_runs/linear_decay_downsize:Baseline 3D + linear decay" `
     --primary-run-id "p3_trend1_skew075" `
     --account-equity $Equity `
     --out "$Root\docs\data\dashboard_data.json"

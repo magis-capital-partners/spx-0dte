@@ -52,6 +52,15 @@
   .login-btn { width:100%; margin-top:8px; padding:10px; border-radius:8px; border:none; background:var(--blue); color:#fff; font-weight:650; cursor:pointer; }
   .login-btn:disabled { opacity:.55; cursor:not-allowed; }
   .login-error { margin-top:12px; color:var(--red); font-size:12px; }
+  .guide h3 { font-size:15px; margin:20px 0 8px; font-weight:600; }
+  .guide h3:first-child { margin-top:0; }
+  .guide p { margin:0 0 10px; color:var(--ink); line-height:1.55; }
+  .guide ul { margin:0 0 12px 18px; padding:0; color:var(--ink); line-height:1.55; }
+  .guide li { margin-bottom:6px; }
+  .guide-head { margin-bottom:16px; }
+  .guide-head .lead { font-size:15px; margin:8px 0 0; color:var(--muted); }
+  .result-grid { display:grid; grid-template-columns:repeat(auto-fill,minmax(200px,1fr)); gap:10px; margin-top:14px; }
+  .result-grid .card .v { font-size:17px; }
 </style>
 </head>
 <body>
@@ -63,9 +72,22 @@ const fmt$ = (n) => (n<0?"-$":"$") + Math.abs(n).toLocaleString(undefined,{maxim
 const fmtPct = (n,d=2) => (n==null||isNaN(n)?"–":n.toFixed(d)+"%");
 const cls = (n) => n>0?"pos":n<0?"neg":"";
 
+function yearAxisTicks(sortedDates) {
+  const ticks = [];
+  let lastYear = "";
+  for (const d of sortedDates) {
+    const y = String(d).slice(0, 4);
+    if (y && y !== lastYear) {
+      ticks.push({ x: d, label: y });
+      lastYear = y;
+    }
+  }
+  return ticks;
+}
+
 function LineChart({series, height=320, yLabel="Cumulative P&L ($)"}) {
   // series: [{name, color, points:[{x:dateStr, y:number}]}]
-  const pad = {l:64,r:16,t:16,b:36};
+  const pad = {l:64,r:16,t:16,b:48};
   const W=900, H=height;
   const all = series.flatMap(s=>s.points);
   if(!all.length) return <div className="muted">No data.</div>;
@@ -78,7 +100,7 @@ function LineChart({series, height=320, yLabel="Cumulative P&L ($)"}) {
   const yToPx = (y)=> pad.t + (1-(y-ymin)/(ymax-ymin))*(H-pad.t-pad.b);
   const ticks = 5;
   const yticks = Array.from({length:ticks+1},(_,i)=>ymin+(i/ticks)*(ymax-ymin));
-  const xticks = xs.filter((_,i)=> i % Math.ceil(xs.length/8) === 0);
+  const xticks = yearAxisTicks(xs);
   return (
     <svg viewBox={`0 0 ${W} ${H}`} style={{width:"100%",height:H}}>
       {yticks.map((yt,i)=>(
@@ -87,8 +109,11 @@ function LineChart({series, height=320, yLabel="Cumulative P&L ($)"}) {
           <text x={pad.l-8} y={yToPx(yt)+4} fill="#8aa0bd" fontSize="11" textAnchor="end">{fmt$(yt)}</text>
         </g>
       ))}
-      {xticks.map((xt,i)=>(
-        <text key={i} x={xToPx(xt)} y={H-12} fill="#8aa0bd" fontSize="10" textAnchor="middle">{xt.slice(5)}</text>
+      {xticks.map((t,i)=>(
+        <g key={i}>
+          <line x1={xToPx(t.x)} x2={xToPx(t.x)} y1={H-pad.b} y2={H-pad.b+4} stroke="#3a4a5e" strokeWidth="1"/>
+          <text x={xToPx(t.x)} y={H-8} fill="#8aa0bd" fontSize="11" textAnchor="middle" fontWeight="600">{t.label}</text>
+        </g>
       ))}
       {series.map((s,si)=>{
         const d = s.points.map((p,i)=>`${i===0?"M":"L"}${xToPx(p.x)},${yToPx(p.y)}`).join(" ");
@@ -100,14 +125,17 @@ function LineChart({series, height=320, yLabel="Cumulative P&L ($)"}) {
 
 function BarChart({data, height=260}) {
   // data: [{x, y}]
-  const pad={l:64,r:16,t:16,b:36}; const W=900,H=height;
+  const pad={l:64,r:16,t:16,b:48}; const W=900,H=height;
   if(!data.length) return <div className="muted">No data.</div>;
+  const xs = data.map(d=>d.x);
   const ys=data.map(d=>d.y); let ymin=Math.min(0,...ys), ymax=Math.max(0,...ys);
   if(ymin===ymax) ymax=ymin+1;
   const bw=(W-pad.l-pad.r)/data.length*0.7;
   const xToPx=(i)=> pad.l + (i+0.5)/data.length*(W-pad.l-pad.r);
   const yToPx=(y)=> pad.t + (1-(y-ymin)/(ymax-ymin))*(H-pad.t-pad.b);
   const zero=yToPx(0);
+  const xticks = yearAxisTicks(xs);
+  const dateIndex = Object.fromEntries(xs.map((d,i)=>[d,i]));
   return (
     <svg viewBox={`0 0 ${W} ${H}`} style={{width:"100%",height:H}}>
       <line x1={pad.l} x2={W-pad.r} y1={zero} y2={zero} stroke="#3a4a5e"/>
@@ -115,9 +143,14 @@ function BarChart({data, height=260}) {
         const y=yToPx(d.y);
         return <g key={i}>
           <rect x={xToPx(i)-bw/2} y={Math.min(y,zero)} width={bw} height={Math.abs(y-zero)} fill={d.y>=0?"#3fb950":"#f85149"} opacity="0.85"/>
-          {data.length<=24 && <text x={xToPx(i)} y={H-12} fill="#8aa0bd" fontSize="9" textAnchor="middle">{String(d.x).slice(5)}</text>}
         </g>;
       })}
+      {xticks.map((t,i)=>(
+        <g key={i}>
+          <line x1={xToPx(dateIndex[t.x])} x2={xToPx(dateIndex[t.x])} y1={H-pad.b} y2={H-pad.b+4} stroke="#3a4a5e" strokeWidth="1"/>
+          <text x={xToPx(dateIndex[t.x])} y={H-8} fill="#8aa0bd" fontSize="11" textAnchor="middle" fontWeight="600">{t.label}</text>
+        </g>
+      ))}
     </svg>
   );
 }
@@ -148,7 +181,10 @@ function Cards({summary, extra=[]}) {
 }
 
 function RunMeta({run}) {
-  if(!run?.meta?.description) return null;
+  if(!run?.meta) return null;
+  const g = run.meta.strategy_guide;
+  if (g) return <StrategyGuide guide={g} run={run} />;
+  if(!run.meta.description) return null;
   return (
     <div className="panel">
       <h2>{run.label}</h2>
@@ -166,6 +202,47 @@ function RunMeta({run}) {
         <p className="sub" style={{margin:"0 0 8px"}}>Entry gates: {run.meta.gates}</p>
       )}
       {run.meta.note && <p className="sub" style={{margin:0}}>{run.meta.note}</p>}
+    </div>
+  );
+}
+
+function StrategyGuide({guide, run}) {
+  if (!guide) return null;
+  return (
+    <div className="panel guide">
+      <div className="guide-head">
+        <h2>{guide.title || run?.label}</h2>
+        {guide.subtitle && <p className="lead">{guide.subtitle}</p>}
+        {run?.meta?.date_range && (
+          <p className="sub" style={{marginTop:10}}>
+            Backtest: <strong>{run.meta.date_range}</strong>
+            {run.meta.oos_days ? ` · ${run.meta.oos_days} eligible OOS days` : ""}
+            {run.meta.note ? ` · ${run.meta.note}` : ""}
+          </p>
+        )}
+      </div>
+      {(guide.sections || []).map((sec, i) => (
+        <div key={i}>
+          <h3>{sec.title}</h3>
+          {(sec.paragraphs || []).map((p, j) => <p key={j}>{p}</p>)}
+          {sec.bullets?.length ? (
+            <ul>{sec.bullets.map((b, j) => <li key={j}>{b}</li>)}</ul>
+          ) : null}
+        </div>
+      ))}
+      {guide.results?.length ? (
+        <>
+          <h3>Backtest results (this run)</h3>
+          <div className="result-grid">
+            {guide.results.map((r, i) => (
+              <div className="card" key={i}>
+                <div className="k">{r.label}</div>
+                <div className="v">{r.value}</div>
+              </div>
+            ))}
+          </div>
+        </>
+      ) : null}
     </div>
   );
 }
@@ -208,76 +285,83 @@ function VolPanel({run, targets}) {
 }
 
 function Overview({data}) {
-  const primaryId = data.primary_run_id || data.runs[0]?.id;
-  const [focusId,setFocusId] = useState(primaryId);
+  const focus = data.runs.find(r=>r.id===data.primary_run_id) || data.runs[0];
+  const multi = data.runs.length > 1;
+  const [focusId,setFocusId] = useState(focus?.id);
   const [activeRuns,setActiveRuns]=useState(data.runs.map(r=>r.id));
   const toggle=(id)=> setActiveRuns(a=> a.includes(id)?a.filter(x=>x!==id):[...a,id]);
-  const focus = data.runs.find(r=>r.id===focusId) || data.runs[0];
+  const focusRun = multi ? (data.runs.find(r=>r.id===focusId) || focus) : focus;
   const series = data.runs.filter(r=>activeRuns.includes(r.id)).map((r,i)=>({
     name:r.label, color:COLORS[data.runs.indexOf(r)%COLORS.length],
     points:r.daily.map(d=>({x:d.date,y:d.cum_pnl}))
   }));
-  const equitySeries = focus ? [{name:"Equity", color:COLORS[0], points:focus.daily.map(d=>({x:d.date,y:d.equity}))}] : [];
-  const ddSeries = focus ? [{name:"Drawdown", color:"#f85149", points:focus.daily.map(d=>({x:d.date,y:-(d.drawdown_pct||0)/100*data.account_equity}))}] : [];
-  const dailyBars = focus ? focus.daily.map(d=>({x:d.date, y:d.net_pnl})) : [];
+  const equitySeries = focusRun ? [{name:"Equity", color:COLORS[0], points:focusRun.daily.map(d=>({x:d.date,y:d.equity}))}] : [];
+  const ddSeries = focusRun ? [{name:"Drawdown", color:"#f85149", points:focusRun.daily.map(d=>({x:d.date,y:-(d.drawdown_pct||0)/100*data.account_equity}))}] : [];
+  const dailyBars = focusRun ? focusRun.daily.map(d=>({x:d.date, y:d.net_pnl})) : [];
   return (
     <div>
-      <div className="row">
-        <label className="muted">Primary run</label>
-        <select value={focusId} onChange={e=>setFocusId(e.target.value)}>
-          {data.runs.map(r=><option key={r.id} value={r.id}>{r.label}</option>)}
-        </select>
-      </div>
-      <RunMeta run={focus}/>
-      <Cards summary={focus?.summary}/>
-      <div className="panel">
-        <h2>Cumulative P&L — backtest runs</h2>
-        <div className="legend" style={{marginBottom:10}}>
-          {data.runs.map((r,i)=>(
-            <span key={r.id} onClick={()=>toggle(r.id)} style={{cursor:"pointer",opacity:activeRuns.includes(r.id)?1:0.4}}>
-              <span className="swatch" style={{background:COLORS[i%COLORS.length]}}></span>{r.label}
-              <span className="muted"> · {fmtPct(r.summary.cagr_pct)} CAGR · Sharpe {r.summary.sharpe?.toFixed(2)}</span>
-            </span>
-          ))}
+      {multi && (
+        <div className="row">
+          <label className="muted">Primary run</label>
+          <select value={focusId} onChange={e=>setFocusId(e.target.value)}>
+            {data.runs.map(r=><option key={r.id} value={r.id}>{r.label}</option>)}
+          </select>
         </div>
-        <LineChart series={series}/>
+      )}
+      <RunMeta run={focusRun}/>
+      <Cards summary={focusRun?.summary}/>
+      <div className="panel">
+        <h2>Cumulative P&L{multi ? " — backtest runs" : ""}</h2>
+        {multi && (
+          <div className="legend" style={{marginBottom:10}}>
+            {data.runs.map((r,i)=>(
+              <span key={r.id} onClick={()=>toggle(r.id)} style={{cursor:"pointer",opacity:activeRuns.includes(r.id)?1:0.4}}>
+                <span className="swatch" style={{background:COLORS[i%COLORS.length]}}></span>{r.label}
+                <span className="muted"> · {fmtPct(r.summary.cagr_pct)} CAGR · Sharpe {r.summary.sharpe?.toFixed(2)}</span>
+              </span>
+            ))}
+          </div>
+        )}
+        <LineChart series={multi ? series : (focusRun ? [{name:focusRun.label, color:COLORS[0], points:focusRun.daily.map(d=>({x:d.date,y:d.cum_pnl}))}] : [])}/>
       </div>
       <div className="panel">
-        <h2>Equity curve — {focus?.label}</h2>
+        <h2>Equity curve</h2>
         <LineChart series={equitySeries} yLabel="Equity ($)"/>
       </div>
       <div className="panel">
-        <h2>Drawdown ($ underwater from peak) — {focus?.label}</h2>
+        <h2>Drawdown ($ underwater from peak)</h2>
         <LineChart series={ddSeries} height={240} yLabel="Drawdown ($)"/>
       </div>
       <div className="panel">
-        <h2>Daily P&L — {focus?.label}</h2>
+        <h2>Daily P&L</h2>
         <BarChart data={dailyBars}/>
       </div>
-      <VolPanel run={focus} targets={data.mbh_targets}/>
-      <BenchmarkPanel data={{...data, runs:[focus].filter(Boolean)}}/>
-      <div className="panel">
-        <h2>Run comparison</h2>
-        <table>
-          <thead><tr><th>Run</th><th>CAGR</th><th>Simple ann.</th><th>Sharpe</th><th>Sortino</th><th>Max DD</th><th>Worst day</th><th>Stop rate</th><th>Max margin/eq</th><th>Ann vol</th><th>Calmar</th><th>Trades</th></tr></thead>
-          <tbody>{data.runs.map((r,i)=>(
-            <tr key={r.id}>
-              <td><span className="swatch" style={{background:COLORS[i%COLORS.length],marginRight:6}}></span>{r.label}</td>
-              <td className={cls(r.summary.cagr_pct)}>{fmtPct(r.summary.cagr_pct)}</td>
-              <td>{fmtPct(r.summary.simple_annualized_pct)}</td>
-              <td>{r.summary.sharpe?.toFixed(2)}</td>
-              <td>{r.summary.sortino?.toFixed(2)}</td>
-              <td className="neg">{fmtPct(r.summary.max_drawdown_pct)}</td>
-              <td className="neg">{fmtPct(r.summary.worst_day_pct_equity)}</td>
-              <td>{fmtPct((r.summary.stop_rate||0)*100,1)}</td>
-              <td>{fmtPct(r.summary.max_margin_pct_equity)}</td>
-              <td>{fmtPct(r.summary.ann_vol_pct)}</td>
-              <td>{r.summary.calmar?.toFixed(2)}</td>
-              <td>{r.summary.trades}</td>
-            </tr>
-          ))}</tbody>
-        </table>
-      </div>
+      <VolPanel run={focusRun} targets={data.mbh_targets}/>
+      <BenchmarkPanel data={{...data, runs:[focusRun].filter(Boolean)}}/>
+      {multi && (
+        <div className="panel">
+          <h2>Run comparison</h2>
+          <table>
+            <thead><tr><th>Run</th><th>CAGR</th><th>Simple ann.</th><th>Sharpe</th><th>Sortino</th><th>Max DD</th><th>Worst day</th><th>Stop rate</th><th>Max margin/eq</th><th>Ann vol</th><th>Calmar</th><th>Trades</th></tr></thead>
+            <tbody>{data.runs.map((r,i)=>(
+              <tr key={r.id}>
+                <td><span className="swatch" style={{background:COLORS[i%COLORS.length],marginRight:6}}></span>{r.label}</td>
+                <td className={cls(r.summary.cagr_pct)}>{fmtPct(r.summary.cagr_pct)}</td>
+                <td>{fmtPct(r.summary.simple_annualized_pct)}</td>
+                <td>{r.summary.sharpe?.toFixed(2)}</td>
+                <td>{r.summary.sortino?.toFixed(2)}</td>
+                <td className="neg">{fmtPct(r.summary.max_drawdown_pct)}</td>
+                <td className="neg">{fmtPct(r.summary.worst_day_pct_equity)}</td>
+                <td>{fmtPct((r.summary.stop_rate||0)*100,1)}</td>
+                <td>{fmtPct(r.summary.max_margin_pct_equity)}</td>
+                <td>{fmtPct(r.summary.ann_vol_pct)}</td>
+                <td>{r.summary.calmar?.toFixed(2)}</td>
+                <td>{r.summary.trades}</td>
+              </tr>
+            ))}</tbody>
+          </table>
+        </div>
+      )}
     </div>
   );
 }
@@ -322,21 +406,16 @@ function BenchmarkPanel({data}) {
 }
 
 function Daily({data}) {
-  const [runId,setRunId]=useState(data.runs[0]?.id);
-  const run = data.runs.find(r=>r.id===runId)||data.runs[0];
+  const run = data.runs.find(r=>r.id===data.primary_run_id) || data.runs[0];
   const [sel,setSel]=useState(null);
   const tradingDays = run? run.daily.filter(d=>d.trades>0).map(d=>d.date):[];
   const day = sel||tradingDays[tradingDays.length-1];
   const dayRow = run?.daily.find(d=>d.date===day);
   const trades = run?.trades_by_date?.[day]||[];
-  const live = data.live?.days?.[day];
+  const liveEnabled = data.live_enabled !== false && Object.keys(data.live?.days || {}).length > 0;
   return (
     <div>
       <div className="row">
-        <label className="muted">Run</label>
-        <select value={runId} onChange={e=>{setRunId(e.target.value);setSel(null);}}>
-          {data.runs.map(r=><option key={r.id} value={r.id}>{r.label}</option>)}
-        </select>
         <label className="muted">Trading day</label>
         <select value={day||""} onChange={e=>setSel(e.target.value)}>
           {tradingDays.map(d=><option key={d} value={d}>{d}</option>)}
@@ -372,21 +451,20 @@ function Daily({data}) {
           ))}</tbody>
         </table>
       </div>
-      <div className="panel">
-        <h2>Live fills — {day} {live?"":<span className="sub">(no live data logged for this day)</span>}</h2>
-        {live ? (
-          <table>
-            <thead><tr><th>Time</th><th>Side</th><th>Sleeve</th><th>Short</th><th>Long</th><th>Contr.</th><th>Credit</th><th>Score</th><th>Mode</th></tr></thead>
-            <tbody>{live.entries.map((e,i)=>(
-              <tr key={i}>
-                <td>{(e.ts||"").slice(11,16)}</td><td>{e.side}</td><td className="muted">{e.sleeve}</td>
-                <td>{e.short_strike}</td><td>{e.long_strike}</td><td>{(e.contracts||0).toLocaleString()}</td>
-                <td>{e.credit}</td><td>{e.score}</td><td><span className="pill">{e.dry?"dry":"live"}</span></td>
-              </tr>
-            ))}</tbody>
-          </table>
-        ) : <p className="sub">Run <code>live/ib_executor.py</code> to log live/paper fills here for backtest-vs-live comparison.</p>}
-      </div>
+      {liveEnabled ? (
+        <div className="panel">
+          <h2>Live fills — {day}</h2>
+          <p className="sub">Live comparison is enabled when fills are exported into the dashboard build.</p>
+        </div>
+      ) : (
+        <div className="panel">
+          <h2>Live trading</h2>
+          <p className="sub" style={{margin:0}}>
+            Live fill comparison is paused until paper/live execution is validated.
+            Backtest tranches above are the source of truth for now.
+          </p>
+        </div>
+      )}
     </div>
   );
 }
@@ -467,15 +545,16 @@ function App({ viewer }) {
   if(!data) return <main><div className="muted">Loading…</div></main>;
   const primary = data.runs.find(r=>r.id===data.primary_run_id) || data.runs[0];
   const windowLabel = primary?.meta?.date_range ? ` · ${primary.meta.date_range}` : "";
+  const title = primary?.label || "SPX 0DTE Strategy Dashboard";
   return (
     <div>
       <header>
-        <h1>SPX 0DTE Strategy Dashboard</h1>
-        <span className="sub">${data.account_equity.toLocaleString()} equity · {data.runs.length} run(s){windowLabel} · built {new Date(data.generated_at).toLocaleString()}{viewer ? ` · ${viewer.name}` : ""}</span>
+        <h1>{title}</h1>
+        <span className="sub">${data.account_equity.toLocaleString()} equity{windowLabel} · built {new Date(data.generated_at).toLocaleString()}{viewer ? ` · ${viewer.name}` : ""}</span>
       </header>
       <div className="tabs">
         <div className={"tab"+(tab==="overview"?" active":"")} onClick={()=>setTab("overview")}>Overview</div>
-        <div className={"tab"+(tab==="daily"?" active":"")} onClick={()=>setTab("daily")}>Daily drill-down · Backtest vs Live</div>
+        <div className={"tab"+(tab==="daily"?" active":"")} onClick={()=>setTab("daily")}>Daily drill-down</div>
       </div>
       <main>
         {tab==="overview"? <Overview data={data}/> : <Daily data={data}/>}

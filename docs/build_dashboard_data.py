@@ -279,6 +279,130 @@ def build_run(run_id: str, results_dir: Path, label: str, account_equity: float,
     }
 
 
+def build_p3_strategy_guide(account_equity: float, hist: Optional[dict] = None) -> dict:
+    """Plain-language strategy guide for the dashboard."""
+    h = (hist or {}).get("headline") or {}
+    ts = (hist or {}).get("trade_stats") or {}
+    eq = f"${account_equity:,.0f}"
+    return {
+        "title": "Trend + Skew Gates on 3D Flatten (linear decay sizing)",
+        "subtitle": (
+            "SPXW same-day vertical credit spreads · 15-minute tranches · "
+            "wide wings · short-leg stops · two risk governors · selective entry filters"
+        ),
+        "sections": [
+            {
+                "title": "What this strategy does",
+                "paragraphs": [
+                    (
+                        "Every trading day, the simulator sells risk-defined SPXW 0DTE vertical credit spreads "
+                        "in 15-minute tranches from 9:32 AM to 3:30 PM Eastern. Each tranche looks for a "
+                        "short option near 15–25 delta (target 20 delta) and buys a farther-out long wing to cap loss. "
+                        "If the short leg moves against us, we stop out that spread only and keep the long wing until "
+                        "settlement — we do not stop the protective long."
+                    ),
+                    (
+                        "This is the best-performing variant from the 2026 improvement-plan tests. It uses the same "
+                        "validated “3D flatten” risk shell and linear-decay sizing as our prior baseline, but turns "
+                        "two entry filters back on. Those filters skip new bear-call spreads (short calls / bearish "
+                        "call-side structures) when the market is in a strong uptrend or when call skew is unusually "
+                        "elevated — the conditions that caused most of the baseline’s weak periods."
+                    ),
+                ],
+            },
+            {
+                "title": "Spread structure and stops",
+                "bullets": [
+                    "Instrument: SPXW options expiring the same session (0DTE).",
+                    "Put spreads: 200-point wide wings (short strike + long strike 200 pts lower).",
+                    "Call spreads: 75-point wide wings (short strike + long strike 75 pts higher).",
+                    "Short-leg stop: exit when the short option reaches 3.0× the entry credit (e.g. sold for $1.00 → stop at $3.00).",
+                    "Stop confirmation: price must breach the stop level on 2 consecutive 1-minute bars before firing (reduces whipsaw).",
+                    "Fees: $0.79 per contract side, included in P&L.",
+                ],
+            },
+            {
+                "title": "Daily risk governors",
+                "bullets": [
+                    "Halt new entries when the day’s mark-to-market loss reaches −2.25% of account equity "
+                    f"(≈ −${account_equity * 0.0225:,.0f} on {eq} starting equity).",
+                    "Force-flatten all open positions when the day’s loss reaches −3.5% of equity "
+                    f"(≈ −${account_equity * 0.035:,.0f}). This is deeper than the entry halt so normal "
+                    "intraday volatility does not automatically flatten everything.",
+                    "No cap on stops per side in this config (same-side stop cooldown disabled).",
+                ],
+            },
+            {
+                "title": "Entry gates (what changed vs the old baseline)",
+                "bullets": [
+                    "Bear-call filter — trend: skip the tranche if trend_score > 1.0 (market trending up strongly; "
+                    "selling calls into a rally is penalized).",
+                    "Bear-call filter — skew: skip if skew_z > 0.75 (call skew unusually rich vs recent history).",
+                    "All other unconditional baseline gates remain off (no score threshold, no danger halts).",
+                    "Bear puts are not filtered by these two gates — only the call / bear-call side is gated.",
+                ],
+            },
+            {
+                "title": "Position sizing (linear_decay_downsize)",
+                "paragraphs": [
+                    (
+                        "Base size is 31 contracts per tranche at the 10:30–11:29 window. Earlier tranches sell "
+                        "more premium; later tranches sell less as gamma and settlement risk rise."
+                    ),
+                ],
+                "bullets": [
+                    "9:32–10:29 → 1.25× base → 39 contracts",
+                    "10:30–11:29 → 1.00× base → 31 contracts",
+                    "11:30–12:29 → 0.85× base → 26 contracts",
+                    "12:30–13:29 → 0.60× base → 19 contracts",
+                    "13:30–14:29 → 0.45× base → 14 contracts",
+                    "14:30–15:30 → 0.25× base → 8 contracts",
+                ],
+            },
+            {
+                "title": "Which days are traded",
+                "bullets": [
+                    "Before April 2022: Monday, Wednesday, Friday only (SPXW was not listed Tue/Thu).",
+                    "April 2022 onward: all weekdays when SPXW trades.",
+                    "Metrics (CAGR, Sharpe, drawdown) use only eligible trading days — skipped calendar days "
+                    "are excluded from the equity path, not counted as zero-P&L days.",
+                ],
+            },
+            {
+                "title": "Backtest window and assumptions",
+                "bullets": [
+                    f"Starting equity: {eq} (compounded daily — profits roll into the next session).",
+                    f"Out-of-sample start: {(hist or {}).get('first_oos_date', '2019-04-15')} "
+                    f"(first ~60 sessions used for signal baseline warm-up).",
+                    "Data: historical SPXW 1-minute quotes + reconstructed signal fields from ThetaData.",
+                    "Simulated fills at mid / model prices — not a guarantee of live execution.",
+                ],
+            },
+        ],
+        "results": [
+            {"label": "Trading days (OOS)", "value": str(h.get("days", "805"))},
+            {"label": "Date range", "value": f"{(hist or {}).get('first_oos_date', '2019-04-15')} → {(hist or {}).get('last_oos_date', '2026-07-02')}"},
+            {"label": "Net P&L", "value": f"${h.get('net_pnl', 12420309.63):,.0f}"},
+            {"label": "Ending equity", "value": f"${h.get('ending_equity', 25420309.63):,.0f}"},
+            {"label": "CAGR (compounded)", "value": f"{h.get('cagr_pct', 23.36):.2f}%"},
+            {"label": "Sharpe (daily)", "value": f"{h.get('sharpe', 1.67):.2f}"},
+            {"label": "Sortino", "value": f"{h.get('sortino', 1.86):.2f}"},
+            {"label": "Max drawdown", "value": f"{h.get('max_drawdown_pct', 11.17):.2f}%"},
+            {"label": "Worst day", "value": f"{h.get('worst_day_pct', -4.94):.2f}% equity ({fmt_dollar(h.get('worst_day', -642633))})"},
+            {"label": "Winning days", "value": f"{(h.get('day_win_rate', 0.6497) * 100):.1f}%"},
+            {"label": "Total spread trades", "value": f"{h.get('trades', 13612):,}"},
+            {"label": "Stop rate (trades)", "value": f"{(h.get('stop_rate', 0.2236) * 100):.1f}%"},
+            {"label": "Spread win rate", "value": f"{(ts.get('win_rate', 0.7471) * 100):.1f}%"},
+            {"label": "Avg P&L per trade", "value": f"${ts.get('expectancy_per_trade', 912.45):,.0f}"},
+        ],
+    }
+
+
+def fmt_dollar(n: object) -> str:
+    v = safe_float(n)
+    return f"${v:,.0f}" if v >= 0 else f"-${abs(v):,.0f}"
+
+
 def build_live(live_dir: Path, account_equity: float) -> dict:
     days: Dict[str, dict] = {}
     if not live_dir.exists():
@@ -314,13 +438,17 @@ def main() -> None:
     parser.add_argument("--account-equity", type=float, default=13_000_000)
     parser.add_argument("--mbh-returns", default=str(ROOT / "data" / "mbh_returns" / "All_Time_Net_Returns.csv"))
     parser.add_argument("--live-dir", default=str(ROOT / "data" / "live"))
+    parser.add_argument(
+        "--include-live",
+        action="store_true",
+        help="Embed live/paper fills from --live-dir (default: omit live data).",
+    )
     parser.add_argument("--primary-run-id", default="", help="Default focus run (default: first --run).")
     parser.add_argument("--out", default=str(Path(__file__).resolve().parent / "data" / "dashboard_data.json"))
     args = parser.parse_args()
 
     default_runs = [
         "p3_trend1_skew075=data/dashboard_runs/p3_trend1_skew075:#1 Trend + Skew gates",
-        "linear_decay_downsize=data/dashboard_runs/linear_decay_downsize:Baseline 3D + linear decay",
     ]
     specs = args.run or default_runs
 
@@ -329,36 +457,27 @@ def main() -> None:
         id_part, rest = spec.split("=", 1)
         dir_part, _, label = rest.partition(":")
         results_dir = (ROOT / dir_part).resolve() if not Path(dir_part).is_absolute() else Path(dir_part)
-        meta = {}
-        if id_part == "linear_decay_downsize":
+        meta: dict = {}
+        hist: Optional[dict] = None
+        summary_path = results_dir / "summary.json"
+        if summary_path.exists():
+            try:
+                hist = json.loads(summary_path.read_text(encoding="utf-8"))
+            except json.JSONDecodeError:
+                hist = None
+        if id_part == "p3_trend1_skew075":
             meta = {
                 "description": (
-                    "3D_flatten_3.5 substrate (wide wings 200/75, 3x stop + 2-bar confirm, "
-                    "halt -2.25%, flatten -3.5%) with time-of-day sizing: sell more early, less late. "
-                    "Mon/Wed/Fri only before Apr 2022; all weekdays thereafter. Unconditional gates off."
+                    "Best backtest variant: 3D flatten substrate + linear decay sizing, with bear-call "
+                    "entry gates re-enabled (skip when trend_score > 1.0 or skew_z > 0.75)."
                 ),
+                "gates": "candidate_max_adverse_trend=1.0 · candidate_max_adverse_skew=0.75",
                 "sizing_schedule": (
                     "09:32-10:29 1.25x (39), 10:30-11:29 1.0x (31), 11:30-12:29 0.85x (26), "
                     "12:30-13:29 0.6x (19), 13:30-14:29 0.45x (14), 14:30-15:30 0.25x (8)"
                 ),
                 "credit_cap_pct": 50.0,
-                "mbh_credit_target_pct": 1.5,
-            }
-        elif id_part == "p3_trend1_skew075":
-            meta = {
-                "description": (
-                    "Improvement-plan #1: same 3D substrate + linear_decay_downsize sizing, but re-enables "
-                    "entry gates disabled in the unconditional baseline — blocks bear_calls when trend_score > 1.0 "
-                    "or skew_z > 0.75 (adverse uptrend / elevated call skew)."
-                ),
-                "gates": (
-                    "candidate_max_adverse_trend=1.0 · candidate_max_adverse_skew=0.75"
-                ),
-                "sizing_schedule": (
-                    "09:32-10:29 1.25x, 10:30-11:29 1.0x, 11:30-12:29 0.85x, "
-                    "12:30-13:29 0.6x, 13:30-14:29 0.45x, 14:30-15:30 0.25x"
-                ),
-                "credit_cap_pct": 50.0,
+                "strategy_guide": build_p3_strategy_guide(args.account_equity, hist),
             }
         run = build_run(id_part, results_dir, label or id_part, args.account_equity, meta)
         if run:
@@ -366,20 +485,15 @@ def main() -> None:
             if daily:
                 run["meta"]["date_range"] = f"{daily[0]['date']} → {daily[-1]['date']}"
                 run["meta"]["oos_days"] = len(daily)
-            summary_path = results_dir / "summary.json"
-            if summary_path.exists():
-                try:
-                    hist = json.loads(summary_path.read_text(encoding="utf-8"))
-                    run["meta"]["note"] = (
-                        f"Expiration-era calendar backtest · eligible metrics · "
-                        f"{hist.get('first_oos_date', '')} OOS start · "
-                        f"{hist.get('headline', {}).get('cagr_pct', '')}% CAGR (eligible path)"
-                    )
-                    for era in hist.get("era_summaries") or []:
-                        if era.get("era"):
-                            run["meta"].setdefault("era_summaries", []).append(era)
-                except json.JSONDecodeError:
-                    pass
+            if hist:
+                run["meta"]["note"] = (
+                    f"Expiration-era calendar backtest · eligible metrics · "
+                    f"{hist.get('first_oos_date', '')} OOS start · "
+                    f"{hist.get('headline', {}).get('cagr_pct', '')}% CAGR (eligible path)"
+                )
+                for era in hist.get("era_summaries") or []:
+                    if era.get("era"):
+                        run["meta"].setdefault("era_summaries", []).append(era)
             runs.append(run)
             s = run["summary"]
             print(f"  added {id_part}: CAGR {s.get('cagr_pct')}% Sharpe {s.get('sharpe')} "
@@ -392,7 +506,8 @@ def main() -> None:
         "primary_run_id": primary_id,
         "runs": runs,
         "mbh_benchmark": {"monthly": parse_mbh_benchmark(Path(args.mbh_returns))},
-        "live": build_live(Path(args.live_dir), args.account_equity),
+        "live": build_live(Path(args.live_dir), args.account_equity) if args.include_live else {"days": {}},
+        "live_enabled": args.include_live,
         "mbh_targets": {
             "cagr_pct": [30, 40],
             "win_rate_pct": 65,
