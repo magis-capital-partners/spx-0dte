@@ -1,5 +1,5 @@
 {
-  "updated_at": "2026-07-07T03:59:31.583637+00:00",
+  "updated_at": "2026-07-07T05:01:18.978451+00:00",
   "policy": "SPXW history is cached locally under data/raw and data/processed. Use this cache for backtests. Do NOT call ThetaData or pass --download unless the user explicitly asks to fill manifest gaps.",
   "raw": {
     "path": "data/raw/thetadata/symbol=SPXW",

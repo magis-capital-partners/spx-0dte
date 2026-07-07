@@ -1,0 +1,20 @@
+{
+  "note": "Eligible calendar days with no usable SPXW 0DTE Greeks from ThetaData after download attempts (2026-07-06).",
+  "dates": [
+    {
+      "date": "2022-04-19",
+      "era": "mwtf",
+      "reason": "skipped_no_same_day_expiration"
+    },
+    {
+      "date": "2022-05-12",
+      "era": "daily",
+      "reason": "skipped_no_same_day_expiration"
+    },
+    {
+      "date": "2025-01-09",
+      "era": "daily",
+      "reason": "0dte_download_error"
+    }
+  ]
+}
