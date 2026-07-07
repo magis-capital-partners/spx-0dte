@@ -1,57 +1,47 @@
 {
-  "updated_at": "2026-07-06T22:46:14.265899+00:00",
+  "updated_at": "2026-07-07T03:59:31.583637+00:00",
   "policy": "SPXW history is cached locally under data/raw and data/processed. Use this cache for backtests. Do NOT call ThetaData or pass --download unless the user explicitly asks to fill manifest gaps.",
   "raw": {
     "path": "data/raw/thetadata/symbol=SPXW",
     "description": "Parquet Greeks from ThetaData (source for rebuilds)",
-    "count": 1530,
+    "count": 1578,
     "first_date": "2019-01-02",
     "last_date": "2026-07-06",
     "by_year": {
       "2019": 161,
-      "2020": 157,
-      "2021": 152,
-      "2022": 209,
-      "2023": 238,
-      "2024": 247,
+      "2020": 160,
+      "2021": 159,
+      "2022": 220,
+      "2023": 250,
+      "2024": 252,
       "2025": 250,
-      "2026": 116
+      "2026": 126
     }
   },
   "processed": {
     "path": "data/processed/symbol=SPXW",
     "description": "Simulator inputs: normalized_option_quotes.csv + signals.csv per day",
-    "count": 1449,
+    "count": 1577,
     "first_date": "2019-01-02",
     "last_date": "2026-07-06",
     "by_year": {
       "2019": 161,
-      "2020": 153,
-      "2021": 148,
-      "2022": 186,
-      "2023": 219,
-      "2024": 243,
-      "2025": 223,
-      "2026": 116
+      "2020": 160,
+      "2021": 159,
+      "2022": 219,
+      "2023": 250,
+      "2024": 252,
+      "2025": 250,
+      "2026": 126
     }
   },
   "cache_status": {
-    "raw_not_built_count": 81,
+    "raw_not_built_count": 1,
     "raw_not_built_by_year": {
-      "2020": 4,
-      "2021": 4,
-      "2022": 23,
-      "2023": 19,
-      "2024": 4,
-      "2025": 27
+      "2022": 1
     },
     "missing_processed_by_year": {
-      "2020": 4,
-      "2021": 4,
-      "2022": 23,
-      "2023": 19,
-      "2024": 4,
-      "2025": 27
+      "2022": 1
     }
   },
   "agent_commands": {
