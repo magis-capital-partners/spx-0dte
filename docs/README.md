@@ -15,7 +15,11 @@ Static React dashboard for backtest runs, MBH benchmark comparison, and (when wi
 **GitHub Pages** deploys from the **`/docs`** folder on **`main`**. In Settings → Pages, choose branch **`main`** and folder **`/docs`** (GitHub only offers `/` or `/docs`, not `/dashboard`).
 
 ```powershell
-.\scripts\sync_dashboard.ps1 -Push
+# Rebuild only
+.\scripts\sync_dashboard.ps1
+
+# Rebuild + deploy to GitHub Pages
+.\scripts\sync_dashboard.ps1 -Deploy
 ```
 
 Legacy fallback (no Actions): `.\docs\deploy_pages.ps1` force-pushes the `gh-pages` branch.
@@ -42,5 +46,5 @@ python docs/build_dashboard_data.py
 Deploy to Pages:
 
 ```powershell
-.\scripts\sync_dashboard.ps1 -Push
+.\scripts\sync_dashboard.ps1 -Deploy
 ```

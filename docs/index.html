@@ -406,7 +406,10 @@ function BenchmarkPanel({data}) {
 }
 
 function Daily({data}) {
-  const run = data.runs.find(r=>r.id===data.primary_run_id) || data.runs[0];
+  const multi = data.runs.length > 1;
+  const defaultRun = data.runs.find(r=>r.id===data.primary_run_id) || data.runs[0];
+  const [runId,setRunId]=useState(defaultRun?.id);
+  const run = data.runs.find(r=>r.id===runId) || defaultRun;
   const [sel,setSel]=useState(null);
   const tradingDays = run? run.daily.filter(d=>d.trades>0).map(d=>d.date):[];
   const day = sel||tradingDays[tradingDays.length-1];
@@ -415,6 +418,14 @@ function Daily({data}) {
   const liveEnabled = data.live_enabled !== false && Object.keys(data.live?.days || {}).length > 0;
   return (
     <div>
+      {multi && (
+        <div className="row">
+          <label className="muted">Backtest run</label>
+          <select value={runId} onChange={e=>{setRunId(e.target.value); setSel(null);}}>
+            {data.runs.map(r=><option key={r.id} value={r.id}>{r.label}</option>)}
+          </select>
+        </div>
+      )}
       <div className="row">
         <label className="muted">Trading day</label>
         <select value={day||""} onChange={e=>setSel(e.target.value)}>

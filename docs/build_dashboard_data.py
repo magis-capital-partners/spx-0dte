@@ -279,10 +279,38 @@ def build_run(run_id: str, results_dir: Path, label: str, account_equity: float,
     }
 
 
-def build_p3_strategy_guide(account_equity: float, hist: Optional[dict] = None) -> dict:
-    """Plain-language strategy guide for the dashboard."""
+def _strategy_guide_results(hist: Optional[dict]) -> list:
     h = (hist or {}).get("headline") or {}
     ts = (hist or {}).get("trade_stats") or {}
+    return [
+        {"label": "Trading days (OOS)", "value": str(h.get("days", "—"))},
+        {
+            "label": "Date range",
+            "value": f"{(hist or {}).get('first_oos_date', '—')} → {(hist or {}).get('last_oos_date', '—')}",
+        },
+        {"label": "Net P&L", "value": f"${h.get('net_pnl', 0):,.0f}"},
+        {"label": "Ending equity", "value": f"${h.get('ending_equity', 0):,.0f}"},
+        {"label": "CAGR (compounded)", "value": f"{h.get('cagr_pct', 0):.2f}%"},
+        {"label": "Sharpe (daily)", "value": f"{h.get('sharpe', 0):.2f}"},
+        {"label": "Sortino", "value": f"{h.get('sortino', 0):.2f}"},
+        {"label": "Max drawdown", "value": f"{h.get('max_drawdown_pct', 0):.2f}%"},
+        {
+            "label": "Worst day",
+            "value": (
+                f"{h.get('worst_day_pct', 0):.2f}% equity "
+                f"({fmt_dollar(h.get('worst_day', 0))})"
+            ),
+        },
+        {"label": "Winning days", "value": f"{(h.get('day_win_rate', 0) * 100):.1f}%"},
+        {"label": "Total spread trades", "value": f"{h.get('trades', 0):,}"},
+        {"label": "Stop rate (trades)", "value": f"{(h.get('stop_rate', 0) * 100):.1f}%"},
+        {"label": "Spread win rate", "value": f"{(ts.get('win_rate', 0) * 100):.1f}%"},
+        {"label": "Avg P&L per trade", "value": f"${ts.get('expectancy_per_trade', 0):,.0f}"},
+    ]
+
+
+def build_p3_strategy_guide(account_equity: float, hist: Optional[dict] = None) -> dict:
+    """Plain-language strategy guide for the dashboard."""
     eq = f"${account_equity:,.0f}"
     return {
         "title": "Trend + Skew Gates on 3D Flatten (linear decay sizing)",
@@ -379,22 +407,102 @@ def build_p3_strategy_guide(account_equity: float, hist: Optional[dict] = None) 
                 ],
             },
         ],
-        "results": [
-            {"label": "Trading days (OOS)", "value": str(h.get("days", "805"))},
-            {"label": "Date range", "value": f"{(hist or {}).get('first_oos_date', '2019-04-15')} → {(hist or {}).get('last_oos_date', '2026-07-02')}"},
-            {"label": "Net P&L", "value": f"${h.get('net_pnl', 12420309.63):,.0f}"},
-            {"label": "Ending equity", "value": f"${h.get('ending_equity', 25420309.63):,.0f}"},
-            {"label": "CAGR (compounded)", "value": f"{h.get('cagr_pct', 23.36):.2f}%"},
-            {"label": "Sharpe (daily)", "value": f"{h.get('sharpe', 1.67):.2f}"},
-            {"label": "Sortino", "value": f"{h.get('sortino', 1.86):.2f}"},
-            {"label": "Max drawdown", "value": f"{h.get('max_drawdown_pct', 11.17):.2f}%"},
-            {"label": "Worst day", "value": f"{h.get('worst_day_pct', -4.94):.2f}% equity ({fmt_dollar(h.get('worst_day', -642633))})"},
-            {"label": "Winning days", "value": f"{(h.get('day_win_rate', 0.6497) * 100):.1f}%"},
-            {"label": "Total spread trades", "value": f"{h.get('trades', 13612):,}"},
-            {"label": "Stop rate (trades)", "value": f"{(h.get('stop_rate', 0.2236) * 100):.1f}%"},
-            {"label": "Spread win rate", "value": f"{(ts.get('win_rate', 0.7471) * 100):.1f}%"},
-            {"label": "Avg P&L per trade", "value": f"${ts.get('expectancy_per_trade', 912.45):,.0f}"},
+        "results": _strategy_guide_results(hist),
+    }
+
+
+def build_p3_poststop_strategy_guide(account_equity: float, hist: Optional[dict] = None) -> dict:
+    """Plain-language strategy guide for the post-stop cooldown variant."""
+    eq = f"${account_equity:,.0f}"
+    return {
+        "title": "Production + 120-Minute Same-Side Stop Cooldown",
+        "subtitle": (
+            "Same 3D flatten shell, trend/skew gates, and linear-decay sizing as live production — "
+            "plus a post-stop rule that pauses new entries on the stopped side for two hours"
+        ),
+        "sections": [
+            {
+                "title": "What this strategy does",
+                "paragraphs": [
+                    (
+                        "This run is identical to the current production profile "
+                        "(p3_trend1_skew075): SPXW 0DTE vertical credit spreads in 15-minute tranches, "
+                        "wide wings (put 200 / call 75), 3.0× short-leg stops with 2-bar confirmation, "
+                        "daily loss halt at −2.25%, flatten at −3.5%, trend/skew bear-call gates, and "
+                        "linear_decay_downsize contract schedule."
+                    ),
+                    (
+                        "The only change is same_side_stop_cooldown_minutes=120. After any stopped spread, "
+                        "the simulator blocks new entries on that side (puts or calls) until 120 minutes "
+                        "have passed. The opposite side can still enter. Open positions are not closed by "
+                        "the cooldown — only new entries are suppressed."
+                    ),
+                ],
+            },
+            {
+                "title": "How the post-stop cooldown works (step by step)",
+                "bullets": [
+                    "A spread stops when its short option trades at 3.0× entry credit for 2 consecutive 1-minute bars.",
+                    "On stop, the simulator records the trade's side: bear_call (call credit spread) or bull_put (put credit spread).",
+                    "It sets side_stop_cooldown_until[side] = stop_timestamp + 120 minutes.",
+                    "At each subsequent 15-minute entry tranche, before opening a new spread, entry_risk_block_reason() checks the cooldown clock.",
+                    "If current time < cooldown_until for that candidate's side, the entry is skipped with reason side_stop_cooldown.",
+                    "The other side is unaffected — e.g. a stopped bear call blocks new call spreads but bull puts can still sell.",
+                    "Global stop cooldown (stop_cooldown_minutes) remains 0 — we do not pause both sides.",
+                    "max_stops_per_side stays unlimited (999) — there is no hard cap on how many stops can occur in a day.",
+                    "If the same side stops again while already in cooldown, the 120-minute window resets from the latest stop.",
+                    "Existing open spreads on the cooled-down side keep running until their own stop, settlement, or the daily flatten governor.",
+                ],
+            },
+            {
+                "title": "Why this helps",
+                "paragraphs": [
+                    (
+                        "Stop events often cluster on one side during a directional move. Without a cooldown, "
+                        "the strategy can re-sell into the same trend every 15 minutes — each new spread is another "
+                        "3× stop candidate. A 120-minute pause breaks that loop: after the market proves a side "
+                        "wrong, we step back and let the move develop before selling premium there again."
+                    ),
+                    (
+                        "On the full 1,500-day eligible OOS path (dashboard parity), this variant raised CAGR from "
+                        "15.2% to 16.4%, held the same worst day (−6.82%), and cut max drawdown roughly in half "
+                        "(15.9% → 10.3%). Trade count fell (~26k → ~22k) because fewer revenge entries fire after stops."
+                    ),
+                ],
+            },
+            {
+                "title": "Spread structure, gates, and sizing (unchanged vs production)",
+                "bullets": [
+                    "Put spreads: 200-point wings. Call spreads: 75-point wings. Short-leg stop 3.0×, 2-bar confirm.",
+                    "Bear-call gate — trend: skip when trend_score > 1.0.",
+                    "Bear-call gate — skew: skip when skew_z > 0.75.",
+                    "Halt new entries at −2.25% daily MTM; flatten all open at −3.5%.",
+                    "Sizing (linear_decay_downsize): 9:32–10:29 → 39 ctr, 10:30–11:29 → 31, 11:30–12:29 → 26, "
+                    "12:30–13:29 → 19, 13:30–14:29 → 14, 14:30–15:30 → 8 contracts.",
+                ],
+            },
+            {
+                "title": "What the cooldown does not do",
+                "bullets": [
+                    "Does not tighten stops or change the 3.0× / 2-bar stop logic.",
+                    "Does not block the opposite side after a stop.",
+                    "Does not reduce position size — only skips entries entirely during the window.",
+                    "Does not block same-strike re-entry (block_same_strike_after_stop is off).",
+                    "Does not replace the daily loss halt or flatten governors.",
+                ],
+            },
+            {
+                "title": "Backtest window and assumptions",
+                "bullets": [
+                    f"Starting equity: {eq} (compounded daily).",
+                    f"OOS start: {(hist or {}).get('first_oos_date', '2019-04-15')} after 40-session signal baseline warm-up.",
+                    "Eligible Mon/Wed (pre-Apr 2022) then all weekdays; metrics on eligible days only.",
+                    "Data: local SPXW 1-minute quotes + reconstructed signals (ThetaData history).",
+                    "Simulated fills — compare to production run in the Run comparison table on Overview.",
+                ],
+            },
         ],
+        "results": _strategy_guide_results(hist),
     }
 
 
@@ -448,7 +556,8 @@ def main() -> None:
     args = parser.parse_args()
 
     default_runs = [
-        "p3_trend1_skew075=data/dashboard_runs/p3_trend1_skew075:#1 Trend + Skew gates",
+        "p3_poststop_cooldown_120=data/dashboard_runs/p3_poststop_cooldown_120:Post-stop 120min cooldown",
+        "p3_trend1_skew075=data/dashboard_runs/p3_trend1_skew075:#1 Trend + Skew gates (production)",
     ]
     specs = args.run or default_runs
 
@@ -478,6 +587,23 @@ def main() -> None:
                 ),
                 "credit_cap_pct": 50.0,
                 "strategy_guide": build_p3_strategy_guide(args.account_equity, hist),
+            }
+        elif id_part == "p3_poststop_cooldown_120":
+            meta = {
+                "description": (
+                    "Production trend/skew gates with same_side_stop_cooldown_minutes=120: after a stopped "
+                    "put or call spread, no new entries on that side for two hours. Opposite side unchanged."
+                ),
+                "gates": (
+                    "trend 1.0 · skew 0.75 · same_side_stop_cooldown_minutes=120 "
+                    "(global stop cooldown off)"
+                ),
+                "sizing_schedule": (
+                    "Same linear_decay_downsize as production: "
+                    "09:32-10:29 1.25x (39) … 14:30-15:30 0.25x (8)"
+                ),
+                "credit_cap_pct": 50.0,
+                "strategy_guide": build_p3_poststop_strategy_guide(args.account_equity, hist),
             }
         run = build_run(id_part, results_dir, label or id_part, args.account_equity, meta)
         if run:
