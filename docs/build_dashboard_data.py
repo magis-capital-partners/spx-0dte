@@ -515,29 +515,96 @@ def fmt_dollar(n: object) -> str:
 
 
 def build_live(live_dir: Path, account_equity: float) -> dict:
+    """Embed paper/live session fills for Daily drill-down comparison."""
+    del account_equity  # reserved for future live return_pct scaling
     days: Dict[str, dict] = {}
     if not live_dir.exists():
         return {"days": {}}
     for day_path in sorted(live_dir.iterdir()):
+        if not day_path.is_dir():
+            continue
         fills_file = day_path / "fills.jsonl"
         if not fills_file.exists():
             continue
         d = day_path.name
-        entries = []
+        events = []
         for line in fills_file.read_text(encoding="utf-8").splitlines():
             line = line.strip()
             if not line:
                 continue
             try:
-                entries.append(json.loads(line))
+                events.append(json.loads(line))
             except json.JSONDecodeError:
                 continue
-        trades = [e for e in entries if e.get("event") == "entry"]
+        trades = [e for e in events if e.get("event") == "entry"]
+        stops = [e for e in events if e.get("event") == "stop"]
+        rejected = [e for e in events if e.get("event") == "order_rejected"]
+        session_ends = [e for e in events if e.get("event") == "session_end"]
+        stopped_keys = {
+            (s.get("side"), s.get("short_strike"), s.get("long_strike"))
+            for s in stops
+        }
+        entry_rows = []
+        for e in trades:
+            key = (e.get("side"), e.get("short_strike"), e.get("long_strike"))
+            entry_rows.append(
+                {
+                    "ts": e.get("ts"),
+                    "side": e.get("side"),
+                    "short_strike": e.get("short_strike"),
+                    "long_strike": e.get("long_strike"),
+                    "contracts": e.get("contracts"),
+                    "credit": e.get("credit"),
+                    "natural_credit": e.get("natural_credit"),
+                    "fill_slippage": e.get("fill_slippage"),
+                    "score": e.get("score"),
+                    "stopped": key in stopped_keys,
+                    "dry": bool(e.get("dry")),
+                }
+            )
+        credit_from_entries = round(
+            sum(float(e.get("credit") or 0) * float(e.get("contracts") or 0) * 100 for e in trades),
+            2,
+        )
+        gross = credit_from_entries
+        marked = None
+        if session_ends:
+            if session_ends[-1].get("gross_credit_sold") is not None:
+                gross = float(session_ends[-1]["gross_credit_sold"])
+            if session_ends[-1].get("marked_pnl") is not None:
+                marked = float(session_ends[-1]["marked_pnl"])
+
+        reconcile = None
+        recon_path = day_path / "reconcile.json"
+        if recon_path.exists():
+            try:
+                raw = json.loads(recon_path.read_text(encoding="utf-8"))
+                reconcile = {
+                    "diff_paper_scale": raw.get("diff_paper_scale"),
+                    "diff_normalized_13m": raw.get("diff_normalized_13m"),
+                    "backtest_paper_scale": {
+                        k: raw.get("backtest_paper_scale", {}).get(k)
+                        for k in ("available", "entries", "contracts", "stops", "net_pnl", "bear_call_pct")
+                    },
+                    "backtest_normalized_13m": {
+                        k: raw.get("backtest_normalized_13m", {}).get(k)
+                        for k in ("available", "entries", "contracts", "stops", "net_pnl", "bear_call_pct")
+                    },
+                }
+            except json.JSONDecodeError:
+                reconcile = None
+
         days[d] = {
             "date": d,
-            "entries": trades,
-            "flattened": any(e.get("event") == "daily_loss_flatten" for e in entries),
-            "gross_credit_sold": round(sum(e.get("credit", 0) * e.get("contracts", 0) * 100 for e in trades), 2),
+            "mode": next((e.get("mode") for e in events if e.get("event") == "session_start"), None),
+            "entries": entry_rows,
+            "stops": len(stops),
+            "order_rejected": len(rejected),
+            "flattened": any(e.get("event") == "flatten" for e in events),
+            "halted": any(e.get("event") == "halt_entries" for e in events),
+            "gross_credit_sold": gross,
+            "marked_pnl": marked,
+            "reconcile": reconcile,
         }
     return {"days": days}
 

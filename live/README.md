@@ -51,11 +51,59 @@ in `data/live/<date>/fills.jsonl`.
 
 ## Before each session
 
-```
+```powershell
 python scripts/refresh_live_baselines.py
+python scripts/download_vix_daily.py   # optional; auto-refreshes if today's row missing
 ```
 
-## Run
+## Paper trading with real-time data
+
+**Prerequisites (IB account + TWS/Gateway):**
+
+1. Log into **paper** TWS or IB Gateway (API port **7497**).
+2. **Market data subscriptions** on your IB account (paper inherits live subs):
+   - **US Securities Snapshot and Futures Value Bundle** (or CBOE **US Index** for SPX)
+   - **OPRA** (US Options) — required for SPXW option quotes
+3. TWS → **Settings → API → Settings**: enable *ActiveX and Socket Clients*, note port **7497**.
+4. TWS → **Settings → Market Data**: you can disable *Allow delayed market data* if you only want live feeds.
+
+**Config** (`live/live_config.py` — already set for real-time):
+
+| Field | Value | Purpose |
+|-------|-------|---------|
+| `mode` | `"paper"` | Routes orders to paper account (port 7497) |
+| `market_data_type` | `1` | Live/real-time quotes (not 15-min delayed) |
+| `auto_fallback_delayed` | `False` | Fail loudly if subs missing (no silent downgrade) |
+| `delayed_quote_fallback` | `False` | Do not synthesize bid/ask from last/mid |
+| `entry_require_live_nbbo` | `True` | Block entries on crossed or missing NBBO |
+
+**Run:**
+
+```powershell
+python live/ib_executor.py
+```
+
+On connect you should see `market_data_type=1 (live)` in the chain banner. If SPX spot fails with error **10168**, your account lacks index/OPRA subs — add them in IB Account Management or temporarily revert to delayed settings (see comment at bottom of `live_config.py`).
+
+Session output: `data/live/<YYYY-MM-DD>/` (`config.json`, `fills.jsonl`, `tranches.jsonl`, `ib.log`).
+
+### Day-to-day paper vs backtest
+
+1. **Pre-session:** `python scripts/refresh_live_baselines.py` (+ VIX calendar if needed).
+2. **Session:** `python live/ib_executor.py` → writes `data/live/<date>/` (includes `session_end.marked_pnl`).
+3. **Post-close:** `.\scripts\daily_data_update.ps1` builds ThetaData for the day, then runs
+   `python simulator/reconcile_live.py --date YYYY-MM-DD` when a live session exists.
+4. **Dashboard:** `.\scripts\sync_dashboard.ps1` embeds live fills (`--include-live`). Daily drill-down
+   shows paper fills next to backtest tranches plus reconcile DIFF chips.
+
+Manual reconcile (dual-scale: paper equity + normalized $13M):
+
+```powershell
+python simulator/reconcile_live.py --date YYYY-MM-DD
+# → data/live/<date>/reconcile.json
+```
+
+## Run (quick reference)
 
 ```
 python live/ib_executor.py
@@ -75,19 +123,10 @@ python live/ib_executor.py
 | `entry_limit_concession` | `0.05` | Haircut from natural credit on combo limit |
 | `entry_work_seconds` | `870` | How long to work an entry before `entry_unfilled` |
 | `entry_ladder_step` | `0.05` | Extra concession per ladder step (every 60s) |
-| `entry_require_live_nbbo` | `False` | Set `True` with OPRA subs |
+| `entry_require_live_nbbo` | `True` | Reject crossed/missing NBBO on entry |
 
-Paper without OPRA (current): `market_data_type=3`, `delayed_quote_fallback=True`,
-`entry_require_live_nbbo=False`.
-
-**Paper with OPRA** (switch when ready):
-
-```python
-market_data_type = 1
-auto_fallback_delayed = False
-delayed_quote_fallback = False
-entry_require_live_nbbo = True
-```
+**Delayed fallback** (no OPRA subs): `market_data_type=3`, `auto_fallback_delayed=True`,
+`delayed_quote_fallback=True`, `entry_require_live_nbbo=False`.
 
 Backtest parity: production profile includes `entry_fill_slippage=0.05` matching
 `entry_limit_concession`.

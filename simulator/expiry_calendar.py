@@ -165,6 +165,23 @@ def discover_eligible_dates(
     return [row["date"] for row in audit if row["eligible"]]
 
 
+def is_live_tradable_day(
+    day: date,
+    *,
+    floor: str,
+    end: str,
+    eras: List[EraRule],
+) -> tuple[bool, str]:
+    """Weekday/era eligibility for live sessions (no processed-data requirement)."""
+    if day < parse_date(floor):
+        return False, "before_start"
+    if day > parse_date(end):
+        return False, "after_end"
+    if day.weekday() not in allowed_weekdays(day, eras):
+        return False, "weekday_not_in_era"
+    return True, ""
+
+
 def summarize_eras(daily_rows: Iterable[dict], account_equity: float) -> List[dict]:
     from portfolio_metrics import portfolio_stats
 

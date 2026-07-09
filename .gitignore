@@ -15,6 +15,7 @@ data/*
 !data/calendar/**
 *.parquet
 *.log
+data/logs/
 
 # Dashboard data blob IS tracked (it is the Pages deploy artifact): see
 # dashboard/data/dashboard_data.json (not under data/, so not ignored).
@@ -31,3 +32,4 @@ venv/
 Thumbs.db
 .vscode/
 .idea/
+installers/

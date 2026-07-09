@@ -322,6 +322,7 @@ class StrategyConfig:
     # Stop calibration modes (Test 3B+).
     stop_mode: str = "short_ask"  # short_ask | short_mid | spread_value
     stop_fill_slippage: float = 0.0
+    entry_fill_slippage: float = 0.0
     stop_confirmation_count: int = 1
     spread_stop_loss_multiple: float = 1.5
     block_same_strike_after_stop: bool = False
@@ -1728,6 +1729,8 @@ def open_trade(
     is_debit_candidate = candidate is not None and candidate.sleeve in {"trend_debit", "long_put_hedge"}
     if credit <= 0 and not is_debit_candidate:
         return None
+    if config.entry_fill_slippage > 0 and not is_debit_candidate:
+        credit = max(credit - config.entry_fill_slippage, 0.0)
 
     spot = candidate.spot if candidate else short_quote.underlying_price
     width = abs(long_quote.strike - short_quote.strike)

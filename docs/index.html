@@ -412,10 +412,15 @@ function Daily({data}) {
   const run = data.runs.find(r=>r.id===runId) || defaultRun;
   const [sel,setSel]=useState(null);
   const tradingDays = run? run.daily.filter(d=>d.trades>0).map(d=>d.date):[];
-  const day = sel||tradingDays[tradingDays.length-1];
+  const liveDays = Object.keys(data.live?.days || {}).sort();
+  const dayOptions = Array.from(new Set([...tradingDays, ...liveDays])).sort();
+  const day = sel || dayOptions[dayOptions.length-1] || "";
   const dayRow = run?.daily.find(d=>d.date===day);
   const trades = run?.trades_by_date?.[day]||[];
+  const liveDay = data.live?.days?.[day];
   const liveEnabled = data.live_enabled !== false && Object.keys(data.live?.days || {}).length > 0;
+  const recon = liveDay?.reconcile;
+  const diffPaper = recon?.diff_paper_scale;
   return (
     <div>
       {multi && (
@@ -429,7 +434,7 @@ function Daily({data}) {
       <div className="row">
         <label className="muted">Trading day</label>
         <select value={day||""} onChange={e=>setSel(e.target.value)}>
-          {tradingDays.map(d=><option key={d} value={d}>{d}</option>)}
+          {dayOptions.map(d=><option key={d} value={d}>{d}{liveDays.includes(d)?" · live":""}</option>)}
         </select>
       </div>
       {dayRow && <div className="cards">
@@ -461,11 +466,61 @@ function Daily({data}) {
             </tr>
           ))}</tbody>
         </table>
+        {!trades.length && <p className="sub">No backtest trades on this day.</p>}
       </div>
       {liveEnabled ? (
         <div className="panel">
-          <h2>Live fills — {day}</h2>
-          <p className="sub">Live comparison is enabled when fills are exported into the dashboard build.</p>
+          <h2>Live / paper fills — {day}{liveDay?.mode ? ` (${liveDay.mode})` : ""}</h2>
+          {liveDay ? (
+            <>
+              <div className="cards" style={{marginBottom:12}}>
+                <div className="card"><div className="k">Entries</div><div className="v">{liveDay.entries?.length||0}</div></div>
+                <div className="card"><div className="k">Stops</div><div className="v">{liveDay.stops||0}</div></div>
+                <div className="card"><div className="k">Rejected</div><div className="v">{liveDay.order_rejected||0}</div></div>
+                <div className="card"><div className="k">Credit sold</div><div className="v">{fmt$(liveDay.gross_credit_sold)}</div></div>
+                <div className="card"><div className="k">Marked P&L</div><div className={"v "+cls(liveDay.marked_pnl)}>{liveDay.marked_pnl==null?"—":fmt$(liveDay.marked_pnl)}</div></div>
+                <div className="card"><div className="k">Flattened</div><div className="v">{liveDay.flattened?<span className="pill halt">Yes</span>:"No"}</div></div>
+                <div className="card"><div className="k">Halted</div><div className="v">{liveDay.halted?<span className="pill halt">Yes</span>:"No"}</div></div>
+              </div>
+              {diffPaper?.available && (
+                <p className="sub" style={{marginTop:0}}>
+                  Reconcile vs paper-scale backtest:{" "}
+                  <span className="pill">entries {diffPaper.entries>0?"+":""}{diffPaper.entries}</span>{" "}
+                  <span className="pill">contracts {diffPaper.contracts>0?"+":""}{diffPaper.contracts}</span>{" "}
+                  <span className="pill">stops {diffPaper.stops>0?"+":""}{diffPaper.stops}</span>
+                  {recon?.backtest_paper_scale?.net_pnl!=null && (
+                    <> · BT net {fmt$(recon.backtest_paper_scale.net_pnl)}</>
+                  )}
+                </p>
+              )}
+              <table>
+                <thead>
+                  <tr>
+                    <th>Time</th><th>Side</th><th>Short</th><th>Long</th><th>Contr.</th>
+                    <th>Credit</th><th>Slip</th><th>Score</th><th>Stopped</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {(liveDay.entries||[]).map((e,i)=>(
+                    <tr key={i}>
+                      <td>{(e.ts||"").slice(11,16)}</td>
+                      <td>{e.side}</td>
+                      <td>{e.short_strike}</td>
+                      <td>{e.long_strike}</td>
+                      <td>{e.contracts}</td>
+                      <td>{e.credit!=null?Number(e.credit).toFixed(2):""}</td>
+                      <td>{e.fill_slippage!=null?Number(e.fill_slippage).toFixed(2):""}</td>
+                      <td>{e.score!=null?Number(e.score).toFixed(2):""}</td>
+                      <td>{e.stopped?<span className="pill halt">stop</span>:""}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+              {!(liveDay.entries||[]).length && <p className="sub">Session logged but no fills.</p>}
+            </>
+          ) : (
+            <p className="sub" style={{margin:0}}>No live/paper session folder for this day under data/live/.</p>
+          )}
         </div>
       ) : (
         <div className="panel">

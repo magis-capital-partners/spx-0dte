@@ -15,6 +15,7 @@ ROOT = Path(__file__).resolve().parents[1]
 RAW_ROOT = ROOT / "data" / "raw" / "thetadata" / "symbol=SPXW"
 PROC_ROOT = ROOT / "data" / "processed" / "symbol=SPXW"
 MANIFEST = ROOT / "data" / "inventory" / "manifest.json"
+VIX_CSV = ROOT / "data" / "calendar" / "vix_daily.csv"
 
 
 def list_dates(root: Path) -> List[str]:
@@ -63,6 +64,25 @@ def build_manifest() -> dict:
     proc_first = proc_dates[0] if proc_dates else "2019-01-02"
     proc_last = proc_dates[-1] if proc_dates else ""
 
+    vix_block = {"path": "data/calendar/vix_daily.csv", "count": 0, "first_date": "", "last_date": ""}
+    if VIX_CSV.exists():
+        import csv
+
+        vix_dates = []
+        with VIX_CSV.open(newline="", encoding="utf-8-sig") as handle:
+            for row in csv.DictReader(handle):
+                if row.get("date"):
+                    vix_dates.append(row["date"][:10])
+        vix_dates.sort()
+        if vix_dates:
+            vix_block = {
+                "path": "data/calendar/vix_daily.csv",
+                "count": len(vix_dates),
+                "first_date": vix_dates[0],
+                "last_date": vix_dates[-1],
+                "source": "yahoo_finance_^VIX",
+            }
+
     return {
         "updated_at": datetime.now(timezone.utc).isoformat(),
         "policy": (
@@ -80,6 +100,7 @@ def build_manifest() -> dict:
             "description": "Simulator inputs: normalized_option_quotes.csv + signals.csv per day",
             **summarize_dates(proc_dates),
         },
+        "vix_daily": vix_block,
         "cache_status": {
             "raw_not_built_count": len(raw_unprocessed),
             "raw_not_built_by_year": dict(sorted(Counter(d[:4] for d in raw_unprocessed).items())),
@@ -96,6 +117,13 @@ def build_manifest() -> dict:
                 f"--start-date {proc_first} --end-date {proc_last or proc_first}"
             ),
             "enrich": "python simulator/feature_enricher.py --symbol SPXW",
+            "download_vix": "python scripts/download_vix_daily.py --start-date 2019-01-01",
+            "enrich_vix": (
+                "python scripts/download_vix_daily.py --start-date 2019-01-01 && "
+                "python simulator/vix_signal_enricher.py --symbol SPXW"
+            ),
+            "validate_vix": "python scripts/validate_vix_coverage.py",
+            "vix_regime_tests": "python scripts/run_vix_regime_tests.py",
         },
         "do_not": [
             "Do not run thetadata_downloader.py or backfill_history.py --download unless the user explicitly requests new dates.",

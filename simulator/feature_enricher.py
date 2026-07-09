@@ -112,9 +112,25 @@ def enrich_day(rows: List[dict], prior_close: Optional[float], prior_range_pct: 
 
 
 def enrich_symbol(processed_dir: Path, symbol: str, dates: Optional[List[str]] = None) -> int:
-    dates = dates or discover_dates(processed_dir, symbol)
+    all_dates = discover_dates(processed_dir, symbol)
+    dates = dates or all_dates
     prior_close: Optional[float] = None
     prior_range_pct = 0.01
+
+    # When enriching a subset, seed overnight/prior-day features from the previous processed day.
+    if dates and all_dates:
+        first = dates[0]
+        if first in all_dates:
+            idx = all_dates.index(first)
+            if idx > 0:
+                prior_path = (
+                    processed_dir / f"symbol={symbol}" / f"date={all_dates[idx - 1]}" / "signals.csv"
+                )
+                prior_rows = read_csv(prior_path)
+                if prior_rows:
+                    prior_close = day_close_spot(prior_rows)
+                    prior_range_pct = max(day_range_pct(prior_rows), 0.002)
+
     updated = 0
     for trade_date in dates:
         day_dir = processed_dir / f"symbol={symbol}" / f"date={trade_date}"

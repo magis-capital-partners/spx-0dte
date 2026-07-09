@@ -142,6 +142,14 @@ def export_time_of_day_scheme(
     }
 
 
+def _load_csv_rows(path: Path) -> list[dict]:
+    if not path.exists():
+        return []
+    from historical_baselines import read_csv
+
+    return read_csv(path)
+
+
 def export_historical_3d_variant(
     preset_id: str,
     spec: dict,
@@ -153,8 +161,14 @@ def export_historical_3d_variant(
     *,
     end_date: str = "",
     rules_file: Path = DEFAULT_RULES,
+    incremental: bool = False,
 ) -> dict:
-    """Run eligible-calendar 3D backtest with optional config overrides."""
+    """Run eligible-calendar 3D backtest with optional config overrides.
+
+    When ``incremental`` is True and prior CSVs exist, only simulate dates after
+    the last exported OOS day (fast daily catch-up). Use a full rebuild after
+    config/profile changes.
+    """
     scheme = spec["scheme"]
     if scheme not in SCHEMES:
         raise SystemExit(f"Unknown scheme {scheme!r}")
@@ -192,13 +206,50 @@ def export_historical_3d_variant(
     else:
         policy = TimeOfDaySizePolicy(SCHEMES[scheme])
 
+    daily_path = out_dir / "daily_summary.csv"
+    trades_path = out_dir / "trades.csv"
+    stops_path = out_dir / "stop_diagnostics.csv"
+
     daily_rows: list[dict] = []
     all_trades: list[dict] = []
     stop_rows: list[dict] = []
+    start_index = train_count
 
-    oos_days = len(eligible_dates) - train_count
-    print(f"Running {preset_id} -> {out_dir} ({oos_days} OOS eligible days)...")
-    for index in range(train_count, len(eligible_dates)):
+    if incremental:
+        prior_daily = _load_csv_rows(daily_path)
+        prior_trades = _load_csv_rows(trades_path)
+        prior_stops = _load_csv_rows(stops_path)
+        if prior_daily:
+            last_exported = str(prior_daily[-1].get("date", ""))
+            if last_exported in eligible_dates:
+                last_idx = eligible_dates.index(last_exported)
+                start_index = max(train_count, last_idx + 1)
+                daily_rows = prior_daily
+                all_trades = prior_trades
+                stop_rows = prior_stops
+                print(
+                    f"Incremental {preset_id}: resuming after {last_exported} "
+                    f"({len(eligible_dates) - start_index} new OOS day(s))"
+                )
+            else:
+                print(
+                    f"Incremental {preset_id}: last exported {last_exported!r} "
+                    "not in eligible calendar; falling back to full rebuild"
+                )
+                start_index = train_count
+                daily_rows, all_trades, stop_rows = [], [], []
+        else:
+            print(f"Incremental {preset_id}: no prior daily_summary; full rebuild")
+
+    oos_total = len(eligible_dates) - train_count
+    new_days = max(0, len(eligible_dates) - start_index)
+    if new_days == 0 and daily_rows:
+        print(f"Running {preset_id} -> {out_dir}: already up to date through {daily_rows[-1]['date']}")
+    else:
+        mode = "incremental" if start_index > train_count else "full"
+        print(f"Running {preset_id} -> {out_dir} ({mode}: {new_days} day(s), {oos_total} OOS total)...")
+
+    for index in range(start_index, len(eligible_dates)):
         test_date = eligible_dates[index]
         train_dates = eligible_dates[index - train_count : index]
         apply_rolling_baseline(processed_dir, symbol, train_dates, test_date, signals_filename)
@@ -234,8 +285,8 @@ def export_historical_3d_variant(
             }
         )
         done = index - train_count + 1
-        if done % 50 == 0 or done == oos_days:
-            print(f"  {done}/{oos_days} OOS days done ({test_date})")
+        if done % 50 == 0 or done == oos_total:
+            print(f"  {done}/{oos_total} OOS days done ({test_date})")
 
     spread_trades = [r for r in all_trades if r.get("model") != "net_long_overlay"]
     ts = trade_stats(spread_trades)
@@ -252,6 +303,7 @@ def export_historical_3d_variant(
         "end_date": resolved_end,
         "config_overrides": overrides,
         "sizing_scheme": scheme,
+        "incremental": bool(incremental and start_index > train_count),
         "vix_policy": (
             {
                 "skip_above": 35.0,
@@ -284,6 +336,11 @@ def main() -> None:
     parser.add_argument("--out-dir", default="")
     parser.add_argument("--train-count", type=int, default=40)
     parser.add_argument("--end-date", default="", help="Cap eligible end date (default: latest processed).")
+    parser.add_argument(
+        "--incremental",
+        action="store_true",
+        help="Append only new OOS days onto existing dashboard_runs CSVs (historical_3d presets).",
+    )
     args = parser.parse_args()
 
     root = Path(__file__).resolve().parents[1]
@@ -296,6 +353,8 @@ def main() -> None:
     spec = PRESETS[preset]
 
     if spec["kind"] == "time_of_day":
+        if args.incremental:
+            print("Note: --incremental is ignored for time_of_day presets (full rebuild).")
         row = export_time_of_day_scheme(
             spec["scheme"],
             out,
@@ -314,6 +373,7 @@ def main() -> None:
             "signals_unconditional.csv",
             args.train_count,
             end_date=args.end_date,
+            incremental=args.incremental,
         )
     else:
         vid = spec["variant_id"]

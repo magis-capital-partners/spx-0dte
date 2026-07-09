@@ -2,8 +2,18 @@
 from __future__ import annotations
 
 import math
-from statistics import mean, pstdev
+from statistics import mean
 from typing import List, Literal, Sequence
+
+
+def _safe_pstdev(values: Sequence[float]) -> float:
+    """Population stdev; avoids Python 3.12 pstdev edge-case crashes on flat paths."""
+    n = len(values)
+    if n < 2:
+        return 0.0
+    m = mean(values)
+    var = sum((x - m) ** 2 for x in values) / n
+    return math.sqrt(var) if var > 1e-18 else 0.0
 
 TRADING_DAYS = 252
 MetricsMode = Literal["all_rows", "eligible_only", "traded_only"]
@@ -45,6 +55,8 @@ def portfolio_stats(
     rets: List[float] = []
     for row in rows:
         pnl = float(row["net_pnl"])
+        if not math.isfinite(pnl):
+            pnl = 0.0
         worst = min(worst, pnl)
         rets.append(pnl / equity if equity else 0.0)
         equity += pnl
@@ -55,10 +67,10 @@ def portfolio_stats(
     total_ret = equity / account_equity - 1.0
     years = days / TRADING_DAYS
     cagr = ((1 + total_ret) ** (1 / years) - 1.0) if years > 0 and total_ret > -1 else 0.0
-    std = pstdev(rets) if len(rets) > 1 else 0.0
+    std = _safe_pstdev(rets)
     sharpe = (mean(rets) / std) * math.sqrt(TRADING_DAYS) if std > 0 else 0.0
     downside = [r for r in rets if r < 0]
-    downside_std = pstdev(downside) if len(downside) > 1 else 0.0
+    downside_std = _safe_pstdev(downside)
     sortino = (mean(rets) / downside_std) * math.sqrt(TRADING_DAYS) if downside_std > 0 else 0.0
     ann_vol = std * math.sqrt(TRADING_DAYS) if std > 0 else 0.0
 

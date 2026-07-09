@@ -20,13 +20,41 @@ The interactive site is deployed from the **`docs/`** folder on **`main`** (GitH
 
 Branch deploy uses **no GitHub Actions minutes**.
 
+## Daily data + dashboard (no Actions minutes)
+
+Prefer the local weekday job over GitHub Actions (saves Actions minutes; Pages branch
+deploy already uses none):
+
+```powershell
+# Install once (User env API key + 6:30 PM weekday task that downloads + deploys)
+.\scripts\install_daily_update_task.ps1 -ApiKey "td1_..." -Deploy
+
+# Or run catch-up now
+.\scripts\daily_data_update.ps1 -Deploy
+```
+
+See `data/README.md` → **Daily automation**.
+
 ## Refresh + deploy
 
 ```powershell
+# Rebuild dashboard JSON only (local preview)
+.\scripts\sync_dashboard.ps1
+
+# Full deploy: rebuild + commit docs/ + push main + trigger GitHub Pages build
+.\scripts\sync_dashboard.ps1 -Deploy
+
+# Alias
 .\scripts\sync_dashboard.ps1 -Push
+
+# Push existing docs/ without rebuilding data, then trigger Pages
+.\scripts\sync_dashboard.ps1 -DeployOnly
+
+# Request a Pages rebuild via API (no git)
+.\scripts\sync_dashboard.ps1 -TriggerPagesBuild
 ```
 
-Rebuilds `docs/data/dashboard_data.json`, commits `docs/`, and pushes `main`.
+`-Deploy` rebuilds `docs/data/dashboard_data.json`, commits `docs/`, pushes `main`, then calls the GitHub Pages build API and polls until status is `built` (or times out after 120s).
 
 Preview locally:
 
