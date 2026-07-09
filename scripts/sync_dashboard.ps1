@@ -88,7 +88,15 @@ if ($doBuild) {
 if ($doDeploy -or $DeployOnly) {
   Push-Location $Root
   # Only stage dashboard artifacts — avoid sweeping unrelated docs/ files (PDFs, guides, etc.).
-  & $Git add -- "docs/data/dashboard_data.json" "docs/index.html" "docs/app.js" "docs/styles.css" "docs/data/investors.json" 2>$null
+  foreach ($artifact in @(
+    "docs/data/dashboard_data.json",
+    "docs/index.html",
+    "docs/data/investors.json"
+  )) {
+    if (Test-Path (Join-Path $Root $artifact)) {
+      & $Git add -- $artifact
+    }
+  }
   # Also stage any other tracked files already under docs/data/ that changed.
   & $Git add -- "docs/data/"
   $staged = & $Git diff --cached --name-only
