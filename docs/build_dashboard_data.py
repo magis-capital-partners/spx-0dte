@@ -417,25 +417,28 @@ def build_p3_poststop_strategy_guide(account_equity: float, hist: Optional[dict]
     return {
         "title": "Production + 120-Minute Same-Side Stop Cooldown",
         "subtitle": (
-            "Same 3D flatten shell, trend/skew gates, and linear-decay sizing as live production — "
-            "plus a post-stop rule that pauses new entries on the stopped side for two hours"
+            "Same 3D flatten shell, trend/skew gates, linear-decay sizing, and VIX regime controls "
+            "(skip >35, 1.25× upscale 25–35) — plus a 120-minute same-side post-stop cooldown"
         ),
         "sections": [
             {
                 "title": "What this strategy does",
                 "paragraphs": [
                     (
-                        "This run is identical to the current production profile "
-                        "(p3_trend1_skew075): SPXW 0DTE vertical credit spreads in 15-minute tranches, "
-                        "wide wings (put 200 / call 75), 3.0× short-leg stops with 2-bar confirmation, "
-                        "daily loss halt at −2.25%, flatten at −3.5%, trend/skew bear-call gates, and "
-                        "linear_decay_downsize contract schedule."
+                        "This run is the current live production profile: SPXW 0DTE vertical credit spreads "
+                        "in 15-minute tranches, wide wings (put 200 / call 75), 3.0× short-leg stops with "
+                        "2-bar confirmation, daily loss halt at −2.25%, flatten at −3.5%, trend/skew "
+                        "bear-call gates, and linear_decay_downsize contract schedule."
                     ),
                     (
-                        "The only change is same_side_stop_cooldown_minutes=120. After any stopped spread, "
-                        "the simulator blocks new entries on that side (puts or calls) until 120 minutes "
-                        "have passed. The opposite side can still enter. Open positions are not closed by "
-                        "the cooldown — only new entries are suppressed."
+                        "VIX regime controls (validated July 2026): skip the entire session when "
+                        "same-day VIX open > 35; on elevated days (VIX 25–35) multiply contract count "
+                        "by 1.25× on top of the time-of-day schedule (capped at 48 contracts per tranche "
+                        "at the 31-contract baseline)."
+                    ),
+                    (
+                        "same_side_stop_cooldown_minutes=120: after any stopped spread, block new entries "
+                        "on that side for 120 minutes. The opposite side can still enter."
                     ),
                 ],
             },
@@ -591,16 +594,17 @@ def main() -> None:
         elif id_part == "p3_poststop_cooldown_120":
             meta = {
                 "description": (
-                    "Production trend/skew gates with same_side_stop_cooldown_minutes=120: after a stopped "
-                    "put or call spread, no new entries on that side for two hours. Opposite side unchanged."
+                    "Production trend/skew gates with same_side_stop_cooldown_minutes=120, "
+                    "VIX session skip when open > 35, and 1.25× contract upscale when VIX is 25–35 "
+                    "(cap 48 contracts/tranche at 31-contract baseline)."
                 ),
                 "gates": (
                     "trend 1.0 · skew 0.75 · same_side_stop_cooldown_minutes=120 "
-                    "(global stop cooldown off)"
+                    "(global stop cooldown off) · skip session VIX>35"
                 ),
                 "sizing_schedule": (
-                    "Same linear_decay_downsize as production: "
-                    "09:32-10:29 1.25x (39) … 14:30-15:30 0.25x (8)"
+                    "linear_decay_downsize + VIX elevated 1.25× (25–35): "
+                    "09:32-10:29 1.25x (39→48 peak elevated) … 14:30-15:30 0.25x (8)"
                 ),
                 "credit_cap_pct": 50.0,
                 "strategy_guide": build_p3_poststop_strategy_guide(args.account_equity, hist),
