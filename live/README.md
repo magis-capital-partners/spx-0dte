@@ -1,129 +1,105 @@
 # Live Execution (Interactive Brokers)
 
-This package takes the validated 0DTE SPX vertical-spread strategy from the
-`simulator/` backtest and runs it live against Interactive Brokers, using the
-**same** `StrategyConfig`, candidate selection, short-leg stop (with N-bar
-confirmation), and halt/flatten governor as the backtest. The goal is that a
-given trading day's live decisions match what the backtest would have produced
-from the same chain.
+Production SPX 0DTE executor with **streaming quotes**, **adaptive polling**, and
+**limit-then-MKT stops**. Strategy logic matches `p3_poststop_cooldown_120` in
+`simulator/profiles.py` (skew gate **0.65**, flatten **−3.25%**, trend/skew gates,
+**120-minute same-side stop cooldown** after any stopped spread).
 
-## Single source of truth
+## Low-latency architecture
 
-The winning parameters live in exactly one place — `simulator/profiles.py`:
+| Phase | Implementation |
+|---|---|
+| **1 — Cached chain** | `reqSecDefOptParams` once at session start (`ib_market_data.py`) |
+| **2 — Streaming** | `reqMktData` on SPX + strike grid; loop reads in-memory cache |
+| **3 — Adaptive poll** | 0.75s near stop · 1.5s with open risk · sleep until tranche when flat |
+| **4 — Stop execution** | Limit buy at ask + 5% / $0.15 buffer, MKT fallback after 3s |
+| **5 — Entry execution** | Non-blocking combo limit: natural credit − $0.05 concession, work ~14.5m, ladder every 60s |
 
-- `build_3d_flatten_config()` → the validated **`3d_flatten_3_5`** production
-  candidate (wide wings 200/75, 3.0× short-leg stop + 2-bar confirm, halt
-  entries −2.25%, flatten −3.5%, 31 contracts flat, gates off).
-- `SCHEMES` → optional Test-3G time-of-day contract weighting.
+Term ratio: next-expiry ATM snapshot refreshed **at tranche boundaries only**
+(four IB lines every 15 minutes).
 
-The backtest runners, the dashboard export, and this live executor **all** build
-their config from that module, so a change moves every consumer together. That
-is what makes iterating on the strategy safe.
+Entry orders are **non-blocking** — the loop keeps polling fills and managing
+stops while a combo works. See `live/entry_execution.py`.
 
-## How to run
+### Post-stop cooldown (live)
 
-There are **no command-line flags**. All runtime settings live in
-`live/live_config.py` (`ACTIVE`). Edit that object, then:
+When `same_side_stop_cooldown_minutes=120` (default profile), each stopped spread
+starts a **side-specific** 120-minute entry pause:
+
+- Stopped **bear call** → no new call spreads until cooldown expires; puts still allowed.
+- Stopped **bull put** → no new put spreads; calls still allowed.
+
+### VIX session controls
+
+At startup the executor reads **same-day VIX open** from `data/calendar/vix_daily.csv`
+(Yahoo `^VIX`, auto-refreshed if today's row is missing). Validated in
+`data/vix_regime_tests/` (July 2026).
+
+| Rule | Default | Behavior |
+|------|---------|----------|
+| **Skip session** | VIX open **> 35** | `SystemExit` before IB connect — no trading |
+| **Elevated sizing** | VIX **25–35** | Contract count × **1.25** (cap **3** at 2-contract baseline) |
+
+Configure in `live/live_config.py` (`use_vix_session_gate`, `vix_skip_open_above`,
+`use_vix_elevated_sizing`, `vix_elevated_scale`, `max_contracts_per_tranche`, etc.).
+Refresh calendar: `python scripts/download_vix_daily.py`.
+- Open positions are not closed by the cooldown — only new entries are blocked.
+- Implemented in `live/risk_gates.py`, wired from `ib_executor.py` after `manage_stops()`.
+
+Events: `side_stop_cooldown_start` and `entry_blocked` with `reason=side_stop_cooldown`
+in `data/live/<date>/fills.jsonl`.
+
+## Before each session
+
+```
+python scripts/refresh_live_baselines.py
+```
+
+## Run
 
 ```
 python live/ib_executor.py
 ```
 
-Key `LiveConfig` fields:
+### Key `LiveConfig` defaults (`live/live_config.py`)
 
-| Field | Meaning |
-|---|---|
-| `profile` | Strategy profile name from `simulator/profiles.py` (`3d_flatten_3_5`) |
-| `sizing_scheme` | `""`/`control_flat` = flat book; e.g. `linear_decay_downsize` for Test-3G weighting |
-| `account_equity` / `contract_scale` | Deployment size; `contract_scale` scales the validated size for pilots |
-| `max_contracts_per_tranche` | Hard safety cap applied after all sizing |
-| `mode` | `dry` (log only) / `paper` (7497) / `live` (7496, requires `allow_live=True`) |
-| `dry_with_ib` | In dry mode, still connect to read the live chain (places nothing) |
-| `poll_seconds`, `host`, `port`, `client_id`, `baselines_path` | IB connection / loop |
-| `delayed_quote_fallback` | Fill missing bid/ask from last/mid when on delayed data (type 3) |
+| Field | Default | Notes |
+|---|---|---|
+| `profile` | `p3_poststop_cooldown_120` | Skew 0.65 + flatten 3.25% + 120min same-side cooldown |
+| `use_streaming_quotes` | `True` | Set `False` to revert to per-poll snapshots |
+| `use_adaptive_polling` | `True` | Set `False` to use fixed `poll_seconds` |
+| `poll_seconds_active` | `1.5` | Open positions |
+| `poll_seconds_near_stop` | `0.75` | Short ask ≥ 80% of stop |
+| `market_data_type` | `1` | Live OPRA; use `3` on paper without subs |
+| `stop_limit_slippage_pct` | `0.05` | Limit stop buffer above ask |
+| `entry_limit_concession` | `0.05` | Haircut from natural credit on combo limit |
+| `entry_work_seconds` | `870` | How long to work an entry before `entry_unfilled` |
+| `entry_ladder_step` | `0.05` | Extra concession per ladder step (every 60s) |
+| `entry_require_live_nbbo` | `False` | Set `True` with OPRA subs |
 
-## Session artifacts
+Paper without OPRA (current): `market_data_type=3`, `delayed_quote_fallback=True`,
+`entry_require_live_nbbo=False`.
 
-Each run writes to `data/live/<date>/`:
+**Paper with OPRA** (switch when ready):
 
-| File | Contents |
-|---|---|
-| `config.json` | Fully-resolved live + strategy config |
-| `fills.jsonl` | Entries, stops, halts, session start/end |
-| `tranches.jsonl` | One JSON record per 15-min tranche (pass/skip reason, scores) |
-| `ib.log` | Full ib_insync library output |
-| `ib_errors.jsonl` | Structured IB error/warning codes |
-
-On each tranche boundary the console prints a `[tranche]` line (sold or skip reason).
-The `[chain]` line every ~60s now includes the strike span fetched (should cover wing legs).
-
-## Architecture
-
-```
-                ┌─────────────────────────────────────────────┐
-                │  ib_executor.py  (run during RTH)            │
-                │                                              │
-  IB Gateway ──▶│  1. MarketData: pull SPXW 0DTE chain         │
-   / TWS        │  2. feature snapshot → SignalSnapshot        │
-                │  3. select_candidate_entries(...)            │
-                │  4. per-tranche sizing (once per tranche)    │
-                │  5. place BAG combo (sell short / buy wing)  │
-                │  6. synthetic short-leg stop (N-bar confirm),│
-                │     keep long wing; native STP as backstop   │
-                │  7. mark book; HALT entries at loss limit,   │
-                │     FLATTEN open positions at deeper limit   │
-                │  8. 0DTE cash-settles at close (no EOD MKT)  │
-                │  9. config.json snapshot + fills.jsonl log   │
-                │ 10. ib.log + ib_errors.jsonl (IB warnings)   │
-                │ 11. tranches.jsonl (per-tranche diagnostics) │
-                └─────────────────────────────────────────────┘
+```python
+market_data_type = 1
+auto_fallback_delayed = False
+delayed_quote_fallback = False
+entry_require_live_nbbo = True
 ```
 
-## Prerequisites
+Backtest parity: production profile includes `entry_fill_slippage=0.05` matching
+`entry_limit_concession`.
 
-- IB Gateway or TWS running with API enabled (paper port 7497, live 7496).
-- Market data: OPRA (US options) + index (SPX) subscription for live Greeks
-  (delta drives strike selection — without it there are no candidates).
-- `pip install ib_insync` (in `requirements.txt`).
-
-## Safe rollout
-
-1. **Dry, no IB** (`mode="dry"`): logs intended trades with neutral signals;
-   exercises the full loop with no market data.
-2. **Dry, live chain** (`mode="dry"`, `dry_with_ib=True`): reads the real chain,
-   logs intended strikes/credits, places nothing.
-3. **Paper** (`mode="paper"`): full order flow on the IB paper account.
-4. **Live pilot** (`mode="live"`, `allow_live=True`): start with a small
-   `contract_scale`, confirm fills/stops behave, then ramp.
-
-## Iteration loop
-
-Each strategy change flows through one loop:
-
-1. Add/edit a profile (or `SCHEMES` entry) in `simulator/profiles.py`.
-2. Backtest it — the runners import the same registry (`stop_calibration_runner`,
-   `time_of_day_sizing_runner`, `robustness_study`).
-3. Dry-run it live (`mode="dry"`, `dry_with_ib=True`); the `config.json`
-   snapshot should match the backtest config.
-4. Paper it, then **reconcile**:
+## Validation
 
 ```
-python simulator/reconcile_live.py --date <session-date>
+python live/test_risk_gates.py
+python live/test_loop_timing.py
+python live/test_entry_execution.py
+python live/test_ib_order_hygiene.py
+python simulator/test_profile_regression.py
+python simulator/test_live_signal_parity.py
+python simulator/reconcile_live.py --date YYYY-MM-DD
 ```
-
-`reconcile_live.py` replays the session date through the backtest with the exact
-saved config and diffs entries / contracts / stops / P&L. Differences beyond
-fills/slippage indicate a logic gap.
-
-## Known gap — signal parity
-
-`IBSignalProvider._build_signal` currently returns a **neutral** snapshot (the
-live z-score assembly is a marked seam). With the `3d_flatten_3_5` gates off,
-trades still fire, but candidate *scoring/side selection* can differ from the
-backtest (which uses real `signals_unconditional.csv`). Day-1 paper validates
-**execution plumbing**; wiring the live features against `historical_baselines`
-is the next iteration and is what `reconcile_live.py` measures.
-
-> Live trading involves real financial risk. The backtest uses 1-minute quotes
-> and modeled fills; live slippage on 0DTE stops can be worse. Always start in
-> paper and a small live pilot.

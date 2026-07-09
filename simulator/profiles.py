@@ -19,6 +19,24 @@ from mbh_simulator import StrategyConfig
 from stop_calibration_runner import wide_wings
 from unconditional_baseline import build_unconditional_config
 
+# Production deployment target (dashboard #1, improvement-plan winner).
+PRODUCTION_PROFILE = "p3_trend1_skew075"
+PRODUCTION_SIZING_SCHEME = "linear_decay_downsize"
+PRODUCTION_BASELINE_CONTRACTS = 31
+PRODUCTION_ACCOUNT_EQUITY = 13_000_000.0
+PRODUCTION_TRAIN_COUNT = 40
+VIX_SKIP_OPEN_ABOVE = 35.0
+VIX_ELEVATED_MIN = 25.0
+VIX_ELEVATED_MAX = 35.0
+VIX_ELEVATED_SCALE = 1.25
+# Overnight Calmar winner (combo_skew065_flat325, July 2026): tighter skew gate + flatten.
+PRODUCTION_SKEW_GATE = 0.65
+PRODUCTION_FLATTEN_LOSS_LIMIT_PCT = 0.0325
+PRODUCTION_DAILY_LOSS_LIMIT_PCT = 0.0225
+# Peak morning elevated tranche: round(baseline × max_tod_mult × vix_elevated_scale).
+PRODUCTION_MAX_CONTRACTS_PER_TRANCHE = 48  # round(31 × 1.25 × 1.25)
+LIVE_PILOT_MAX_CONTRACTS_PER_TRANCHE = 3  # round(2 × 1.25 × 1.25)
+
 # --------------------------------------------------------------------------- #
 # Frozen 3D winner (wide wings + 3x stop + 2-bar confirm + flatten governor).
 # --------------------------------------------------------------------------- #
@@ -30,6 +48,7 @@ WINNERS: Dict[str, object] = {
     "daily_loss_limit_pct": 0.0225,   # halt NEW entries here
     "flatten_on_daily_loss": True,
     "flatten_loss_limit_pct": 0.035,  # force-flatten OPEN positions here
+    "entry_fill_slippage": 0.05,      # matches live entry_limit_concession
 }
 
 
@@ -53,9 +72,49 @@ def build_3d_flatten_config(
     return replace(cfg, **wide_wings(), **winners_wo_stop)
 
 
+def build_p3_trend_skew_config(
+    account_equity: float = PRODUCTION_ACCOUNT_EQUITY,
+    baseline_contracts: int = PRODUCTION_BASELINE_CONTRACTS,
+) -> StrategyConfig:
+    """Production profile: 3D flatten + trend/skew entry gates.
+
+    Skips bear calls when trend_score > 1.0 or skew_z > 0.75 (z-scored features).
+    ~23% CAGR on eligible-calendar OOS path (805 days as of 2026-07).
+    """
+    return replace(
+        build_3d_flatten_config(account_equity, baseline_contracts),
+        candidate_max_adverse_trend=1.0,
+        candidate_max_adverse_skew=0.75,
+    )
+
+
+def build_p3_poststop_cooldown_config(
+    account_equity: float = PRODUCTION_ACCOUNT_EQUITY,
+    baseline_contracts: int = PRODUCTION_BASELINE_CONTRACTS,
+    cooldown_minutes: int = 120,
+) -> StrategyConfig:
+    """Production profile + same-side post-stop re-entry cooldown.
+
+    After a stopped trade on puts or calls, block new entries on that side only
+    for ``cooldown_minutes`` (default 120). Opposite side and risk governors unchanged.
+
+    Skew gate 0.65 and flatten at −3.25% (entries halt −2.25%) are the overnight
+    Calmar suite winner ``combo_skew065_flat325`` (July 2026).
+    """
+    return replace(
+        build_p3_trend_skew_config(account_equity, baseline_contracts),
+        same_side_stop_cooldown_minutes=cooldown_minutes,
+        candidate_max_adverse_skew=PRODUCTION_SKEW_GATE,
+        daily_loss_limit_pct=PRODUCTION_DAILY_LOSS_LIMIT_PCT,
+        flatten_loss_limit_pct=PRODUCTION_FLATTEN_LOSS_LIMIT_PCT,
+    )
+
+
 # Named profiles: name -> builder(account_equity, baseline_contracts) -> config.
 PROFILE_BUILDERS: Dict[str, Callable[..., StrategyConfig]] = {
     "3d_flatten_3_5": build_3d_flatten_config,
+    PRODUCTION_PROFILE: build_p3_trend_skew_config,
+    "p3_poststop_cooldown_120": build_p3_poststop_cooldown_config,
 }
 
 

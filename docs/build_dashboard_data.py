@@ -417,8 +417,8 @@ def build_p3_poststop_strategy_guide(account_equity: float, hist: Optional[dict]
     return {
         "title": "Production + 120-Minute Same-Side Stop Cooldown",
         "subtitle": (
-            "Same 3D flatten shell, trend/skew gates, linear-decay sizing, and VIX regime controls "
-            "(skip >35, 1.25× upscale 25–35) — plus a 120-minute same-side post-stop cooldown"
+            "Overnight Calmar winner: skew gate 0.65, flatten −3.25%, linear-decay sizing, "
+            "VIX skip >35 / 1.25× upscale 25–35, plus 120-minute same-side post-stop cooldown"
         ),
         "sections": [
             {
@@ -427,8 +427,8 @@ def build_p3_poststop_strategy_guide(account_equity: float, hist: Optional[dict]
                     (
                         "This run is the current live production profile: SPXW 0DTE vertical credit spreads "
                         "in 15-minute tranches, wide wings (put 200 / call 75), 3.0× short-leg stops with "
-                        "2-bar confirmation, daily loss halt at −2.25%, flatten at −3.5%, trend/skew "
-                        "bear-call gates, and linear_decay_downsize contract schedule."
+                        "2-bar confirmation, daily loss halt at −2.25%, flatten at −3.25%, trend/skew "
+                        "bear-call gates (skew_z > 0.65), and linear_decay_downsize contract schedule."
                     ),
                     (
                         "VIX regime controls (validated July 2026): skip the entire session when "
@@ -478,8 +478,8 @@ def build_p3_poststop_strategy_guide(account_equity: float, hist: Optional[dict]
                 "bullets": [
                     "Put spreads: 200-point wings. Call spreads: 75-point wings. Short-leg stop 3.0×, 2-bar confirm.",
                     "Bear-call gate — trend: skip when trend_score > 1.0.",
-                    "Bear-call gate — skew: skip when skew_z > 0.75.",
-                    "Halt new entries at −2.25% daily MTM; flatten all open at −3.5%.",
+                    "Bear-call gate — skew: skip when skew_z > 0.65 (overnight Calmar winner vs prior 0.75).",
+                    "Halt new entries at −2.25% daily MTM; flatten all open at −3.25%.",
                     "Sizing (linear_decay_downsize): 9:32–10:29 → 39 ctr, 10:30–11:29 → 31, 11:30–12:29 → 26, "
                     "12:30–13:29 → 19, 13:30–14:29 → 14, 14:30–15:30 → 8 contracts.",
                 ],
@@ -594,12 +594,12 @@ def main() -> None:
         elif id_part == "p3_poststop_cooldown_120":
             meta = {
                 "description": (
-                    "Production trend/skew gates with same_side_stop_cooldown_minutes=120, "
-                    "VIX session skip when open > 35, and 1.25× contract upscale when VIX is 25–35 "
-                    "(cap 48 contracts/tranche at 31-contract baseline)."
+                    "Overnight Calmar winner (combo_skew065_flat325): skew gate 0.65, flatten −3.25%, "
+                    "same_side_stop_cooldown_minutes=120, VIX skip when open > 35, and 1.25× upscale "
+                    "when VIX is 25–35 (cap 48 contracts/tranche at 31-contract baseline)."
                 ),
                 "gates": (
-                    "trend 1.0 · skew 0.75 · same_side_stop_cooldown_minutes=120 "
+                    "trend 1.0 · skew 0.65 · flatten −3.25% · same_side_stop_cooldown_minutes=120 "
                     "(global stop cooldown off) · skip session VIX>35"
                 ),
                 "sizing_schedule": (

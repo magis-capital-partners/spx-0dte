@@ -27,9 +27,16 @@ from stop_calibration_runner import (
 )
 from time_of_day_sizing_runner import SCHEMES, TimeOfDaySizePolicy, WINNERS as TOD_WINNERS
 from unconditional_baseline import trade_stats
+from vix_sizing_policies import VixElevatedSkipPolicy, build_production_vix_policy
 
 # Canonical frozen winners — single source of truth (see simulator/profiles.py).
-from profiles import WINNERS
+from profiles import (
+    WINNERS,
+    PROFILE_BUILDERS,
+    PRODUCTION_ACCOUNT_EQUITY,
+    PRODUCTION_MAX_CONTRACTS_PER_TRANCHE,
+    VIX_ELEVATED_SCALE,
+)
 
 PRESETS = {
     "3d_flatten_3_5": {
@@ -47,11 +54,17 @@ PRESETS = {
     "p3_trend1_skew075": {
         "kind": "historical_3d",
         "scheme": "linear_decay_downsize",
-        "config_overrides": {
-            "candidate_max_adverse_trend": 1.0,
-            "candidate_max_adverse_skew": 0.75,
-        },
+        "profile": "p3_trend1_skew075",
         "label": "#1 Trend + Skew gates (improvement plan winner)",
+    },
+    "p3_poststop_cooldown_120": {
+        "kind": "historical_3d",
+        "scheme": "linear_decay_downsize",
+        "profile": "p3_poststop_cooldown_120",
+        "label": "Production skew 0.65 + flatten 3.25% + 120min cooldown + VIX",
+        "use_vix_elevated_policy": True,
+        "vix_max_contracts": PRODUCTION_MAX_CONTRACTS_PER_TRANCHE,
+        "vix_elevated_scale": VIX_ELEVATED_SCALE,
     },
 }
 
@@ -163,8 +176,21 @@ def export_historical_3d_variant(
         raise SystemExit(f"Need more than {train_count} eligible dates; have {len(eligible_dates)}")
 
     overrides = spec.get("config_overrides") or {}
-    config = replace(base_config(**TOD_WINNERS), **overrides)
-    policy = TimeOfDaySizePolicy(SCHEMES[scheme])
+    profile_name = spec.get("profile")
+    if profile_name:
+        if profile_name not in PROFILE_BUILDERS:
+            raise SystemExit(f"Unknown profile {profile_name!r}")
+        config = PROFILE_BUILDERS[profile_name](account_equity=PRODUCTION_ACCOUNT_EQUITY)
+    else:
+        config = replace(base_config(**TOD_WINNERS), **overrides)
+    if spec.get("use_vix_elevated_policy"):
+        policy = build_production_vix_policy(
+            SCHEMES[scheme],
+            elevated_scale=float(spec.get("vix_elevated_scale", VIX_ELEVATED_SCALE)),
+            max_contracts=spec.get("vix_max_contracts", PRODUCTION_MAX_CONTRACTS_PER_TRANCHE),
+        )
+    else:
+        policy = TimeOfDaySizePolicy(SCHEMES[scheme])
 
     daily_rows: list[dict] = []
     all_trades: list[dict] = []
@@ -226,6 +252,16 @@ def export_historical_3d_variant(
         "end_date": resolved_end,
         "config_overrides": overrides,
         "sizing_scheme": scheme,
+        "vix_policy": (
+            {
+                "skip_above": 35.0,
+                "elevated_band": [25.0, 35.0],
+                "elevated_scale": float(spec.get("vix_elevated_scale", VIX_ELEVATED_SCALE)),
+                "max_contracts_per_tranche": spec.get("vix_max_contracts"),
+            }
+            if spec.get("use_vix_elevated_policy")
+            else None
+        ),
         "eligible_dates": len(eligible_dates),
         "oos_eligible_days": len(daily_rows),
         "first_oos_date": daily_rows[0]["date"] if daily_rows else "",
