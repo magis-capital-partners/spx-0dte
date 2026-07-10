@@ -809,6 +809,8 @@ def main() -> None:
     out_path = Path(args.out)
     out_path.parent.mkdir(parents=True, exist_ok=True)
     out_path.write_text(json.dumps(blob, separators=(",", ":")), encoding="utf-8")
+    stamp_path = out_path.parent / "build_stamp.txt"
+    stamp_path.write_text(blob["generated_at"] + "\n", encoding="utf-8")
     size_kb = out_path.stat().st_size / 1024
     print(f"wrote {out_path} ({size_kb:.0f} KB, {len(runs)} runs)")
 

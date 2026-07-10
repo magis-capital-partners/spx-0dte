@@ -791,7 +791,19 @@ function App({ viewer }) {
   const [data,setData]=useState(null);
   const [tab,setTab]=useState("overview");
   const [err,setErr]=useState(null);
-  useEffect(()=>{ fetch("data/dashboard_data.json").then(r=>{if(!r.ok)throw new Error(r.status);return r.json();}).then(setData).catch(e=>setErr(String(e))); },[]);
+  useEffect(()=>{
+    fetch("data/build_stamp.txt", { cache: "no-store" })
+      .then(r => r.ok ? r.text() : "")
+      .catch(() => "")
+      .then(stamp => {
+        const v = encodeURIComponent(String(stamp || "").trim());
+        const url = v ? `data/dashboard_data.json?v=${v}` : "data/dashboard_data.json";
+        return fetch(url, { cache: "no-store" });
+      })
+      .then(r => { if (!r.ok) throw new Error(String(r.status)); return r.json(); })
+      .then(setData)
+      .catch(e => setErr(String(e)));
+  },[]);
   if(err) return <main><div className="panel">Could not load <code>data/dashboard_data.json</code>: {err}. Run <code>python dashboard/build_dashboard_data.py</code> first.</div></main>;
   if(!data) return <main><div className="muted">Loading…</div></main>;
   const primary = data.runs.find(r=>r.id===data.primary_run_id) || data.runs[0];
