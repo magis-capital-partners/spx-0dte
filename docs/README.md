@@ -38,8 +38,9 @@ python -m http.server 8000
 Full historical run (local cache, no ThetaData download):
 
 ```powershell
-python simulator/export_dashboard_run.py --preset p3_trend1_skew075
-python docs/build_dashboard_data.py
+python simulator/export_dashboard_run.py --preset p3_poststop_cooldown_120
+python simulator/export_dashboard_run.py --preset p3_trend_bc_085
+python docs/build_dashboard_data.py --primary-run-id p3_poststop_cooldown_120
 # or: .\scripts\sync_dashboard.ps1
 ```
 

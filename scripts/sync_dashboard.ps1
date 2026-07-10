@@ -77,8 +77,8 @@ function Wait-PagesBuild {
 if ($doBuild) {
   Write-Host "Building dashboard data (including live/paper sessions)..."
   & $Python "$Root\docs\build_dashboard_data.py" `
-    --run "p3_poststop_cooldown_120=data/dashboard_runs/p3_poststop_cooldown_120:Post-stop 120min cooldown" `
-    --run "p3_trend1_skew075=data/dashboard_runs/p3_trend1_skew075:#1 Trend + Skew gates (production)" `
+    --run "p3_poststop_cooldown_120=data/dashboard_runs/p3_poststop_cooldown_120:Production optimal — put wing 150 (Wave 2 Calmar)" `
+    --run "p3_trend_bc_085=data/dashboard_runs/p3_trend_bc_085:Trend BC 0.85 gate (Wave 2 risk-shape)" `
     --primary-run-id "p3_poststop_cooldown_120" `
     --account-equity $Equity `
     --include-live `
@@ -87,10 +87,12 @@ if ($doBuild) {
 
 if ($doDeploy -or $DeployOnly) {
   Push-Location $Root
-  # Only stage dashboard artifacts — avoid sweeping unrelated docs/ files (PDFs, guides, etc.).
+  # Only stage dashboard artifacts - avoid sweeping unrelated docs/ files (PDFs, guides, etc.).
   foreach ($artifact in @(
     "docs/data/dashboard_data.json",
+    "docs/data/build_stamp.txt",
     "docs/index.html",
+    "docs/build_dashboard_data.py",
     "docs/data/investors.json"
   )) {
     if (Test-Path (Join-Path $Root $artifact)) {

@@ -11,6 +11,7 @@ from dataclasses import dataclass
 @dataclass
 class LiveConfig:
     # --- Strategy selection ------------------------------------------------- #
+    # Wave 2 optimal: put wing 150, skew 0.65, flatten −3.25%, 120min cooldown.
     profile: str = "p3_poststop_cooldown_120"
     sizing_scheme: str = "linear_decay_downsize"
 

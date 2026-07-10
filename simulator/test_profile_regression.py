@@ -29,7 +29,8 @@ def test_production_profile_gates() -> None:
 
 def test_profile_registry() -> None:
     assert PRODUCTION_PROFILE in PROFILE_BUILDERS
-    assert PROFILE_BUILDERS[PRODUCTION_PROFILE] is build_p3_trend_skew_config
+    assert PROFILE_BUILDERS[PRODUCTION_PROFILE] is build_p3_poststop_cooldown_config
+    assert PROFILE_BUILDERS["p3_trend1_skew075"] is build_p3_trend_skew_config
     base = build_3d_flatten_config()
     assert base.candidate_max_adverse_trend == 99.0
     assert base.candidate_max_adverse_skew == 99.0
@@ -49,7 +50,19 @@ def test_poststop_profile_cooldown() -> None:
     assert cfg.candidate_max_adverse_skew == 0.65
     assert cfg.flatten_loss_limit_pct == 0.0325
     assert cfg.daily_loss_limit_pct == 0.0225
+    assert cfg.put_wing_width == 150.0  # Wave 2 Calmar winner put_wing_150
+    assert cfg.call_wing_width == 75.0
     assert "p3_poststop_cooldown_120" in PROFILE_BUILDERS
+
+
+def test_trend_bc_085_profile() -> None:
+    from profiles import build_p3_trend_bc_085_config
+
+    cfg = build_p3_trend_bc_085_config()
+    assert cfg.candidate_max_adverse_trend == 0.85
+    assert cfg.put_wing_width == 150.0
+    assert cfg.candidate_max_adverse_skew == 0.65
+    assert "p3_trend_bc_085" in PROFILE_BUILDERS
 
 
 def main() -> None:
@@ -57,6 +70,7 @@ def main() -> None:
     test_profile_registry()
     test_sizing_scheme_exists()
     test_poststop_profile_cooldown()
+    test_trend_bc_085_profile()
     print("profile regression: PASS")
 
 

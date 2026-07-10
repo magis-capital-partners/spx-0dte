@@ -78,6 +78,11 @@ from vix_session import (  # noqa: E402
     resolve_session_vix_open,
     vix_elevated_sizing_multiplier,
 )
+from session_recovery import (  # noqa: E402
+    acquire_executor_lock,
+    recover_session_book,
+    release_executor_lock,
+)
 from expiry_calendar import DEFAULT_RULES, is_live_tradable_day, load_era_rules  # noqa: E402
 from profiles import schedule_multiplier  # noqa: E402
 from strategy_profiles import resolve_strategy_config  # noqa: E402
@@ -1078,8 +1083,13 @@ def run(live: LiveConfig = ACTIVE) -> None:
     dry = live.mode == "dry"
     needs_signals = gates_require_signals(config)
 
+    # Single-instance lock before any IB work so two executors cannot share a day.
+    lock_path = acquire_executor_lock(today)
+    print(f"[{datetime.now().isoformat()}] executor lock acquired → {lock_path}")
+
     eligible, skip_reason = check_session_eligible(today_date)
     if not eligible:
+        release_executor_lock(lock_path)
         raise SystemExit(
             f"{today} is not an eligible SPXW session ({skip_reason}) — "
             "backtest CAGR uses eligible-calendar days only."
@@ -1088,6 +1098,7 @@ def run(live: LiveConfig = ACTIVE) -> None:
     vix_open, vix_source = resolve_session_vix_open(today, live)
     vix_blocked, vix_skip_reason = check_vix_session_allowed(vix_open, live)
     if vix_blocked:
+        release_executor_lock(lock_path)
         vix_txt = f"{vix_open:.2f}" if vix_open is not None else "n/a"
         raise SystemExit(
             f"{today} skipped — {vix_skip_reason} (VIX open={vix_txt}, source={vix_source}). "
@@ -1113,6 +1124,7 @@ def run(live: LiveConfig = ACTIVE) -> None:
     print(f"[{datetime.now().isoformat()}] mode={live.mode} profile={live.profile} "
           f"scheme={live.sizing_scheme or 'flat'} equity=${live.account_equity:,.0f} "
           f"baseline_contracts={config.baseline_contracts} "
+          f"wings=put{config.put_wing_width:.0f}/call{config.call_wing_width:.0f} "
           f"gates=trend<={config.candidate_max_adverse_trend}/skew<={config.candidate_max_adverse_skew} "
           f"stop={config.stop_multiple}x/{config.stop_confirmation_count}bar "
           f"side_cooldown={config.same_side_stop_cooldown_minutes}min "
@@ -1130,187 +1142,234 @@ def run(live: LiveConfig = ACTIVE) -> None:
                       "vix_sizing_multiplier": vix_sizing_mult})
 
     ib = None
-    provider: SignalProvider
-    connect_ib = (live.mode in ("paper", "live")) or (dry and live.dry_with_ib)
-    if not connect_ib:
-        if dry:
-            if needs_signals:
-                raise SystemExit(
-                    "Dry mode without IB cannot run gated profile — set dry_with_ib=True "
-                    "or use profile 3d_flatten_3_5 (gates off)."
-                )
-            print("Dry mode without IB: logging intended trades with neutral signals.")
-        provider = _NeutralProvider()
-    else:
-        if not HAS_IB:
-            raise SystemExit("ib_insync required for IB connection: pip install ib_insync")
-        if needs_signals and baselines_core is None:
-            raise SystemExit("gated profile requires baselines — run scripts/refresh_live_baselines.py")
-        ib = IB()
-        ib_log = setup_ib_logging(today)
-        port = live.port or (7497 if live.mode == "paper" else 7496)
-        ib.connect(live.host, port, clientId=live.client_id)
-        register_ib_error_handler(ib, today)
-        print(f"IB connected (port {port}, market_data_type={live.market_data_type} requested)")
-        print(f"IB messages -> {ib_log} and data/live/{today}/ib_errors.jsonl")
-        print(f"Tranche diagnostics -> data/live/{today}/tranches.jsonl")
-        if baselines_core is not None:
-            print(f"Signal baselines -> {live.baselines_path}")
-        provider = IBSignalProvider(ib, live, config, baselines_core=baselines_core)
-        provider.start()
-
+    provider: Optional[SignalProvider] = None
     open_spreads: List[OpenSpread] = []
     gross_credit_sold = 0.0
-    daily_credit_cap = config.account_equity * config.daily_credit_cap_pct
-    # Two-threshold governor: halt NEW entries at daily_loss_limit_pct, force-
-    # flatten OPEN positions at the (deeper) flatten_loss_limit_pct when set.
-    halt_limit = -config.account_equity * config.daily_loss_limit_pct
-    flatten_pct = config.flatten_loss_limit_pct or config.daily_loss_limit_pct
-    flatten_limit = -config.account_equity * flatten_pct
-    portfolio_margin_used = 0.0
-    sleeve_margin_used = {"core": 0.0, "exploratory": 0.0, "condor": 0.0,
-                          "one_dte": 0.0, "trend_debit": 0.0, "long_put_hedge": 0.0}
-    entries_halted = False
-    flattened = False
-    traded_tranches: set = set()
     pending_entry: Optional[PendingEntry] = None
-    side_stop_cooldown_until: Dict[str, datetime] = {}
+    flattened = False
     last_quotes: List[OptionQuote] = []
     last_marked_pnl: float = 0.0
-    ib_provider: Optional[IBSignalProvider] = None
-    if isinstance(provider, IBSignalProvider):
-        ib_provider = provider
+    connect_ib = (live.mode in ("paper", "live")) or (dry and live.dry_with_ib)
 
     try:
-        while datetime.now().time() <= config.force_flat_time:
-            now = datetime.now()
-            at_tranche = should_fire_tranche(now, config, traded_tranches)
-            quotes, signal = provider.fetch(now, at_tranche=at_tranche)
-            last_quotes = list(quotes)
+        if not connect_ib:
+            if dry:
+                if needs_signals:
+                    raise SystemExit(
+                        "Dry mode without IB cannot run gated profile — set dry_with_ib=True "
+                        "or use profile 3d_flatten_3_5 (gates off)."
+                    )
+                print("Dry mode without IB: logging intended trades with neutral signals.")
+            provider = _NeutralProvider()
+        else:
+            if not HAS_IB:
+                raise SystemExit("ib_insync required for IB connection: pip install ib_insync")
+            if needs_signals and baselines_core is None:
+                raise SystemExit("gated profile requires baselines — run scripts/refresh_live_baselines.py")
+            ib = IB()
+            ib_log = setup_ib_logging(today)
+            port = live.port or (7497 if live.mode == "paper" else 7496)
+            ib.connect(live.host, port, clientId=live.client_id)
+            register_ib_error_handler(ib, today)
+            print(f"IB connected (port {port}, market_data_type={live.market_data_type} requested)")
+            print(f"IB messages -> {ib_log} and data/live/{today}/ib_errors.jsonl")
+            print(f"Tranche diagnostics -> data/live/{today}/tranches.jsonl")
+            if baselines_core is not None:
+                print(f"Signal baselines -> {live.baselines_path}")
+            provider = IBSignalProvider(ib, live, config, baselines_core=baselines_core)
+            provider.start()
 
-            if pending_entry is not None and ib is not None and not dry:
-                active_pending = pending_entry
-                pending_entry, resolution = poll_pending_entry(
-                    ib, active_pending, live, today, now, log_event=log_event,
-                )
-                if resolution is not None:
-                    log_event(today, resolution)
-                    _, credit_added, _, portfolio_margin_used = apply_pending_resolution(
-                        resolution,
-                        active_pending,
-                        open_spreads=open_spreads,
+        # Rebuild open book from today's fills and verify against IB positions.
+        recovered = recover_session_book(
+            today=today,
+            stop_multiple=config.stop_multiple,
+            OpenSpread=OpenSpread,
+            CandidateRecord=CandidateRecord,
+            ib=ib if (ib is not None and not dry) else None,
+            fail_on_unmatched=True,
+        )
+        open_spreads = list(recovered.spreads)
+        gross_credit_sold = float(recovered.gross_credit_sold)
+        for warn in recovered.warnings:
+            print(f"[{datetime.now().isoformat()}] RECOVERY WARN: {warn}")
+        if open_spreads or recovered.source_entries:
+            print(
+                f"[{datetime.now().isoformat()}] recovered "
+                f"{len(open_spreads)} open spread(s) from {recovered.source_entries} fill event(s); "
+                f"gross_credit=${gross_credit_sold:,.0f}; ib_matched_legs={recovered.ib_matched_legs}"
+            )
+            log_event(today, {
+                "event": "session_recovered",
+                "open_spreads": len(open_spreads),
+                "source_entries": recovered.source_entries,
+                "gross_credit_sold": round(gross_credit_sold, 2),
+                "ib_matched_legs": recovered.ib_matched_legs,
+                "warnings": recovered.warnings,
+            })
+
+        daily_credit_cap = config.account_equity * config.daily_credit_cap_pct
+        # Two-threshold governor: halt NEW entries at daily_loss_limit_pct, force-
+        # flatten OPEN positions at the (deeper) flatten_loss_limit_pct when set.
+        halt_limit = -config.account_equity * config.daily_loss_limit_pct
+        flatten_pct = config.flatten_loss_limit_pct or config.daily_loss_limit_pct
+        flatten_limit = -config.account_equity * flatten_pct
+        portfolio_margin_used = 0.0
+        sleeve_margin_used = {"core": 0.0, "exploratory": 0.0, "condor": 0.0,
+                              "one_dte": 0.0, "trend_debit": 0.0, "long_put_hedge": 0.0}
+        # Recreate sleeve/portfolio margin used from recovered open risk.
+        for spread in open_spreads:
+            mpc = candidate_margin_per_contract(spread.candidate, config) * spread.contracts
+            sleeve = spread.candidate.sleeve or "core"
+            sleeve_margin_used[sleeve] = sleeve_margin_used.get(sleeve, 0.0) + mpc
+            portfolio_margin_used += mpc
+        entries_halted = False
+        flattened = False
+        traded_tranches: set = set()
+        pending_entry = None
+        side_stop_cooldown_until: Dict[str, datetime] = {}
+        last_quotes = []
+        last_marked_pnl = 0.0
+        ib_provider: Optional[IBSignalProvider] = None
+        if isinstance(provider, IBSignalProvider):
+            ib_provider = provider
+
+        try:
+            while datetime.now().time() <= config.force_flat_time:
+                now = datetime.now()
+                at_tranche = should_fire_tranche(now, config, traded_tranches)
+                quotes, signal = provider.fetch(now, at_tranche=at_tranche)
+                last_quotes = list(quotes)
+
+                if pending_entry is not None and ib is not None and not dry:
+                    active_pending = pending_entry
+                    pending_entry, resolution = poll_pending_entry(
+                        ib, active_pending, live, today, now, log_event=log_event,
+                    )
+                    if resolution is not None:
+                        log_event(today, resolution)
+                        _, credit_added, _, portfolio_margin_used = apply_pending_resolution(
+                            resolution,
+                            active_pending,
+                            open_spreads=open_spreads,
+                            config=config,
+                            sleeve_margin_used=sleeve_margin_used,
+                            portfolio_margin_used=portfolio_margin_used,
+                        )
+                        gross_credit_sold += credit_added
+
+                newly_stopped = manage_stops(ib, open_spreads, quotes, config, today, dry, live)
+                if newly_stopped:
+                    apply_side_stop_cooldowns(
+                        newly_stopped,
                         config=config,
+                        now=now,
+                        side_stop_cooldown_until=side_stop_cooldown_until,
+                    )
+                    for spread in newly_stopped:
+                        log_event(today, {
+                            "event": "side_stop_cooldown_start",
+                            "side": spread.candidate.side,
+                            "minutes": config.same_side_stop_cooldown_minutes,
+                            "until": (
+                                side_stop_cooldown_until[spread.candidate.side].isoformat()
+                                if spread.candidate.side in side_stop_cooldown_until
+                                else None
+                            ),
+                        })
+
+                marked = _mark_book(open_spreads, quotes, config)
+                last_marked_pnl = marked
+                if not entries_halted and marked <= halt_limit:
+                    entries_halted = True
+                    print(f"[{now.isoformat()}] HALT new entries (marked ${marked:,.0f} <= ${halt_limit:,.0f}).")
+                    log_event(today, {"event": "halt_entries", "marked_pnl": round(marked, 2)})
+                if config.flatten_on_daily_loss and not flattened and marked <= flatten_limit:
+                    flattened = True
+                    entries_halted = True
+                    print(f"[{now.isoformat()}] FLATTEN (marked ${marked:,.0f} <= ${flatten_limit:,.0f}).")
+                    cancel_pending_entry(ib, pending_entry, today, reason="flatten", dry=dry)
+                    pending_entry = None
+                    flatten_all(ib, open_spreads, today, dry)
+                    log_event(today, {"event": "flatten", "marked_pnl": round(marked, 2)})
+
+                if at_tranche:
+                    tranche_key = (now.hour, now.minute)
+                    traded_tranches.add(tranche_key)
+                    executed, credit_added, _, portfolio_margin_used, new_pending, _ = _process_tranche(
+                        now=now,
+                        today=today,
+                        quotes=quotes,
+                        signal=signal,
+                        config=config,
+                        sizing_schedule=sizing_schedule,
+                        live=live,
+                        ib=ib,
+                        dry=dry,
+                        entries_halted=entries_halted,
+                        open_spreads=open_spreads,
+                        gross_credit_sold=gross_credit_sold,
+                        daily_credit_cap=daily_credit_cap,
                         sleeve_margin_used=sleeve_margin_used,
                         portfolio_margin_used=portfolio_margin_used,
+                        provider=ib_provider,
+                        pending_entry=pending_entry,
+                        side_stop_cooldown_until=side_stop_cooldown_until,
+                        vix_sizing_multiplier=vix_sizing_mult,
                     )
                     gross_credit_sold += credit_added
+                    pending_entry = new_pending
 
-            newly_stopped = manage_stops(ib, open_spreads, quotes, config, today, dry, live)
-            if newly_stopped:
-                apply_side_stop_cooldowns(
-                    newly_stopped,
-                    config=config,
-                    now=now,
-                    side_stop_cooldown_until=side_stop_cooldown_until,
-                )
-                for spread in newly_stopped:
-                    log_event(today, {
-                        "event": "side_stop_cooldown_start",
-                        "side": spread.candidate.side,
-                        "minutes": config.same_side_stop_cooldown_minutes,
-                        "until": (
-                            side_stop_cooldown_until[spread.candidate.side].isoformat()
-                            if spread.candidate.side in side_stop_cooldown_until
-                            else None
-                        ),
-                    })
-
-            marked = _mark_book(open_spreads, quotes, config)
-            last_marked_pnl = marked
-            if not entries_halted and marked <= halt_limit:
-                entries_halted = True
-                print(f"[{now.isoformat()}] HALT new entries (marked ${marked:,.0f} <= ${halt_limit:,.0f}).")
-                log_event(today, {"event": "halt_entries", "marked_pnl": round(marked, 2)})
-            if config.flatten_on_daily_loss and not flattened and marked <= flatten_limit:
-                flattened = True
-                entries_halted = True
-                print(f"[{now.isoformat()}] FLATTEN (marked ${marked:,.0f} <= ${flatten_limit:,.0f}).")
-                cancel_pending_entry(ib, pending_entry, today, reason="flatten", dry=dry)
-                pending_entry = None
-                flatten_all(ib, open_spreads, today, dry)
-                log_event(today, {"event": "flatten", "marked_pnl": round(marked, 2)})
-
-            if at_tranche:
-                tranche_key = (now.hour, now.minute)
-                traded_tranches.add(tranche_key)
-                executed, credit_added, _, portfolio_margin_used, new_pending, _ = _process_tranche(
-                    now=now,
-                    today=today,
-                    quotes=quotes,
-                    signal=signal,
-                    config=config,
-                    sizing_schedule=sizing_schedule,
+                sleep_for = adaptive_sleep_seconds(
                     live=live,
-                    ib=ib,
-                    dry=dry,
-                    entries_halted=entries_halted,
+                    now=now,
                     open_spreads=open_spreads,
-                    gross_credit_sold=gross_credit_sold,
-                    daily_credit_cap=daily_credit_cap,
-                    sleeve_margin_used=sleeve_margin_used,
-                    portfolio_margin_used=portfolio_margin_used,
-                    provider=ib_provider,
-                    pending_entry=pending_entry,
-                    side_stop_cooldown_until=side_stop_cooldown_until,
-                    vix_sizing_multiplier=vix_sizing_mult,
+                    quotes=quotes,
+                    config=config,
                 )
-                gross_credit_sold += credit_added
-                pending_entry = new_pending
+                if pending_entry is not None:
+                    sleep_for = min(sleep_for, live.entry_poll_seconds)
+                if sleep_for > 0:
+                    self_sleep = sleep_for
+                    if HAS_IB and ib is not None:
+                        ib.sleep(self_sleep)
+                    else:
+                        _time.sleep(self_sleep)
+        except Exception as exc:
+            print(f"[{datetime.now().isoformat()}] ERROR: {exc!r} -- flattening and exiting.")
+            log_event(today, {"event": "error_flatten", "error": repr(exc)})
+            cancel_pending_entry(ib, pending_entry, today, reason="error", dry=dry)
+            if not dry:
+                flatten_all(ib, [s for s in open_spreads if not s.closed], today, dry)
+            raise
 
-            sleep_for = adaptive_sleep_seconds(
-                live=live,
-                now=now,
-                open_spreads=open_spreads,
-                quotes=quotes,
-                config=config,
-            )
-            if pending_entry is not None:
-                sleep_for = min(sleep_for, live.entry_poll_seconds)
-            if sleep_for > 0:
-                self_sleep = sleep_for
-                if HAS_IB and ib is not None:
-                    ib.sleep(self_sleep)
-                else:
-                    _time.sleep(self_sleep)
-    except Exception as exc:
-        print(f"[{datetime.now().isoformat()}] ERROR: {exc!r} -- flattening and exiting.")
-        log_event(today, {"event": "error_flatten", "error": repr(exc)})
-        cancel_pending_entry(ib, pending_entry, today, reason="error", dry=dry)
-        if not dry:
-            flatten_all(ib, [s for s in open_spreads if not s.closed], today, dry)
-        raise
+        # End of day: SPXW 0DTE is cash-settled on the close, so open defined-risk
+        # spreads are left to settle (matches the backtest's settle-at-close). Only
+        # the governor or an error flattens early.
+        if last_quotes:
+            last_marked_pnl = _mark_book(open_spreads, last_quotes, config)
+        log_event(today, {
+            "event": "session_end",
+            "spreads": len(open_spreads),
+            "stopped": sum(1 for s in open_spreads if s.stopped),
+            "flattened": flattened,
+            "gross_credit_sold": round(gross_credit_sold, 2),
+            "marked_pnl": round(last_marked_pnl, 2),
+        })
+        print(f"[{datetime.now().isoformat()}] session end. spreads={len(open_spreads)} "
+              f"stopped={sum(1 for s in open_spreads if s.stopped)} "
+              f"gross_credit=${gross_credit_sold:,.0f} marked_pnl=${last_marked_pnl:,.0f}")
     finally:
         if isinstance(provider, IBSignalProvider):
-            provider.shutdown()
+            try:
+                provider.shutdown()
+            except Exception:
+                pass
         if ib is not None:
-            ib.disconnect()
-
-    # End of day: SPXW 0DTE is cash-settled on the close, so open defined-risk
-    # spreads are left to settle (matches the backtest's settle-at-close). Only
-    # the governor or an error flattens early.
-    if last_quotes:
-        last_marked_pnl = _mark_book(open_spreads, last_quotes, config)
-    log_event(today, {
-        "event": "session_end",
-        "spreads": len(open_spreads),
-        "stopped": sum(1 for s in open_spreads if s.stopped),
-        "flattened": flattened,
-        "gross_credit_sold": round(gross_credit_sold, 2),
-        "marked_pnl": round(last_marked_pnl, 2),
-    })
-    print(f"[{datetime.now().isoformat()}] session end. spreads={len(open_spreads)} "
-          f"stopped={sum(1 for s in open_spreads if s.stopped)} "
-          f"gross_credit=${gross_credit_sold:,.0f} marked_pnl=${last_marked_pnl:,.0f}")
+            try:
+                ib.disconnect()
+            except Exception:
+                pass
+        release_executor_lock(lock_path)
 
 
 def _size_with_caps(cand: CandidateRecord, config: StrategyConfig, gross_credit_sold: float,

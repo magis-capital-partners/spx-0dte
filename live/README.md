@@ -2,8 +2,9 @@
 
 Production SPX 0DTE executor with **streaming quotes**, **adaptive polling**, and
 **limit-then-MKT stops**. Strategy logic matches `p3_poststop_cooldown_120` in
-`simulator/profiles.py` (skew gate **0.65**, flatten **−3.25%**, trend/skew gates,
-**120-minute same-side stop cooldown** after any stopped spread).
+`simulator/profiles.py` (skew gate **0.65**, flatten **−3.25%**, put wing **150** /
+call wing **75**, trend/skew gates, **120-minute same-side stop cooldown** after
+any stopped spread).
 
 ## Low-latency architecture
 
@@ -96,6 +97,16 @@ Session output: `data/live/<YYYY-MM-DD>/` (`config.json`, `fills.jsonl`, `tranch
 4. **Dashboard:** `.\scripts\sync_dashboard.ps1` embeds live fills (`--include-live`). Daily drill-down
    shows paper fills next to backtest tranches plus reconcile DIFF chips.
 
+### Restart safety (required before live)
+
+The executor now:
+
+1. **Single-instance lock** — `data/live/<date>/executor.lock` (PID). A second process exits unless the prior PID is dead.
+2. **Book recovery** — rebuilds `open_spreads` from today's `fills.jsonl` (entries minus stops/flatten) and resumes stop/flatten management.
+3. **Fail loud** — if IB shows SPXW option risk that does not match the recovered book, startup exits with the residual legs printed. Flatten/reconcile in TWS, then restart.
+
+Also cancels orphan working SPXW/BAG orders from a crashed prior run. Do **not** start a second executor mid-session; if you must restart, use one process only and let recovery reload the book.
+
 Manual reconcile (dual-scale: paper equity + normalized $13M):
 
 ```powershell
@@ -113,7 +124,7 @@ python live/ib_executor.py
 
 | Field | Default | Notes |
 |---|---|---|
-| `profile` | `p3_poststop_cooldown_120` | Skew 0.65 + flatten 3.25% + 120min same-side cooldown |
+| `profile` | `p3_poststop_cooldown_120` | Skew 0.65 + flatten 3.25% + put wing 150 + 120min same-side cooldown |
 | `use_streaming_quotes` | `True` | Set `False` to revert to per-poll snapshots |
 | `use_adaptive_polling` | `True` | Set `False` to use fixed `poll_seconds` |
 | `poll_seconds_active` | `1.5` | Open positions |
@@ -138,6 +149,7 @@ python live/test_risk_gates.py
 python live/test_loop_timing.py
 python live/test_entry_execution.py
 python live/test_ib_order_hygiene.py
+python live/test_session_recovery.py
 python simulator/test_profile_regression.py
 python simulator/test_live_signal_parity.py
 python simulator/reconcile_live.py --date YYYY-MM-DD

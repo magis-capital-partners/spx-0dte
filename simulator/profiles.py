@@ -19,8 +19,8 @@ from mbh_simulator import StrategyConfig
 from stop_calibration_runner import wide_wings
 from unconditional_baseline import build_unconditional_config
 
-# Production deployment target (dashboard #1, improvement-plan winner).
-PRODUCTION_PROFILE = "p3_trend1_skew075"
+# Production deployment target (Wave 2 Calmar winner, July 2026).
+PRODUCTION_PROFILE = "p3_poststop_cooldown_120"
 PRODUCTION_SIZING_SCHEME = "linear_decay_downsize"
 PRODUCTION_BASELINE_CONTRACTS = 31
 PRODUCTION_ACCOUNT_EQUITY = 13_000_000.0
@@ -29,10 +29,13 @@ VIX_SKIP_OPEN_ABOVE = 35.0
 VIX_ELEVATED_MIN = 25.0
 VIX_ELEVATED_MAX = 35.0
 VIX_ELEVATED_SCALE = 1.25
-# Overnight Calmar winner (combo_skew065_flat325, July 2026): tighter skew gate + flatten.
+# Overnight Calmar Wave 1 winner (combo_skew065_flat325, July 2026): tighter skew + flatten.
 PRODUCTION_SKEW_GATE = 0.65
 PRODUCTION_FLATTEN_LOSS_LIMIT_PCT = 0.0325
 PRODUCTION_DAILY_LOSS_LIMIT_PCT = 0.0225
+# Overnight Calmar Wave 2 winner (put_wing_150, July 2026): tighter put wing vs 200pt substrate.
+PRODUCTION_PUT_WING_WIDTH = 150.0
+PRODUCTION_CALL_WING_WIDTH = 75.0
 # Peak morning elevated tranche: round(baseline × max_tod_mult × vix_elevated_scale).
 PRODUCTION_MAX_CONTRACTS_PER_TRANCHE = 48  # round(31 × 1.25 × 1.25)
 LIVE_PILOT_MAX_CONTRACTS_PER_TRANCHE = 3  # round(2 × 1.25 × 1.25)
@@ -98,8 +101,9 @@ def build_p3_poststop_cooldown_config(
     After a stopped trade on puts or calls, block new entries on that side only
     for ``cooldown_minutes`` (default 120). Opposite side and risk governors unchanged.
 
-    Skew gate 0.65 and flatten at −3.25% (entries halt −2.25%) are the overnight
-    Calmar suite winner ``combo_skew065_flat325`` (July 2026).
+    Wave 1 (July 2026): skew 0.65 + flatten −3.25% (``combo_skew065_flat325``).
+    Wave 2 (July 2026): put wing 150pt (``put_wing_150``) — +2.2pp CAGR / Calmar 2.31
+    on eligible-calendar OOS vs put-200 substrate.
     """
     return replace(
         build_p3_trend_skew_config(account_equity, baseline_contracts),
@@ -107,14 +111,34 @@ def build_p3_poststop_cooldown_config(
         candidate_max_adverse_skew=PRODUCTION_SKEW_GATE,
         daily_loss_limit_pct=PRODUCTION_DAILY_LOSS_LIMIT_PCT,
         flatten_loss_limit_pct=PRODUCTION_FLATTEN_LOSS_LIMIT_PCT,
+        put_wing_width=PRODUCTION_PUT_WING_WIDTH,
+        call_wing_width=PRODUCTION_CALL_WING_WIDTH,
+    )
+
+
+def build_p3_trend_bc_085_config(
+    account_equity: float = PRODUCTION_ACCOUNT_EQUITY,
+    baseline_contracts: int = PRODUCTION_BASELINE_CONTRACTS,
+    cooldown_minutes: int = 120,
+) -> StrategyConfig:
+    """Production optimal + tighter bear-call trend gate (Wave 2 runner-up).
+
+    Same as ``p3_poststop_cooldown_120`` but skips bear calls when trend_score > 0.85
+    (production uses 1.0). Improves max DD and worst day with ~flat CAGR in Wave 2 suite.
+    """
+    return replace(
+        build_p3_poststop_cooldown_config(account_equity, baseline_contracts, cooldown_minutes),
+        candidate_max_adverse_trend=0.85,
     )
 
 
 # Named profiles: name -> builder(account_equity, baseline_contracts) -> config.
 PROFILE_BUILDERS: Dict[str, Callable[..., StrategyConfig]] = {
     "3d_flatten_3_5": build_3d_flatten_config,
-    PRODUCTION_PROFILE: build_p3_trend_skew_config,
+    PRODUCTION_PROFILE: build_p3_poststop_cooldown_config,
+    "p3_trend1_skew075": build_p3_trend_skew_config,
     "p3_poststop_cooldown_120": build_p3_poststop_cooldown_config,
+    "p3_trend_bc_085": build_p3_trend_bc_085_config,
 }
 
 

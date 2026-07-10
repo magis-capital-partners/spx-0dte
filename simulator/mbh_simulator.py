@@ -222,6 +222,9 @@ class StrategyConfig:
     final_hour_cutoff: time = time(15, 0)
     final_hour_min_distance_pct: float = 0.006
     same_side_stop_late_reentry_cutoff: time = time(14, 0)
+    # When True, block same-side re-entry after a stop once past late_reentry_cutoff
+    # (independent of use_time_of_day_controls score gates).
+    use_late_same_side_reentry: bool = False
     use_event_controls: bool = False
     event_bucket: str = "unlabeled"
     event_shock_buckets: str = "tariff_shock,tariff_reversal"
@@ -305,6 +308,17 @@ class StrategyConfig:
     stop_cooldown_minutes: int = 30
     same_side_stop_cooldown_minutes: int = 120
     max_stops_per_side: int = 2
+    # Day-wide stop circuit breaker: after this many stops (all sides), block new entries.
+    max_stops_per_day: int = 999
+    # Scale bear_call contracts relative to bull_put (1.0 = no asymmetry).
+    bear_call_size_scale: float = 1.0
+    # Path-dependent size cut before flatten: when marked PnL <= -equity * pct, multiply size.
+    intraday_size_cut_pct: float = 0.0
+    intraday_size_cut_scale: float = 0.5
+    # VIX-conditional tighter flatten/halt (0 disables). Uses first available session VIX.
+    vix_tight_flatten_above: float = 0.0
+    vix_tight_flatten_loss_pct: float = 0.030
+    vix_tight_daily_loss_pct: float = 0.020
     use_intraday_memory_gate: bool = True
     memory_term_ratio_skip_threshold: float = 1.50
     memory_skew_skip_threshold: float = 99.0
@@ -982,6 +996,12 @@ def _entry_control_block_reason(
             and side_stop_counts.get(candidate.side, 0) > 0
         ):
             return "late_same_side_reentry_after_stop"
+    elif (
+        config.use_late_same_side_reentry
+        and current_time >= config.same_side_stop_late_reentry_cutoff
+        and side_stop_counts.get(candidate.side, 0) > 0
+    ):
+        return "late_same_side_reentry_after_stop"
 
     if config.use_event_controls:
         event_bucket = config.event_bucket or "unlabeled"
@@ -1551,6 +1571,8 @@ def select_candidate_entries(
         if record.side in used_sides:
             continue
         contracts = _candidate_contracts(base_contracts, record.score, config)
+        if record.side == "bear_call" and config.bear_call_size_scale != 1.0:
+            contracts = max(0, round(contracts * config.bear_call_size_scale))
         if contracts <= 0:
             continue
         record.status = "selected"
@@ -1580,6 +1602,8 @@ def select_two_tier_candidate_entries(
         if record.side in used_core_sides:
             continue
         contracts = _candidate_contracts(base_contracts, record.score, config)
+        if record.side == "bear_call" and config.bear_call_size_scale != 1.0:
+            contracts = max(0, round(contracts * config.bear_call_size_scale))
         if contracts <= 0:
             continue
         record.status = "selected"
@@ -1606,6 +1630,8 @@ def select_two_tier_candidate_entries(
             record.reason = block_reason
             continue
         contracts = _exploratory_contracts(base_contracts, config)
+        if record.side == "bear_call" and config.bear_call_size_scale != 1.0:
+            contracts = max(0, round(contracts * config.bear_call_size_scale))
         if contracts <= 0:
             continue
         record.status = "selected"
@@ -1726,6 +1752,8 @@ def open_trade(
     short_sell = short_quote.bid
     long_buy = long_quote.ask
     credit = short_sell - long_buy
+    if not all(math.isfinite(x) for x in (short_sell, long_buy, credit)):
+        return None
     is_debit_candidate = candidate is not None and candidate.sleeve in {"trend_debit", "long_put_hedge"}
     if credit <= 0 and not is_debit_candidate:
         return None
@@ -1969,6 +1997,8 @@ def entry_risk_block_reason(
         return "side_stop_cooldown"
     if side_stop_counts.get(candidate.side, 0) >= config.max_stops_per_side:
         return "side_stop_limit"
+    if config.max_stops_per_day < 999 and sum(side_stop_counts.values()) >= config.max_stops_per_day:
+        return "day_stop_limit"
     entry_control_reason = _entry_control_block_reason(candidate, timestamp, config, side_stop_counts)
     if entry_control_reason:
         return entry_control_reason
@@ -2156,6 +2186,7 @@ def simulate_day(
         if config.flatten_loss_limit_pct > 0
         else daily_loss_limit
     )
+    vix_tight_applied = False
     sleeve_margin_used: Dict[str, float] = {
         "core": 0.0,
         "exploratory": 0.0,
@@ -2193,6 +2224,20 @@ def simulate_day(
             messages.append(f"Flattened {len(trades)} open trades at {timestamp.isoformat()} on daily-loss governor")
 
         signal = signals_by_ts.get(timestamp)
+        if (
+            not vix_tight_applied
+            and config.vix_tight_flatten_above > 0
+            and signal is not None
+            and signal.vix is not None
+            and signal.vix >= config.vix_tight_flatten_above
+        ):
+            daily_loss_limit = -config.account_equity * config.vix_tight_daily_loss_pct
+            flatten_loss_limit = -config.account_equity * config.vix_tight_flatten_loss_pct
+            vix_tight_applied = True
+            messages.append(
+                f"VIX-tight flatten/halt armed at {timestamp.isoformat()} "
+                f"(vix={signal.vix:.2f} >= {config.vix_tight_flatten_above})"
+            )
         update_intraday_memory(signal, config, intraday_memory_reasons)
 
         if not is_entry_time(timestamp, config):
@@ -2203,6 +2248,11 @@ def simulate_day(
                 continue
             if config.use_candidate_engine and signal is not None:
                 base_contracts = policy.contracts(signal, config)
+                if (
+                    config.intraday_size_cut_pct > 0
+                    and marked_pnl <= -config.account_equity * config.intraday_size_cut_pct
+                ):
+                    base_contracts = max(0, round(base_contracts * config.intraday_size_cut_scale))
                 if base_contracts <= 0:
                     continue
                 selected_candidates, records = select_candidate_entries(snapshot, signal, base_contracts, config)
@@ -2318,6 +2368,12 @@ def simulate_day(
             continue
 
         base_contracts = policy.contracts(signal, config) if signal is not None else 0
+        if (
+            signal is not None
+            and config.intraday_size_cut_pct > 0
+            and marked_pnl <= -config.account_equity * config.intraday_size_cut_pct
+        ):
+            base_contracts = max(0, round(base_contracts * config.intraday_size_cut_scale))
         if signal is None:
             tranche_summaries.append(
                 _summarize_tranche_from_records(
