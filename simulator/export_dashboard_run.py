@@ -61,7 +61,16 @@ PRESETS = {
         "kind": "historical_3d",
         "scheme": "linear_decay_downsize",
         "profile": "p3_poststop_cooldown_120",
-        "label": "Production skew 0.65 + flatten 3.25% + 120min cooldown + VIX",
+        "label": "Production optimal — put wing 150 (Wave 2 Calmar)",
+        "use_vix_elevated_policy": True,
+        "vix_max_contracts": PRODUCTION_MAX_CONTRACTS_PER_TRANCHE,
+        "vix_elevated_scale": VIX_ELEVATED_SCALE,
+    },
+    "p3_trend_bc_085": {
+        "kind": "historical_3d",
+        "scheme": "linear_decay_downsize",
+        "profile": "p3_trend_bc_085",
+        "label": "Trend BC 0.85 gate (Wave 2 risk-shape)",
         "use_vix_elevated_policy": True,
         "vix_max_contracts": PRODUCTION_MAX_CONTRACTS_PER_TRANCHE,
         "vix_elevated_scale": VIX_ELEVATED_SCALE,
@@ -162,6 +171,7 @@ def export_historical_3d_variant(
     end_date: str = "",
     rules_file: Path = DEFAULT_RULES,
     incremental: bool = False,
+    settlement_spot_overrides: dict[str, float] | None = None,
 ) -> dict:
     """Run eligible-calendar 3D backtest with optional config overrides.
 
@@ -254,11 +264,13 @@ def export_historical_3d_variant(
         train_dates = eligible_dates[index - train_count : index]
         apply_rolling_baseline(processed_dir, symbol, train_dates, test_date, signals_filename)
         day_dir = processed_dir / f"symbol={symbol}" / f"date={test_date}"
+        close_spot = (settlement_spot_overrides or {}).get(test_date)
         result = simulate_day(
             read_quotes_csv(day_dir / "normalized_option_quotes.csv"),
             read_signals_csv(day_dir / signals_filename),
             config=config,
             policy=policy,
+            close_spot=close_spot,
         )
         day = parse_date(test_date)
         era = era_for_date(day, eras)
@@ -341,7 +353,21 @@ def main() -> None:
         action="store_true",
         help="Append only new OOS days onto existing dashboard_runs CSVs (historical_3d presets).",
     )
+    parser.add_argument(
+        "--settlement-spot",
+        action="append",
+        default=[],
+        metavar="DATE=SPOT",
+        help="Override settlement SPX for a date (repeatable), e.g. 2026-07-10=7575.39",
+    )
     args = parser.parse_args()
+
+    settlement_overrides: dict[str, float] = {}
+    for item in args.settlement_spot:
+        if "=" not in item:
+            raise SystemExit(f"Invalid --settlement-spot {item!r}; use DATE=SPOT")
+        d, _, spot_s = item.partition("=")
+        settlement_overrides[d.strip()] = float(spot_s.strip())
 
     root = Path(__file__).resolve().parents[1]
     preset = args.preset
@@ -374,6 +400,7 @@ def main() -> None:
             args.train_count,
             end_date=args.end_date,
             incremental=args.incremental,
+            settlement_spot_overrides=settlement_overrides or None,
         )
     else:
         vid = spec["variant_id"]
