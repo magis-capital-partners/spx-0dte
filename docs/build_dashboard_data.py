@@ -609,6 +609,83 @@ def build_live(live_dir: Path, account_equity: float) -> dict:
     return {"days": days}
 
 
+def _compact_market_factors(report: dict, preset_id: str, equity: float) -> dict:
+    """Dashboard-sized slice of run_full_analysis output."""
+    rolling = report.get("rolling") or {}
+    rolling_126 = (rolling.get("126") or {}) if isinstance(rolling, dict) else {}
+    return {
+        "preset": preset_id,
+        "account_equity": equity,
+        "n_days": report.get("n_days"),
+        "date_start": report.get("date_start"),
+        "date_end": report.get("date_end"),
+        "labels": report.get("labels"),
+        "headline": report.get("headline"),
+        "correlation": report.get("correlation"),
+        "single_factor": report.get("single_factor"),
+        "multi_factor": report.get("multi_factor"),
+        "partial_correlation": report.get("partial_correlation"),
+        "rolling_126": rolling_126,
+        "upside_downside": report.get("upside_downside"),
+        "capture": report.get("capture"),
+        "hedge_ratios": report.get("hedge_ratios"),
+        "tracking_vs_spx": report.get("tracking_vs_spx"),
+        "vix_regimes": report.get("vix_regimes"),
+        "era_split": report.get("era_split"),
+        "tail_comovement_spx": report.get("tail_comovement_spx"),
+        "pca": report.get("pca"),
+    }
+
+
+def build_market_factors(preset_id: str, equity: float, results_dir: Path) -> Optional[dict]:
+    """Strategy vs SPX/IXIC/RUT factor stats for the dashboard Market factors tab."""
+    summary_path = results_dir / "daily_summary.csv"
+    if not summary_path.exists():
+        return None
+    try:
+        from index_daily import (  # noqa: WPS433
+            CALENDAR_DIR,
+            close_to_close_returns,
+            csv_path_for_symbol,
+            load_index_daily,
+        )
+        from market_factor_analysis import (  # noqa: WPS433
+            build_return_panel,
+            load_daily_summary_csv,
+            run_full_analysis,
+            strategy_returns_from_daily,
+        )
+        from vix_daily import DEFAULT_VIX_CSV, load_vix_daily  # noqa: WPS433
+    except ImportError as exc:
+        print(f"  market_factors skipped ({exc})")
+        return None
+
+    rows = load_daily_summary_csv(summary_path)
+    strategy_rets = strategy_returns_from_daily(rows, equity)
+    index_rets: dict = {}
+    for symbol, key in (("^GSPC", "spx"), ("^IXIC", "ixic"), ("^RUT", "rut")):
+        path = csv_path_for_symbol(symbol, CALENDAR_DIR)
+        by_date = load_index_daily(path)
+        if not by_date:
+            print(f"  market_factors skipped (missing {path})")
+            return None
+        index_rets[key] = close_to_close_returns(by_date)
+
+    vix_map = {d: row.open for d, row in load_vix_daily(DEFAULT_VIX_CSV).items()}
+    panel = build_return_panel(strategy_rets, index_rets, vix_open_by_date=vix_map)
+    if panel.n < 30:
+        print(f"  market_factors skipped (only {panel.n} aligned days)")
+        return None
+    report = run_full_analysis(panel)
+    compact = _compact_market_factors(report, preset_id, equity)
+    h = compact.get("headline") or {}
+    print(
+        f"  market_factors {preset_id}: beta_spx={h.get('beta_spx')} "
+        f"corr_spx={h.get('corr_spx')} n={compact.get('n_days')}"
+    )
+    return compact
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Build SPX 0DTE dashboard data blob.")
     parser.add_argument("--run", action="append", default=[],
@@ -697,6 +774,19 @@ def main() -> None:
                   f"maxDD {s.get('max_drawdown_pct')}% ({len(run['daily'])} days)")
 
     primary_id = args.primary_run_id or (runs[0]["id"] if runs else None)
+    primary_run = next((r for r in runs if r["id"] == primary_id), runs[0] if runs else None)
+    market_factors = None
+    if primary_run:
+        primary_dir = (ROOT / "data" / "dashboard_runs" / primary_run["id"]).resolve()
+        if not primary_dir.exists():
+            for spec in specs:
+                id_part, rest = spec.split("=", 1)
+                if id_part == primary_run["id"]:
+                    dir_part, _, _ = rest.partition(":")
+                    primary_dir = (ROOT / dir_part).resolve() if not Path(dir_part).is_absolute() else Path(dir_part)
+                    break
+        market_factors = build_market_factors(primary_run["id"], args.account_equity, primary_dir)
+
     blob = {
         "generated_at": datetime.now().isoformat(),
         "account_equity": args.account_equity,
@@ -705,6 +795,7 @@ def main() -> None:
         "mbh_benchmark": {"monthly": parse_mbh_benchmark(Path(args.mbh_returns))},
         "live": build_live(Path(args.live_dir), args.account_equity) if args.include_live else {"days": {}},
         "live_enabled": args.include_live,
+        "market_factors": market_factors,
         "mbh_targets": {
             "cagr_pct": [30, 40],
             "win_rate_pct": 65,
