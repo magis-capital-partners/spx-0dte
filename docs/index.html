@@ -25,9 +25,13 @@
   .cards { display:grid; grid-template-columns:repeat(auto-fill,minmax(170px,1fr)); gap:12px; margin-bottom:20px; }
   .card { background:var(--panel); border:1px solid var(--line); border-radius:10px; padding:14px 16px; }
   .card .k { color:var(--muted); font-size:11px; text-transform:uppercase; letter-spacing:.04em; }
+  .card .k.greek, th.greek, .greek-label { text-transform:none; letter-spacing:0; }
+  .greek { font-family:"Cambria Math","Segoe UI Symbol","Times New Roman",serif; font-style:normal; font-weight:600; }
+  sub { font-size:0.72em; font-weight:500; opacity:0.9; }
   .card .v { font-size:22px; font-weight:650; margin-top:6px; }
   .panel { background:var(--panel); border:1px solid var(--line); border-radius:12px; padding:18px; margin-bottom:20px; }
   .panel h2 { font-size:14px; margin:0 0 14px; font-weight:600; }
+  .panel h2.greek-label { text-transform:none; }
   table { width:100%; border-collapse:collapse; font-size:13px; }
   th,td { text-align:right; padding:7px 10px; border-bottom:1px solid var(--line); white-space:nowrap; }
   th:first-child, td:first-child { text-align:left; }
@@ -539,6 +543,8 @@ const fmtNum = (n, d=4) => (n==null||isNaN(n)?"–":Number(n).toFixed(d));
 const fmtAnn = (n) => (n==null||isNaN(n)?"–":(Number(n)*100).toFixed(2)+"% ann.");
 const VIX_REGIME_LABELS = { lt15: "VIX < 15", "15_25": "15–25", "25_35": "25–35", gt35: "> 35" };
 const BENCH_LABELS = { spx: "SPX", ixic: "NASDAQ", rut: "RUT" };
+const Alpha = ({ ann, reg }) => <span className="greek">α{ann ? <sub>ann</sub> : null}{reg ? <span className="muted" style={{fontWeight:400}}> ({reg})</span> : null}</span>;
+const Beta = ({ bench, rolling }) => <span className="greek">β{bench ? <span style={{fontWeight:400}}> vs {bench}</span> : null}{rolling ? <span style={{fontWeight:400}}> (126d)</span> : null}</span>;
 
 function MarketFactors({ data }) {
   const mf = data.market_factors;
@@ -575,14 +581,18 @@ function MarketFactors({ data }) {
         <p className="lead">
           {run?.label || mf.preset} · daily % returns vs SPX / NASDAQ / RUT · {mf.n_days} aligned days ({mf.date_start} → {mf.date_end})
         </p>
+        <p className="muted" style={{marginTop:8, fontSize:13}}>
+          Single-factor model: <span className="greek">r</span><sub>strategy</sub> = <Alpha /> + <Beta /> · <span className="greek">r</span><sub>index</sub> + <span className="greek">ε</span>
+          {" "}· <Alpha ann /> = intercept (annualized) · <Beta /> = index sensitivity
+        </p>
       </div>
       <div className="cards">
-        <div className="card"><div className="k">β vs SPX</div><div className="v">{fmtNum(h.beta_spx)}</div></div>
-        <div className="card"><div className="k">β vs NASDAQ</div><div className="v">{fmtNum(h.beta_ixic)}</div></div>
-        <div className="card"><div className="k">β vs RUT</div><div className="v">{fmtNum(h.beta_rut)}</div></div>
+        <div className="card"><div className="k greek"><Beta bench="SPX" /></div><div className="v">{fmtNum(h.beta_spx)}</div></div>
+        <div className="card"><div className="k greek"><Beta bench="NASDAQ" /></div><div className="v">{fmtNum(h.beta_ixic)}</div></div>
+        <div className="card"><div className="k greek"><Beta bench="RUT" /></div><div className="v">{fmtNum(h.beta_rut)}</div></div>
         <div className="card"><div className="k">Corr vs SPX</div><div className="v">{fmtNum(h.corr_spx)}</div></div>
         <div className="card"><div className="k">R² vs SPX</div><div className="v">{fmtNum(h.r2_spx, 3)}</div></div>
-        <div className="card"><div className="k">α ann. (SPX reg)</div><div className="v">{fmtAnn(h.alpha_ann_spx)}</div></div>
+        <div className="card"><div className="k greek"><Alpha ann reg="SPX reg" /></div><div className="v">{fmtAnn(h.alpha_ann_spx)}</div></div>
         <div className="card"><div className="k">Tracking error</div><div className="v">{fmtAnn(mf.tracking_vs_spx?.tracking_error_ann)}</div></div>
         <div className="card"><div className="k">Info ratio vs SPX</div><div className="v">{fmtNum(mf.tracking_vs_spx?.information_ratio, 2)}</div></div>
       </div>
@@ -608,7 +618,7 @@ function MarketFactors({ data }) {
       <div className="panel">
         <h2>Single-factor OLS (strategy ~ index)</h2>
         <table>
-          <thead><tr><th>Index</th><th>β</th><th>SE(β)</th><th>R²</th><th>α ann.</th><th>Resid vol ann.</th><th>n</th></tr></thead>
+          <thead><tr><th>Index</th><th className="greek"><Beta /></th><th className="greek">SE(<Beta />)</th><th>R²</th><th className="greek"><Alpha ann /></th><th>Resid vol ann.</th><th>n</th></tr></thead>
           <tbody>
             {Object.entries(single).map(([k, fit])=>(
               <tr key={k}>
@@ -628,9 +638,9 @@ function MarketFactors({ data }) {
         <div className="panel">
           <h2>Multi-factor OLS (SPX + NASDAQ + RUT)</h2>
           <table>
-            <thead><tr><th>Factor</th><th>β</th><th>VIF</th></tr></thead>
+            <thead><tr><th>Factor</th><th className="greek"><Beta /></th><th>VIF</th></tr></thead>
             <tbody>
-              <tr><td>Intercept (α ann.)</td><td colSpan={2} className={cls((multi.alpha_ann||0)*100)}>{fmtAnn(multi.alpha_ann)} · R² {fmtNum(multi.r2, 3)}</td></tr>
+              <tr><td className="greek">Intercept (<Alpha ann />)</td><td colSpan={2} className={cls((multi.alpha_ann||0)*100)}>{fmtAnn(multi.alpha_ann)} · R² {fmtNum(multi.r2, 3)}</td></tr>
               {Object.entries(multi.betas||{}).map(([k,v])=>(
                 <tr key={k}><td>{BENCH_LABELS[k] || k}</td><td>{fmtNum(v)}</td><td>{fmtNum(multi.vif?.[k], 2)}</td></tr>
               ))}
@@ -642,7 +652,7 @@ function MarketFactors({ data }) {
         </div>
       )}
       <div className="panel">
-        <h2>Rolling 126-day β vs indices</h2>
+        <h2 className="greek-label">Rolling 126-day <Beta /> vs indices</h2>
         <div className="legend" style={{marginBottom:10}}>
           {betaSeries.map(s=>(
             <span key={s.name}><span className="swatch" style={{background:s.color}}></span>{s.name}</span>
@@ -652,9 +662,9 @@ function MarketFactors({ data }) {
       </div>
       {regimes.length > 0 && (
         <div className="panel">
-          <h2>VIX open regimes (β vs SPX)</h2>
+          <h2 className="greek-label">VIX open regimes (<Beta bench="SPX" />)</h2>
           <table>
-            <thead><tr><th>Regime</th><th>Days</th><th>β SPX</th><th>Corr</th><th>R²</th><th>Strat vol ann.</th></tr></thead>
+            <thead><tr><th>Regime</th><th>Days</th><th className="greek"><Beta bench="SPX" /></th><th>Corr</th><th>R²</th><th>Strat vol ann.</th></tr></thead>
             <tbody>
               {regimes.map(r=>(
                 <tr key={r.regime}>
@@ -673,7 +683,7 @@ function MarketFactors({ data }) {
       <div className="panel">
         <h2>Era split & tail behavior</h2>
         <table>
-          <thead><tr><th>Slice</th><th>Days</th><th>β SPX</th><th>α ann.</th><th>R²</th></tr></thead>
+          <thead><tr><th>Slice</th><th>Days</th><th className="greek"><Beta bench="SPX" /></th><th className="greek"><Alpha ann /></th><th>R²</th></tr></thead>
           <tbody>
             {Object.entries(era).map(([k, row])=>(
               <tr key={k}>
@@ -696,7 +706,7 @@ function MarketFactors({ data }) {
       <div className="panel">
         <h2>Up / down market & capture ratios</h2>
         <table>
-          <thead><tr><th>Index</th><th>β up days</th><th>β down days</th><th>Up capture</th><th>Down capture</th><th>Hedge ratio</th></tr></thead>
+          <thead><tr><th>Index</th><th className="greek"><Beta /> up days</th><th className="greek"><Beta /> down days</th><th>Up capture</th><th>Down capture</th><th>Hedge ratio</th></tr></thead>
           <tbody>
             {["spx","ixic","rut"].map(k=>{
               const ud = (mf.upside_downside||{})[k] || {};
