@@ -412,33 +412,35 @@ def build_p3_strategy_guide(account_equity: float, hist: Optional[dict] = None) 
 
 
 def build_p3_poststop_strategy_guide(account_equity: float, hist: Optional[dict] = None) -> dict:
-    """Plain-language strategy guide for the post-stop cooldown variant."""
+    """Plain-language strategy guide for the Wave 2 production optimal."""
     eq = f"${account_equity:,.0f}"
     return {
-        "title": "Production + 120-Minute Same-Side Stop Cooldown",
+        "title": "Production Optimal — Put Wing 150 (Wave 2 Calmar)",
         "subtitle": (
-            "Overnight Calmar winner: skew gate 0.65, flatten −3.25%, linear-decay sizing, "
-            "VIX skip >35 / 1.25× upscale 25–35, plus 120-minute same-side post-stop cooldown"
+            "Wave 2 winner: put wing 150 / call wing 75, skew 0.65, flatten −3.25%, "
+            "120min same-side cooldown, VIX skip >35 / 1.25× upscale 25–35"
         ),
         "sections": [
             {
                 "title": "What this strategy does",
                 "paragraphs": [
                     (
-                        "This run is the current live production profile: SPXW 0DTE vertical credit spreads "
-                        "in 15-minute tranches, wide wings (put 200 / call 75), 3.0× short-leg stops with "
-                        "2-bar confirmation, daily loss halt at −2.25%, flatten at −3.25%, trend/skew "
-                        "bear-call gates (skew_z > 0.65), and linear_decay_downsize contract schedule."
+                        "This is the current live and dashboard primary profile: SPXW 0DTE vertical credit "
+                        "spreads in 15-minute tranches, asymmetric wings (put 150 / call 75), 3.0× short-leg "
+                        "stops with 2-bar confirmation, daily loss halt at −2.25%, flatten at −3.25%, "
+                        "bear-call gates (trend_score > 1.0 or skew_z > 0.65), linear_decay_downsize sizing, "
+                        "and 120-minute same-side post-stop cooldown."
                     ),
                     (
-                        "VIX regime controls (validated July 2026): skip the entire session when "
-                        "same-day VIX open > 35; on elevated days (VIX 25–35) multiply contract count "
-                        "by 1.25× on top of the time-of-day schedule (capped at 48 contracts per tranche "
-                        "at the 31-contract baseline)."
+                        "Wave 2 (July 2026) narrowed the put wing from 200 to 150 points. Bull puts collect "
+                        "more premium per unit of defined risk; on the full eligible-calendar backtest this "
+                        "raised CAGR from ~17.7% to ~19.9% and Calmar from 2.10 to 2.31 with worst day "
+                        "unchanged at −6.82%."
                     ),
                     (
-                        "same_side_stop_cooldown_minutes=120: after any stopped spread, block new entries "
-                        "on that side for 120 minutes. The opposite side can still enter."
+                        "VIX regime controls: skip the entire session when same-day VIX open > 35; on elevated "
+                        "days (VIX 25–35) multiply contract count by 1.25× on top of the time-of-day schedule "
+                        "(capped at 48 contracts per tranche at the 31-contract baseline)."
                     ),
                 ],
             },
@@ -446,52 +448,21 @@ def build_p3_poststop_strategy_guide(account_equity: float, hist: Optional[dict]
                 "title": "How the post-stop cooldown works (step by step)",
                 "bullets": [
                     "A spread stops when its short option trades at 3.0× entry credit for 2 consecutive 1-minute bars.",
-                    "On stop, the simulator records the trade's side: bear_call (call credit spread) or bull_put (put credit spread).",
+                    "On stop, the simulator records the trade's side: bear_call or bull_put.",
                     "It sets side_stop_cooldown_until[side] = stop_timestamp + 120 minutes.",
-                    "At each subsequent 15-minute entry tranche, before opening a new spread, entry_risk_block_reason() checks the cooldown clock.",
-                    "If current time < cooldown_until for that candidate's side, the entry is skipped with reason side_stop_cooldown.",
-                    "The other side is unaffected — e.g. a stopped bear call blocks new call spreads but bull puts can still sell.",
-                    "Global stop cooldown (stop_cooldown_minutes) remains 0 — we do not pause both sides.",
-                    "max_stops_per_side stays unlimited (999) — there is no hard cap on how many stops can occur in a day.",
-                    "If the same side stops again while already in cooldown, the 120-minute window resets from the latest stop.",
-                    "Existing open spreads on the cooled-down side keep running until their own stop, settlement, or the daily flatten governor.",
+                    "New entries on that side are blocked until the cooldown expires; the opposite side is unaffected.",
+                    "Global stop cooldown remains 0 — we do not pause both sides.",
                 ],
             },
             {
-                "title": "Why this helps",
-                "paragraphs": [
-                    (
-                        "Stop events often cluster on one side during a directional move. Without a cooldown, "
-                        "the strategy can re-sell into the same trend every 15 minutes — each new spread is another "
-                        "3× stop candidate. A 120-minute pause breaks that loop: after the market proves a side "
-                        "wrong, we step back and let the move develop before selling premium there again."
-                    ),
-                    (
-                        "On the full 1,500-day eligible OOS path (dashboard parity), this variant raised CAGR from "
-                        "15.2% to 16.4%, held the same worst day (−6.82%), and cut max drawdown roughly in half "
-                        "(15.9% → 10.3%). Trade count fell (~26k → ~22k) because fewer revenge entries fire after stops."
-                    ),
-                ],
-            },
-            {
-                "title": "Spread structure, gates, and sizing (unchanged vs production)",
+                "title": "Spread structure, gates, and sizing",
                 "bullets": [
-                    "Put spreads: 200-point wings. Call spreads: 75-point wings. Short-leg stop 3.0×, 2-bar confirm.",
+                    "Put spreads: 150-point wings (short strike + long strike 150 pts lower).",
+                    "Call spreads: 75-point wings. Short-leg stop 3.0×, 2-bar confirm.",
                     "Bear-call gate — trend: skip when trend_score > 1.0.",
-                    "Bear-call gate — skew: skip when skew_z > 0.65 (overnight Calmar winner vs prior 0.75).",
+                    "Bear-call gate — skew: skip when skew_z > 0.65.",
                     "Halt new entries at −2.25% daily MTM; flatten all open at −3.25%.",
-                    "Sizing (linear_decay_downsize): 9:32–10:29 → 39 ctr, 10:30–11:29 → 31, 11:30–12:29 → 26, "
-                    "12:30–13:29 → 19, 13:30–14:29 → 14, 14:30–15:30 → 8 contracts.",
-                ],
-            },
-            {
-                "title": "What the cooldown does not do",
-                "bullets": [
-                    "Does not tighten stops or change the 3.0× / 2-bar stop logic.",
-                    "Does not block the opposite side after a stop.",
-                    "Does not reduce position size — only skips entries entirely during the window.",
-                    "Does not block same-strike re-entry (block_same_strike_after_stop is off).",
-                    "Does not replace the daily loss halt or flatten governors.",
+                    "Sizing (linear_decay_downsize): 9:32–10:29 → 39 ctr (48 peak elevated), … 14:30–15:30 → 8 ctr.",
                 ],
             },
             {
@@ -501,7 +472,54 @@ def build_p3_poststop_strategy_guide(account_equity: float, hist: Optional[dict]
                     f"OOS start: {(hist or {}).get('first_oos_date', '2019-04-15')} after 40-session signal baseline warm-up.",
                     "Eligible Mon/Wed (pre-Apr 2022) then all weekdays; metrics on eligible days only.",
                     "Data: local SPXW 1-minute quotes + reconstructed signals (ThetaData history).",
-                    "Simulated fills — compare to production run in the Run comparison table on Overview.",
+                    "Compare to Trend BC 0.85 on the Overview cumulative P&L chart for a tighter risk-shape variant.",
+                ],
+            },
+        ],
+        "results": _strategy_guide_results(hist),
+    }
+
+
+def build_p3_trend_bc_085_strategy_guide(account_equity: float, hist: Optional[dict] = None) -> dict:
+    """Strategy guide for Wave 2 trend-gate comparison run."""
+    eq = f"${account_equity:,.0f}"
+    return {
+        "title": "Trend BC 0.85 Gate (Wave 2 Risk-Shape Variant)",
+        "subtitle": (
+            "Same as production optimal (put wing 150) but skips bear calls when trend_score > 0.85 "
+            "(production uses 1.0)"
+        ),
+        "sections": [
+            {
+                "title": "What differs from production optimal",
+                "paragraphs": [
+                    (
+                        "This comparison run uses the full Wave 2 production stack — put wing 150, skew 0.65, "
+                        "flatten −3.25%, 120min cooldown, VIX sizing — with one tighter entry filter: "
+                        "candidate_max_adverse_trend = 0.85 instead of 1.0."
+                    ),
+                    (
+                        "Bear calls in mildly positive trend buckets were a major source of weak days in "
+                        "attribution analysis. Tightening the trend gate skips more call-side entries on "
+                        "up-drift days. In Wave 2 backtests this improved max drawdown and worst day with "
+                        "CAGR roughly flat vs the production optimal line."
+                    ),
+                ],
+            },
+            {
+                "title": "When to compare this vs production optimal",
+                "bullets": [
+                    "Use production optimal (primary) for live deployment and headline CAGR/Calmar.",
+                    "Use this variant on the Overview chart to see the risk/return trade-off of tighter trend filtering.",
+                    "Not promoted to live — kept as a dashboard benchmark only unless a future combo test wins.",
+                ],
+            },
+            {
+                "title": "Shared structure (same as production optimal)",
+                "bullets": [
+                    "Put spreads: 150-point wings. Call spreads: 75-point wings.",
+                    "Skew gate 0.65 · flatten −3.25% · halt −2.25% · 120min same-side cooldown.",
+                    f"Starting equity: {eq} · same eligible-calendar OOS window as primary run.",
                 ],
             },
         ],
@@ -703,8 +721,8 @@ def main() -> None:
     args = parser.parse_args()
 
     default_runs = [
-        "p3_poststop_cooldown_120=data/dashboard_runs/p3_poststop_cooldown_120:Post-stop 120min cooldown",
-        "p3_trend1_skew075=data/dashboard_runs/p3_trend1_skew075:#1 Trend + Skew gates (production)",
+        "p3_poststop_cooldown_120=data/dashboard_runs/p3_poststop_cooldown_120:Production optimal — put wing 150 (Wave 2 Calmar)",
+        "p3_trend_bc_085=data/dashboard_runs/p3_trend_bc_085:Trend BC 0.85 gate (Wave 2 risk-shape)",
     ]
     specs = args.run or default_runs
 
@@ -738,13 +756,12 @@ def main() -> None:
         elif id_part == "p3_poststop_cooldown_120":
             meta = {
                 "description": (
-                    "Overnight Calmar winner (combo_skew065_flat325): skew gate 0.65, flatten −3.25%, "
-                    "same_side_stop_cooldown_minutes=120, VIX skip when open > 35, and 1.25× upscale "
-                    "when VIX is 25–35 (cap 48 contracts/tranche at 31-contract baseline)."
+                    "Wave 2 Calmar winner (put_wing_150): put wing 150 / call 75, skew 0.65, flatten −3.25%, "
+                    "same_side_stop_cooldown_minutes=120, VIX skip when open > 35, 1.25× upscale when VIX 25–35."
                 ),
                 "gates": (
-                    "trend 1.0 · skew 0.65 · flatten −3.25% · same_side_stop_cooldown_minutes=120 "
-                    "(global stop cooldown off) · skip session VIX>35"
+                    "trend 1.0 · skew 0.65 · put wing 150 · flatten −3.25% · "
+                    "same_side_stop_cooldown_minutes=120 · skip session VIX>35"
                 ),
                 "sizing_schedule": (
                     "linear_decay_downsize + VIX elevated 1.25× (25–35): "
@@ -752,6 +769,22 @@ def main() -> None:
                 ),
                 "credit_cap_pct": 50.0,
                 "strategy_guide": build_p3_poststop_strategy_guide(args.account_equity, hist),
+            }
+        elif id_part == "p3_trend_bc_085":
+            meta = {
+                "description": (
+                    "Wave 2 risk-shape variant: same as production optimal but candidate_max_adverse_trend=0.85 "
+                    "(skip bear calls on milder uptrends). Dashboard comparison only — not live."
+                ),
+                "gates": (
+                    "trend 0.85 · skew 0.65 · put wing 150 · flatten −3.25% · "
+                    "same_side_stop_cooldown_minutes=120 · skip session VIX>35"
+                ),
+                "sizing_schedule": (
+                    "linear_decay_downsize + VIX elevated 1.25× (25–35) — same as production optimal"
+                ),
+                "credit_cap_pct": 50.0,
+                "strategy_guide": build_p3_trend_bc_085_strategy_guide(args.account_equity, hist),
             }
         run = build_run(id_part, results_dir, label or id_part, args.account_equity, meta)
         if run:
