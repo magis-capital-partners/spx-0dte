@@ -1,76 +1,175 @@
-# MBH SPX 0DTE Strategy Recreation
+# SPX 0DTE — Production Strategy, Backtest & Live Execution
 
-This folder turns the diligence plan into a working reconstruction project.
+Research and production stack for SPXW same-day vertical credit spreads: historical
+backtest, performance dashboard, and Interactive Brokers paper/live executor. All
+three share one canonical config in `simulator/profiles.py`.
 
-The current version focuses on the narrower strategy described in the call and Fund 1 materials:
+## Production strategy (July 2026 — Wave 2 Calmar)
 
-- SPX/SPXW only.
-- Same-day expiration.
-- Risk-defined vertical spreads.
-- Empty book at the start of the regular session.
-- 15-minute tranche cadence.
-- 15-25 delta short legs.
-- Protective long wings.
-- Stop the short leg only.
-- Keep the long wing until end-of-day settlement.
-- No overnight option positions.
-- Position size throttled from 16 contracts to 8, 4, or 0 based on option-chain signals.
+**Profile:** `p3_poststop_cooldown_120`  
+**Sizing:** `linear_decay_downsize`  
+**Account reference:** $13M (backtest/dashboard); $500k pilot (live paper default)
 
-The simulator does not claim to know MBH's proprietary model. It exposes the signal fields MBH described so we can test candidate reconstructions against real SPX option-chain data.
+| Parameter | Value |
+|-----------|--------|
+| Put / call wings | **150 / 75** pt |
+| Bear-call gates | skip if `trend_score > 1.0` or `skew_z > 0.65` |
+| Stops | 3.0× short leg, 2-bar confirm |
+| Daily halt | −2.25% MTM (no new entries) |
+| Flatten | −3.25% MTM (close all) |
+| Post-stop cooldown | **120 min**, same side only |
+| VIX | skip session if open **> 35**; **1.25×** size if open **25–35** |
 
-## Files
+**Dashboard comparison run:** `p3_trend_bc_085` (trend gate 0.85 instead of 1.0) —
+better risk shape in backtest; **not** used for live.
 
-- `strategy_reconstruction_spec.md` - formal version of the recreated strategy rules.
-- `diligence_reconciliation.md` - what the MBH materials agree on, where they conflict, and what must be resolved.
-- `data_schema.md` - data fields needed to run a credible backtest.
-- `position_snapshot_analysis.md` - DDQ and position-snapshot analysis used to improve the reconstruction.
-- `position_snapshots.csv` - structured version of the user snapshot and DDQ snapshots.
-- `simulator\mbh_simulator.py` - first-pass SPX 0DTE vertical-spread simulator.
-- `simulator\snapshot_tools.py` - helper for summarizing strike-level position snapshots.
-- `simulator\thetadata_downloader.py` - downloads SPXW 0DTE and next-expiration first-order Greeks from ThetaData.
-- `simulator\feature_builder.py` - converts ThetaData files into simulator quotes and signal features.
-- `simulator\run_reconstruction_backtest.py` - runs the reconstruction simulator on processed data.
-- `simulator\calibration_report.py` - summarizes current backtest results and trade shape.
-- `simulator\holdings_from_trades.py` - reconstructs strike-level simulated holdings at screenshot times.
-- `simulator\calibration_grid.py` - scores parameter grids against the March 2 DDQ snapshot.
-- `simulator\historical_baselines.py` - builds no-lookahead historical signal baselines.
-- `simulator\walk_forward_grid.py` - runs walk-forward parameter grids.
-- `simulator\long_vol_overlay.py` - models long-volatility hedge overlays.
-- `simulator\combine_holdings.py` - combines spread and long-vol holdings.
-- `simulator\snapshot_scorer.py` - scores simulated holdings against MBH/DDQ snapshots.
-- `implementation_status_2026-06-20.md` - current implementation status and calibration findings.
-- `run_full_research.ps1` - orchestrates a larger ThetaData download, feature build, walk-forward grid, and long-vol overlay run.
-- `simulator\sample_quotes.csv` - small synthetic quote sample.
-- `simulator\sample_signals.csv` - synthetic signal sample.
-- `simulator\run_sample.py` - sample run using the synthetic files.
+Wave 2 campaign write-up: [`overnight_calmar_wave2_results_2026-07-10.md`](overnight_calmar_wave2_results_2026-07-10.md)
 
-## ThetaData Usage
+Eligible-calendar OOS backtest (through 2026-07-10, SPX settle override where noted):
+~**19.9% CAGR**, Calmar **~2.32**, max DD **~8.6%**.
 
-**Local cache:** SPXW history is stored under `data/raw/` and `data/processed/`.
-See **`data/README.md`** and **`data/inventory/manifest.json`**. Backtests re-use this
-cache — do not re-download unless filling explicit gaps.
+---
 
-The downloader reads the API key from `THETADATA_API_KEY`. Do not hard-code the key into scripts.
+## Quick start — what to run
 
-Example:
+### Live / paper trading (Interactive Brokers)
+
+1. **Each morning** (from repo root):
+
+   ```powershell
+   python scripts/refresh_live_baselines.py
+   python scripts/download_vix_daily.py
+   ```
+
+2. **Log into paper TWS or IB Gateway** (port **7497**). Requires SPX index + **OPRA**
+   subscriptions for real-time quotes.
+
+3. **Run the executor** (no CLI flags — config is in `live/live_config.py`):
+
+   ```powershell
+   python live/ib_executor.py
+   ```
+
+   Confirm startup log includes `wings=put150/call75` and
+   `profile=p3_poststop_cooldown_120`.
+
+4. **Session logs:** `data/live/<YYYY-MM-DD>/` (`fills.jsonl`, `tranches.jsonl`,
+   `config.json`, `ib.log`).
+
+5. **After the close:**
+
+   ```powershell
+   .\scripts\daily_data_update.ps1
+   python simulator/reconcile_live.py --date YYYY-MM-DD
+   .\scripts\sync_dashboard.ps1 -Deploy
+   ```
+
+Full IB setup, restart safety, and config table: **[`live/README.md`](live/README.md)**
+
+**Real-money live** is still off by default (`allow_live: false`, `mode: "paper"`).
+Run more paper sessions and reconcile against backtest before enabling live.
+
+### Dashboard (backtest + paper fills)
+
+- **Live site:** https://magis-capital-partners.github.io/spx-0dte/
+- **Rebuild locally:**
+
+  ```powershell
+  .\scripts\sync_dashboard.ps1
+  ```
+
+- **Rebuild + publish to GitHub Pages:**
+
+  ```powershell
+  .\scripts\sync_dashboard.ps1 -Deploy
+  ```
+
+Details: [`docs/README.md`](docs/README.md), [`DASHBOARD.md`](DASHBOARD.md)
+
+Primary backtest line on the chart: **Production optimal — put wing 150 (Wave 2)**.  
+Stat cards and strategy guide use `p3_poststop_cooldown_120`. Second line:
+**Trend BC 0.85** comparison.
+
+### Historical backtest (local cache, no API unless filling gaps)
+
+Read **`data/inventory/manifest.json`** before downloading. Do **not** re-download
+ThetaData unless you are explicitly filling missing dates.
 
 ```powershell
-$env:THETADATA_API_KEY="..."
-python .\simulator\thetadata_downloader.py --symbol SPXW --dates 2026-03-02 --interval 1m --strike-range 80
-python .\simulator\feature_builder.py --symbol SPXW --dates 2026-03-02
-python .\simulator\run_reconstruction_backtest.py --symbol SPXW --dates 2026-03-02 --account-equity 28000000
-python .\simulator\calibration_report.py
+# Export dashboard presets (incremental after first full run)
+python simulator/export_dashboard_run.py --preset p3_poststop_cooldown_120 --incremental
+python simulator/export_dashboard_run.py --preset p3_trend_bc_085 --incremental
+
+# Optional: override settlement SPX for a specific day
+python simulator/export_dashboard_run.py --preset p3_poststop_cooldown_120 --incremental --settlement-spot 2026-07-10=7575.39
+
+python docs/build_dashboard_data.py --primary-run-id p3_poststop_cooldown_120 --include-live
 ```
 
-For a larger research run:
+Daily catch-up (download → build → export → optional deploy):
 
 ```powershell
-$env:THETADATA_API_KEY="..."
-.\run_full_research.ps1 -StartDate "2025-01-02" -EndDate "2025-03-31" -TrainCount 40 -TestCount 20
+$env:THETADATA_API_KEY = "..."
+.\scripts\daily_data_update.ps1 -Deploy
 ```
 
-## Current Status
+---
 
-ThetaData is wired in and the first real-data pilot is running through the full path: raw 0DTE/next-expiration chains, processed signal features, simulator trades, daily results, and calibration report.
+## Repository layout
 
-The remaining work is not plumbing. It is model research: larger data download, parameter search, walk-forward validation, intraday snapshot matching, long-volatility hedge attribution, and execution/slippage calibration.
+| Path | Purpose |
+|------|---------|
+| [`simulator/profiles.py`](simulator/profiles.py) | **Single source of truth** for strategy configs (backtest + live) |
+| [`simulator/mbh_simulator.py`](simulator/mbh_simulator.py) | Core day simulator |
+| [`simulator/export_dashboard_run.py`](simulator/export_dashboard_run.py) | Export runs to `data/dashboard_runs/` |
+| [`live/live_config.py`](live/live_config.py) | Live/paper knobs (`ACTIVE` dataclass) |
+| [`live/ib_executor.py`](live/ib_executor.py) | IB session loop (entries, stops, flatten, VIX gate) |
+| [`live/strategy_profiles.py`](live/strategy_profiles.py) | Resolves `LiveConfig` → `StrategyConfig` |
+| [`docs/build_dashboard_data.py`](docs/build_dashboard_data.py) | Builds `docs/data/dashboard_data.json` |
+| [`docs/index.html`](docs/index.html) | Static dashboard UI |
+| [`data/processed/`](data/processed/) | Cached SPXW quotes + signals (local only) |
+| [`data/dashboard_runs/`](data/dashboard_runs/) | Exported backtest CSVs per preset |
+| [`data/live/`](data/live/) | Paper/live session JSONL logs |
+| [`scripts/overnight_calmar_variants.py`](scripts/overnight_calmar_variants.py) | Wave 2 variant registry |
+| [`scripts/run_overnight_calmar_suite.py`](scripts/run_overnight_calmar_suite.py) | Overnight Calmar batch runner |
+
+Data cache policy: [`data/README.md`](data/README.md)
+
+---
+
+## Validation
+
+```powershell
+python simulator/test_profile_regression.py
+python live/test_risk_gates.py
+python live/test_session_recovery.py
+python live/test_entry_execution.py
+python simulator/reconcile_live.py --date YYYY-MM-DD
+```
+
+---
+
+## Research history
+
+This repo began as an MBH strategy reconstruction exercise (see
+`strategy_reconstruction_spec.md`, `implementation_status_2026-06-20.md`). The
+current production path is the **3D flatten + trend/skew gates + time-of-day sizing**
+line, refined through stop calibration (June 2026), improvement-plan tests, and
+**Overnight Calmar Wave 1** (skew 0.65, flatten −3.25%) and **Wave 2** (put wing 150).
+
+Older calibration scripts (`calibration_grid.py`, `walk_forward_grid.py`, etc.) remain
+for research; day-to-day operations use the flow above.
+
+---
+
+## ThetaData
+
+API key: `THETADATA_API_KEY` (environment variable — never commit).
+
+```powershell
+$env:THETADATA_API_KEY = "..."
+python simulator/backfill_history.py --download --build --start-date 2026-07-10 --end-date 2026-07-10
+python scripts/update_data_inventory.py
+```
+
+Only download when manifest shows gaps and you intentionally want to spend credits.
