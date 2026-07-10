@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from datetime import time
-from typing import Deque, Optional
+from typing import Deque, Optional, Sequence
 
 from mbh_simulator import SignalSnapshot, StrategyConfig
 from profiles import Schedule
@@ -88,7 +88,7 @@ class DdqVixTodPolicy(TimeOfDaySizePolicy):
 
 
 class RegimeDownsizePolicy(TimeOfDaySizePolicy):
-    """Halve size when trailing 5-day stop rate exceeds threshold."""
+    """Scale size when trailing 5-day stop rate exceeds threshold."""
 
     def __init__(
         self,
@@ -96,11 +96,13 @@ class RegimeDownsizePolicy(TimeOfDaySizePolicy):
         trailing_stop: Deque[float],
         *,
         threshold: float = 0.25,
+        scale: float = 0.5,
         max_contracts: Optional[int] = 48,
     ) -> None:
         super().__init__(schedule)
         self.trailing_stop = trailing_stop
         self.threshold = threshold
+        self.scale = scale
         self.max_contracts = max_contracts
 
     def contracts(self, signal: Optional[SignalSnapshot], config: StrategyConfig) -> int:
@@ -108,7 +110,7 @@ class RegimeDownsizePolicy(TimeOfDaySizePolicy):
         if len(self.trailing_stop) >= 5:
             avg = sum(self.trailing_stop) / len(self.trailing_stop)
             if avg > self.threshold:
-                base = max(0, round(base * 0.5))
+                base = max(0, round(base * self.scale))
         return _apply_max_contracts(base, self.max_contracts)
 
 
@@ -123,5 +125,18 @@ class PriorDayLossSkipPolicy:
 
     def contracts(self, signal: Optional[SignalSnapshot], config: StrategyConfig) -> int:
         if self.prior_day_pnl <= -self.account_equity * self.loss_pct:
+            return 0
+        return self.inner.contracts(signal, config)
+
+
+class WeekdaySkipPolicy:
+    """Wrap a policy; skip entries on selected weekdays (0=Mon .. 6=Sun)."""
+
+    def __init__(self, inner, *, skip_weekdays: Sequence[int]) -> None:
+        self.inner = inner
+        self.skip_weekdays = set(skip_weekdays)
+
+    def contracts(self, signal: Optional[SignalSnapshot], config: StrategyConfig) -> int:
+        if signal is not None and signal.timestamp.weekday() in self.skip_weekdays:
             return 0
         return self.inner.contracts(signal, config)
