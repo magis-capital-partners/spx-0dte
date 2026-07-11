@@ -14,6 +14,13 @@
       "salt_b64": "vOkyqLcay67Xs5MtsCAuyQ==",
       "hash_b64": "xHdEQ4DFGUURCcvTcxGnT7RgeUS0rgbG4qjBMQiUcgI=",
       "iterations": 250000
+    },
+    {
+      "id": "drubenstein",
+      "name": "D Rubenstein",
+      "salt_b64": "Ha77sykifSl667F139czqg==",
+      "hash_b64": "zOCGq5uP0jE5MouEPu6npZy2AHLSvMOXz0VT80fxPP4=",
+      "iterations": 250000
     }
   ]
 }
