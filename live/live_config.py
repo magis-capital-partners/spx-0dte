@@ -11,7 +11,8 @@ from dataclasses import dataclass
 @dataclass
 class LiveConfig:
     # --- Strategy selection ------------------------------------------------- #
-    # Wave 2 optimal: put wing 150, skew 0.65, flatten −3.25%, 120min cooldown.
+    # Production: put wing 150, skew 0.65, flatten −3.25%, 120min cooldown,
+    # FOMC 13:30, VIX put+25, plus IC overlay (8/31 size fraction, VIX≥15, 1×/day).
     profile: str = "p3_poststop_cooldown_120"
     sizing_scheme: str = "linear_decay_downsize"
 
@@ -98,6 +99,8 @@ class LiveConfig:
     vix_elevated_min: float = 25.0
     vix_elevated_max: float = 35.0
     vix_elevated_scale: float = 1.25
+    # Production profile also carries: put wing +25 when VIX>=20, FOMC entry end 13:30.
+    # Those live on StrategyConfig from profiles.build_p3_poststop_cooldown_config.
 
 
 # Default: prefer live OPRA (type 1) with auto-fallback to delayed (type 3).

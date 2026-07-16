@@ -412,42 +412,45 @@ def build_p3_strategy_guide(account_equity: float, hist: Optional[dict] = None) 
 
 
 def build_p3_poststop_strategy_guide(account_equity: float, hist: Optional[dict] = None) -> dict:
-    """Plain-language strategy guide for the Wave 2 production optimal."""
+    """Plain-language strategy guide for the Wave 2 production optimal + IC overlay."""
     eq = f"${account_equity:,.0f}"
     return {
-        "title": "Production Optimal — Put Wing 150 (Wave 2 Calmar)",
+        "title": "Production — Put Wing 150 + Iron Condor Overlay",
         "subtitle": (
-            "Wave 2 winner: put wing 150 / call wing 75, skew 0.65, flatten −3.25%, "
-            "120min same-side cooldown, VIX skip >35 / 1.25× upscale 25–35"
+            "Vertical stack (put 150 / call 75, skew 0.65, flatten −3.25%, FOMC 13:30, VIX wing widen) "
+            "plus short IC overlay: 8 contracts @ $13M baseline, 50pt wings, VIX≥15, once/day"
         ),
         "sections": [
             {
                 "title": "What this strategy does",
                 "paragraphs": [
                     (
-                        "This is the current live and dashboard primary profile: SPXW 0DTE vertical credit "
-                        "spreads in 15-minute tranches, asymmetric wings (put 150 / call 75), 3.0× short-leg "
-                        "stops with 2-bar confirmation, daily loss halt at −2.25%, flatten at −3.25%, "
-                        "bear-call gates (trend_score > 1.0 or skew_z > 0.65), linear_decay_downsize sizing, "
-                        "and 120-minute same-side post-stop cooldown."
+                        "Primary live/dashboard profile: SPXW 0DTE vertical credit spreads in 15-minute "
+                        "tranches, asymmetric wings (put 150 / call 75), 3.0× short-leg stops with 2-bar "
+                        "confirmation, daily loss halt at −2.25%, flatten at −3.25%, bear-call gates "
+                        "(trend_score > 1.0 or skew_z > 0.65), linear_decay_downsize sizing, 120-minute "
+                        "same-side post-stop cooldown, FOMC no-new-entries after 13:30, and put wing +25 "
+                        "when VIX ≥ 20."
                     ),
                     (
-                        "Wave 2 (July 2026) narrowed the put wing from 200 to 150 points. Bull puts collect "
-                        "more premium per unit of defined risk; on the full eligible-calendar backtest this "
-                        "raised CAGR from ~17.7% to ~19.9% and Calmar from 2.10 to 2.31 with worst day "
-                        "unchanged at −6.82%."
+                        "Iron condor overlay (July 2026 selective-overlay promo): once per day at/after 10:00, "
+                        "sell a short ~0.12Δ put credit + call credit with 50-point wings when same-day VIX "
+                        "open ≥ 15. Target size is 8 contracts at the $13M / 31-lot vertical baseline "
+                        "(fraction 8/31), so any global size multiplier on baseline contracts scales the "
+                        "IC the same way as verticals. Losses are bounded by wing width − credit."
                     ),
                     (
-                        "VIX regime controls: skip the entire session when same-day VIX open > 35; on elevated "
-                        "days (VIX 25–35) multiply contract count by 1.25× on top of the time-of-day schedule "
-                        "(capped at 48 contracts per tranche at the 31-contract baseline)."
+                        "VIX regime controls for verticals: skip the entire session when same-day VIX open > 35; "
+                        "on elevated days (VIX 25–35) multiply contract count by 1.25× on top of the "
+                        "time-of-day schedule (capped at 48 contracts per tranche at the 31-contract baseline). "
+                        "IC is additionally skipped when VIX open < 15 (fee drag in low vol)."
                     ),
                 ],
             },
             {
                 "title": "How the post-stop cooldown works (step by step)",
                 "bullets": [
-                    "A spread stops when its short option trades at 3.0× entry credit for 2 consecutive 1-minute bars.",
+                    "A vertical stops when its short option trades at 3.0× entry credit for 2 consecutive 1-minute bars.",
                     "On stop, the simulator records the trade's side: bear_call or bull_put.",
                     "It sets side_stop_cooldown_until[side] = stop_timestamp + 120 minutes.",
                     "New entries on that side are blocked until the cooldown expires; the opposite side is unaffected.",
@@ -457,12 +460,12 @@ def build_p3_poststop_strategy_guide(account_equity: float, hist: Optional[dict]
             {
                 "title": "Spread structure, gates, and sizing",
                 "bullets": [
-                    "Put spreads: 150-point wings (short strike + long strike 150 pts lower).",
-                    "Call spreads: 75-point wings. Short-leg stop 3.0×, 2-bar confirm.",
-                    "Bear-call gate — trend: skip when trend_score > 1.0.",
-                    "Bear-call gate — skew: skip when skew_z > 0.65.",
+                    "Vertical puts: 150-point wings (175 when VIX≥20). Vertical calls: 75-point wings.",
+                    "IC overlay: ~0.12Δ shorts, 50-point wings, 8 contracts @ flat 31-lot baseline (scales with size).",
+                    "IC entry: first eligible tranche ≥ 10:00 when VIX open ≥ 15; max one IC structure per day.",
+                    "Bear-call gate — trend: skip when trend_score > 1.0; skew: skip when skew_z > 0.65.",
                     "Halt new entries at −2.25% daily MTM; flatten all open at −3.25%.",
-                    "Sizing (linear_decay_downsize): 9:32–10:29 → 39 ctr (48 peak elevated), … 14:30–15:30 → 8 ctr.",
+                    "Vertical sizing (linear_decay_downsize): 9:32–10:29 → 39 ctr (48 peak elevated), … 14:30–15:30 → 8 ctr.",
                 ],
             },
             {
@@ -721,7 +724,7 @@ def main() -> None:
     args = parser.parse_args()
 
     default_runs = [
-        "p3_poststop_cooldown_120=data/dashboard_runs/p3_poststop_cooldown_120:Production optimal — put wing 150 (Wave 2 Calmar)",
+        "p3_poststop_cooldown_120=data/dashboard_runs/p3_poststop_cooldown_120:Production — put wing 150 + IC8 overlay (VIX≥15)",
         "p3_trend_bc_085=data/dashboard_runs/p3_trend_bc_085:Trend BC 0.85 gate (Wave 2 risk-shape)",
     ]
     specs = args.run or default_runs
@@ -756,16 +759,19 @@ def main() -> None:
         elif id_part == "p3_poststop_cooldown_120":
             meta = {
                 "description": (
-                    "Wave 2 Calmar winner (put_wing_150): put wing 150 / call 75, skew 0.65, flatten −3.25%, "
-                    "same_side_stop_cooldown_minutes=120, VIX skip when open > 35, 1.25× upscale when VIX 25–35."
+                    "Production stack: put wing 150 / call 75, skew 0.65, flatten −3.25%, FOMC 13:30 cutoff, "
+                    "VIX put+25 when ≥20, skip session VIX>35, 1.25× upscale VIX 25–35, plus short IC overlay "
+                    "(8 contracts @ $13M/31-lot baseline, 50pt wings, VIX≥15, once/day)."
                 ),
                 "gates": (
-                    "trend 1.0 · skew 0.65 · put wing 150 · flatten −3.25% · "
-                    "same_side_stop_cooldown_minutes=120 · skip session VIX>35"
+                    "trend 1.0 · skew 0.65 · put wing 150 · flatten −3.25% · FOMC 13:30 · "
+                    "same_side_stop_cooldown_minutes=120 · skip session VIX>35 · "
+                    "IC: VIX≥15 · 50pt wings · 8/31 size fraction · 1×/day"
                 ),
                 "sizing_schedule": (
                     "linear_decay_downsize + VIX elevated 1.25× (25–35): "
-                    "09:32-10:29 1.25x (39→48 peak elevated) … 14:30-15:30 0.25x (8)"
+                    "09:32-10:29 1.25x (39→48 peak elevated) … 14:30-15:30 0.25x (8); "
+                    "IC size = round(vertical_base × 8/31)"
                 ),
                 "credit_cap_pct": 50.0,
                 "strategy_guide": build_p3_poststop_strategy_guide(args.account_equity, hist),

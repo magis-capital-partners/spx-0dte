@@ -36,9 +36,22 @@ PRODUCTION_DAILY_LOSS_LIMIT_PCT = 0.0225
 # Overnight Calmar Wave 2 winner (put_wing_150, July 2026): tighter put wing vs 200pt substrate.
 PRODUCTION_PUT_WING_WIDTH = 150.0
 PRODUCTION_CALL_WING_WIDTH = 75.0
+# Why-Not-Look-At holdout survivors (2026-07-15): VIX put-wing widen + FOMC afternoon cutoff.
+PRODUCTION_VIX_WIDEN_PUT_ABOVE = 20.0
+PRODUCTION_VIX_WIDEN_PUT_EXTRA = 25.0
+PRODUCTION_USE_FOMC_ENTRY_CUTOFF = True
+PRODUCTION_FOMC_ENTRY_END = time(13, 30)
 # Peak morning elevated tranche: round(baseline × max_tod_mult × vix_elevated_scale).
 PRODUCTION_MAX_CONTRACTS_PER_TRANCHE = 48  # round(31 × 1.25 × 1.25)
 LIVE_PILOT_MAX_CONTRACTS_PER_TRANCHE = 3  # round(2 × 1.25 × 1.25)
+# Selective overlay promo (July 2026): short IC @ 8 contracts on $13M / 31-lot baseline.
+# Size scales with baseline_contracts via fraction — e.g. 2× book → 16 IC contracts.
+PRODUCTION_CONDOR_BASELINE_CONTRACTS = 8
+PRODUCTION_CONDOR_SIZE_FRACTION = PRODUCTION_CONDOR_BASELINE_CONTRACTS / PRODUCTION_BASELINE_CONTRACTS
+PRODUCTION_CONDOR_WING_WIDTH = 50.0
+PRODUCTION_CONDOR_MIN_VIX = 15.0
+PRODUCTION_CONDOR_TARGET_DELTA = 0.12
+PRODUCTION_CONDOR_MAX_ENTRIES_PER_DAY = 1
 
 # --------------------------------------------------------------------------- #
 # Frozen 3D winner (wide wings + 3x stop + 2-bar confirm + flatten governor).
@@ -104,6 +117,10 @@ def build_p3_poststop_cooldown_config(
     Wave 1 (July 2026): skew 0.65 + flatten −3.25% (``combo_skew065_flat325``).
     Wave 2 (July 2026): put wing 150pt (``put_wing_150``) — +2.2pp CAGR / Calmar 2.31
     on eligible-calendar OOS vs put-200 substrate.
+    Wave WNLA (July 2026): put wing +25 when VIX>=20; no new entries after 13:30 on FOMC.
+    Wave IC (July 2026): short ATM-delta iron condor overlay — 8 contracts @ $13M
+    baseline (scales with ``baseline_contracts``), 50pt wings, VIX open >= 15,
+    one structure per day (selective-overlay holdout promo).
     """
     return replace(
         build_p3_trend_skew_config(account_equity, baseline_contracts),
@@ -113,6 +130,29 @@ def build_p3_poststop_cooldown_config(
         flatten_loss_limit_pct=PRODUCTION_FLATTEN_LOSS_LIMIT_PCT,
         put_wing_width=PRODUCTION_PUT_WING_WIDTH,
         call_wing_width=PRODUCTION_CALL_WING_WIDTH,
+        vix_widen_put_wing_above=PRODUCTION_VIX_WIDEN_PUT_ABOVE,
+        vix_widen_put_wing_extra=PRODUCTION_VIX_WIDEN_PUT_EXTRA,
+        use_fomc_entry_cutoff=PRODUCTION_USE_FOMC_ENTRY_CUTOFF,
+        fomc_entry_end=PRODUCTION_FOMC_ENTRY_END,
+        # Iron condor overlay (bounded short premium) — size tracks vertical baseline.
+        use_condor_sleeve=True,
+        condor_size_fraction=PRODUCTION_CONDOR_SIZE_FRACTION,
+        condor_wing_width=PRODUCTION_CONDOR_WING_WIDTH,
+        condor_min_vix=PRODUCTION_CONDOR_MIN_VIX,
+        condor_max_entries_per_day=PRODUCTION_CONDOR_MAX_ENTRIES_PER_DAY,
+        condor_target_abs_delta=PRODUCTION_CONDOR_TARGET_DELTA,
+        condor_min_abs_delta=PRODUCTION_CONDOR_TARGET_DELTA - 0.04,
+        condor_max_abs_delta=PRODUCTION_CONDOR_TARGET_DELTA + 0.04,
+        condor_entry_start=time(10, 0),
+        condor_entry_end=time(15, 0),
+        # Match selective-overlay B_always_IC: enter whenever VIX/structure allow.
+        condor_min_score=-100.0,
+        condor_min_straddle_residual_z=-999.0,
+        condor_max_abs_trend_score=999.0,
+        condor_max_abs_skew_z=999.0,
+        condor_max_abs_term_ratio_z=999.0,
+        condor_max_abs_realized_z=999.0,
+        condor_block_event_buckets="tariff_shock,tariff_reversal",
     )
 
 

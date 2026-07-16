@@ -61,7 +61,7 @@ PRESETS = {
         "kind": "historical_3d",
         "scheme": "linear_decay_downsize",
         "profile": "p3_poststop_cooldown_120",
-        "label": "Production optimal — put wing 150 (Wave 2 Calmar)",
+        "label": "Production — put wing 150 + IC8 overlay (VIX≥15)",
         "use_vix_elevated_policy": True,
         "vix_max_contracts": PRODUCTION_MAX_CONTRACTS_PER_TRANCHE,
         "vix_elevated_scale": VIX_ELEVATED_SCALE,

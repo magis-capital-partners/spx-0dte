@@ -3,7 +3,7 @@ from __future__ import annotations
 import csv
 import math
 from collections import Counter
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, time, timedelta
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Sequence, Set, Tuple
@@ -243,6 +243,12 @@ class StrategyConfig:
     condor_max_abs_skew_z: float = 1.25
     condor_max_abs_term_ratio_z: float = 1.25
     condor_max_abs_realized_z: float = 1.50
+    # Fixed wing width for IC longs (0 = fall back to vertical put/call wing widths).
+    condor_wing_width: float = 0.0
+    # Skip IC when signal.vix is missing or below this (0 = no VIX floor).
+    condor_min_vix: float = 0.0
+    # Max iron-condor structures per day (each structure = put credit + call credit). 0 = unlimited.
+    condor_max_entries_per_day: int = 0
     condor_entry_start: time = time(9, 45)
     condor_entry_end: time = time(14, 30)
     condor_allowed_event_buckets: str = ""
@@ -340,6 +346,41 @@ class StrategyConfig:
     stop_confirmation_count: int = 1
     spread_stop_loss_multiple: float = 1.5
     block_same_strike_after_stop: bool = False
+    # --- Why-not-look-at research knobs (defaults preserve production) ---
+    # Early exit / profit take: close open credit spreads when marked capture
+    # reaches profit_take_credit_fraction of entry credit (0 disables).
+    profit_take_credit_fraction: float = 0.0
+    profit_take_after: Optional[time] = None
+    profit_take_max_adverse_spot_pct: float = 0.0
+    profit_take_vix_below: float = 0.0
+    # Time exit: after time_exit_after, close if marked capture < fraction of credit.
+    time_exit_after: Optional[time] = None
+    time_exit_min_credit_fraction: float = 0.25
+    # Credit targeting: prefer shorts near target credit / credit-to-width.
+    target_credit: float = 0.0
+    target_credit_to_width: float = 0.0
+    credit_selection_mode: str = "score"  # score | target_credit | target_credit_to_width
+    # Strike liquidity proxies.
+    prefer_strike_multiple: float = 0.0
+    require_strike_multiple: bool = False
+    # Side filters.
+    allowed_sides: str = "bull_put,bear_call"
+    skip_puts_if_realized_below: float = -999.0  # disabled when <= -900
+    skip_calls_if_realized_below: float = -999.0
+    skip_both_if_straddle_residual_below: float = -999.0
+    # Dynamic target adjustments.
+    afternoon_min_credit: float = 0.0
+    afternoon_min_credit_start: time = time(13, 0)
+    post_stop_min_credit_to_width: float = 0.0
+    vix_widen_put_wing_above: float = 0.0  # when >0, widen put wing if VIX >= this
+    vix_widen_put_wing_extra: float = 25.0
+    vix_tighten_delta_above: float = 0.0
+    vix_tighten_delta_target: float = 0.16
+    both_sides_max_abs_skew: float = 0.0  # if >0 and max_sides>=2, require |skew| below this
+    # FOMC decision-day entry cutoff (no new entries after fomc_entry_end).
+    use_fomc_entry_cutoff: bool = False
+    fomc_entry_end: time = time(13, 30)
+    fomc_calendar_path: str = ""  # empty -> data/calendar/fomc_days.csv
 
 
 @dataclass
@@ -759,6 +800,26 @@ def _distance_pct(side: str, short_strike: float, spot: float) -> float:
 
 
 def _side_gate_reason(side: str, signal: SignalSnapshot, config: StrategyConfig) -> str:
+    allowed = _csv_set(config.allowed_sides) if config.allowed_sides else {"bull_put", "bear_call"}
+    if side not in allowed:
+        return "side_not_allowed"
+    if (
+        config.skip_both_if_straddle_residual_below > -900.0
+        and signal.straddle_residual_z < config.skip_both_if_straddle_residual_below
+    ):
+        return "negative_vrp_proxy"
+    if (
+        side == "bull_put"
+        and config.skip_puts_if_realized_below > -900.0
+        and signal.realized_vs_implied_z < config.skip_puts_if_realized_below
+    ):
+        return "put_realized_cheap"
+    if (
+        side == "bear_call"
+        and config.skip_calls_if_realized_below > -900.0
+        and signal.realized_vs_implied_z < config.skip_calls_if_realized_below
+    ):
+        return "call_realized_cheap"
     if config.require_positive_premium_richness and signal.straddle_residual_z < config.atm_surface_min_residual:
         return "cheap_premium"
     if abs(signal.term_ratio_z) > config.candidate_max_abs_term_ratio_z:
@@ -780,6 +841,58 @@ def _side_gate_reason(side: str, signal: SignalSnapshot, config: StrategyConfig)
     if side == "bear_call" and signal.skew_z > config.candidate_max_adverse_skew:
         return "adverse_call_skew"
     return ""
+
+
+def _effective_delta_targets(config: StrategyConfig, signal: Optional[SignalSnapshot]) -> tuple[float, float, float]:
+    target = config.target_abs_delta
+    lo = config.min_abs_delta
+    hi = config.max_abs_delta
+    if (
+        signal is not None
+        and signal.vix is not None
+        and config.vix_tighten_delta_above > 0
+        and signal.vix > config.vix_tighten_delta_above
+    ):
+        target = config.vix_tighten_delta_target
+        lo = round(target - 0.05, 2)
+        hi = round(target + 0.05, 2)
+    return target, lo, hi
+
+
+def _effective_put_wing_width(config: StrategyConfig, signal: Optional[SignalSnapshot]) -> float:
+    width = config.put_wing_width
+    if width <= 0:
+        return width
+    if (
+        signal is not None
+        and signal.vix is not None
+        and config.vix_widen_put_wing_above > 0
+        and signal.vix >= config.vix_widen_put_wing_above
+    ):
+        return width + config.vix_widen_put_wing_extra
+    return width
+
+
+def _strike_multiple_ok(strike: float, multiple: float) -> bool:
+    if multiple <= 0:
+        return True
+    return abs(strike % multiple) < 1e-6 or abs(strike % multiple - multiple) < 1e-6
+
+
+def _credit_sort_key(record: "CandidateRecord", config: StrategyConfig) -> tuple:
+    if config.credit_selection_mode == "target_credit" and config.target_credit > 0:
+        return (-abs(record.credit - config.target_credit), record.score, record.credit_to_width, record.distance_pct)
+    if config.credit_selection_mode == "target_credit_to_width" and config.target_credit_to_width > 0:
+        return (
+            -abs(record.credit_to_width - config.target_credit_to_width),
+            record.score,
+            record.credit_to_width,
+            record.distance_pct,
+        )
+    prefer_bonus = 0.0
+    if config.prefer_strike_multiple > 0 and _strike_multiple_ok(record.short_strike, config.prefer_strike_multiple):
+        prefer_bonus = 1.0
+    return (record.score + prefer_bonus * 0.01, record.credit_to_width, record.distance_pct)
 
 
 def _candidate_score(
@@ -833,19 +946,39 @@ def build_scored_candidates(
     trading_snapshot = [quote for quote in snapshot if quote.expiry == target_expiry]
     spot = snapshot_spot(trading_snapshot)
     records: List[CandidateRecord] = []
+    target_delta, min_delta, max_delta = _effective_delta_targets(config, signal)
+    eff_put_wing = _effective_put_wing_width(config, signal)
+    eff_config = config
+    if abs(eff_put_wing - config.put_wing_width) > 1e-9 or abs(target_delta - config.target_abs_delta) > 1e-9:
+        eff_config = replace(
+            config,
+            put_wing_width=eff_put_wing,
+            target_abs_delta=target_delta,
+            min_abs_delta=min_delta,
+            max_abs_delta=max_delta,
+        )
+    afternoon_floor = (
+        config.afternoon_min_credit
+        if config.afternoon_min_credit > 0 and signal.timestamp.time() >= config.afternoon_min_credit_start
+        else 0.0
+    )
 
     for side in ("bull_put", "bear_call"):
         option_type = _side_option_type(side)
         long_direction = _side_long_direction(side)
-        gate_reason = _side_gate_reason(side, signal, config)
+        gate_reason = _side_gate_reason(side, signal, eff_config)
 
         for short_quote in trading_snapshot:
             if normalize_option_type(short_quote.option_type) != option_type or short_quote.delta is None:
                 continue
             abs_delta = abs(short_quote.delta)
-            if not (config.min_abs_delta <= abs_delta <= config.max_abs_delta):
+            if not (min_delta <= abs_delta <= max_delta):
                 continue
-            long_quote = select_long_wing(trading_snapshot, short_quote, long_direction, config, side=side)
+            if config.require_strike_multiple and not _strike_multiple_ok(
+                short_quote.strike, config.prefer_strike_multiple or 25.0
+            ):
+                continue
+            long_quote = select_long_wing(trading_snapshot, short_quote, long_direction, eff_config, side=side)
             if long_quote is None:
                 continue
 
@@ -855,26 +988,31 @@ def build_scored_candidates(
             credit = short_quote.bid - long_quote.ask
             credit_to_width = credit / width if width else 0.0
             distance_pct = _distance_pct(side, short_quote.strike, spot)
-            raw_stop_loss = short_quote.bid * max(config.stop_multiple - 1.0, 0.0) + long_quote.ask
+            raw_stop_loss = short_quote.bid * max(eff_config.stop_multiple - 1.0, 0.0) + long_quote.ask
             stop_loss_to_credit = raw_stop_loss / max(credit, 0.01)
-            score = _candidate_score(side, signal, abs_delta, credit_to_width, distance_pct, stop_loss_to_credit, config)
+            score = _candidate_score(
+                side, signal, abs_delta, credit_to_width, distance_pct, stop_loss_to_credit, eff_config
+            )
 
             status = "pass"
             reason = "accepted"
+            min_credit = max(eff_config.candidate_min_credit, afternoon_floor)
             if gate_reason:
                 status = "gated"
                 reason = gate_reason
-            elif credit < config.candidate_min_credit:
+            elif credit < min_credit:
                 status = "rejected"
                 reason = "insufficient_credit"
-            elif credit_to_width < config.candidate_min_credit_to_width:
+            elif credit_to_width < eff_config.candidate_min_credit_to_width:
                 status = "rejected"
                 reason = "thin_credit_to_width"
-            elif stop_loss_to_credit > config.candidate_max_stop_loss_to_credit:
+            elif stop_loss_to_credit > eff_config.candidate_max_stop_loss_to_credit:
                 status = "rejected"
                 reason = "poor_stop_reward"
             else:
-                min_score = config.harvest_min_score if config.use_harvest_mode else _effective_candidate_min_score(config)
+                min_score = (
+                    eff_config.harvest_min_score if eff_config.use_harvest_mode else _effective_candidate_min_score(eff_config)
+                )
                 if score < min_score:
                     status = "rejected"
                     reason = "low_score"
@@ -908,7 +1046,7 @@ def build_scored_candidates(
                 )
             )
 
-    records.sort(key=lambda record: (record.score, record.credit_to_width, record.distance_pct), reverse=True)
+    records.sort(key=lambda record: _credit_sort_key(record, config), reverse=True)
     return records
 
 
@@ -934,7 +1072,26 @@ def _exploratory_contracts(base_contracts: int, config: StrategyConfig) -> int:
 
 
 def _condor_contracts(base_contracts: int, config: StrategyConfig) -> int:
+    """Scale IC size with the same TOD/VIX-adjusted baseline as verticals.
+
+    Production uses ``condor_size_fraction = 8/31`` so flat morning size is 8
+    contracts at the $13M / 31-contract vertical baseline, and any global size
+    multiplier on ``baseline_contracts`` scales IC proportionally.
+    """
+    if base_contracts <= 0 or config.condor_size_fraction <= 0:
+        return 0
     return max(1, round(base_contracts * config.condor_size_fraction))
+
+
+def _condor_structures_opened(trades: Sequence["Trade"]) -> int:
+    """Count IC structures opened today.
+
+    Uses max(put legs, call legs) so a partial fill (one side risk-blocked) still
+    consumes the daily slot and prevents repeated one-sided re-entries.
+    """
+    puts = sum(1 for trade in trades if trade.model == "candidate_condor" and trade.side == "bull_put")
+    calls = sum(1 for trade in trades if trade.model == "candidate_condor" and trade.side == "bear_call")
+    return max(puts, calls)
 
 
 def _one_dte_contracts(base_contracts: int, config: StrategyConfig) -> int:
@@ -1065,6 +1222,9 @@ def _condor_signal_allowed(timestamp: datetime, signal: SignalSnapshot, config: 
         return False
     if config.event_bucket in _csv_set(config.condor_block_event_buckets):
         return False
+    if config.condor_min_vix > 0:
+        if signal.vix is None or signal.vix < config.condor_min_vix:
+            return False
     if signal.straddle_residual_z < config.condor_min_straddle_residual_z:
         return False
     if abs(signal.trend_score) > config.condor_max_abs_trend_score:
@@ -1143,6 +1303,18 @@ def _select_condor_leg(
     spot = snapshot_spot(trading_snapshot)
     option_type = _side_option_type(side)
     long_direction = _side_long_direction(side)
+    # IC uses its own fixed wing width so vertical put/call wings (150/75) do not widen it.
+    wing_cfg = config
+    if config.condor_wing_width > 0:
+        wing_cfg = replace(
+            config,
+            put_wing_width=config.condor_wing_width,
+            call_wing_width=config.condor_wing_width,
+            wing_width=config.condor_wing_width,
+            min_wing_width=max(25.0, config.condor_wing_width - 25.0),
+            max_wing_width=config.condor_wing_width + 25.0,
+            wing_selection_mode="fixed_width",
+        )
     candidates: List[Tuple[float, float, float, CandidateRecord]] = []
 
     for short_quote in trading_snapshot:
@@ -1151,7 +1323,7 @@ def _select_condor_leg(
         abs_delta = abs(short_quote.delta)
         if not (config.condor_min_abs_delta <= abs_delta <= config.condor_max_abs_delta):
             continue
-        long_quote = select_long_wing(trading_snapshot, short_quote, long_direction, config, side=side)
+        long_quote = select_long_wing(trading_snapshot, short_quote, long_direction, wing_cfg, side=side)
         if long_quote is None:
             continue
         width = abs(long_quote.strike - short_quote.strike)
@@ -1298,8 +1470,15 @@ def select_condor_entries(
     signal: SignalSnapshot,
     base_contracts: int,
     config: StrategyConfig,
+    trades: Optional[Sequence["Trade"]] = None,
 ) -> Tuple[List[CandidateRecord], List[CandidateRecord]]:
     if not _condor_signal_allowed(snapshot[0].timestamp, signal, config):
+        return [], []
+    if (
+        config.condor_max_entries_per_day > 0
+        and trades is not None
+        and _condor_structures_opened(trades) >= config.condor_max_entries_per_day
+    ):
         return [], []
     legs = [
         _select_condor_leg(snapshot, signal, "bull_put", config),
@@ -1565,11 +1744,18 @@ def select_candidate_entries(
 
     selected: List[CandidateRecord] = []
     used_sides = set()
+    max_sides = config.candidate_max_sides
     for record in records:
         if record.status != "pass":
             continue
         if record.side in used_sides:
             continue
+        if (
+            max_sides >= 2
+            and config.both_sides_max_abs_skew > 0
+            and abs(record.skew_z) >= config.both_sides_max_abs_skew
+        ):
+            max_sides = 1
         contracts = _candidate_contracts(base_contracts, record.score, config)
         if record.side == "bear_call" and config.bear_call_size_scale != 1.0:
             contracts = max(0, round(contracts * config.bear_call_size_scale))
@@ -1581,7 +1767,7 @@ def select_candidate_entries(
         record.contracts = contracts
         selected.append(record)
         used_sides.add(record.side)
-        if len(selected) >= config.candidate_max_sides:
+        if len(selected) >= max_sides:
             break
     return selected, records
 
@@ -1921,8 +2107,85 @@ def process_stops(
     return newly_stopped
 
 
+def _adverse_spot_move_pct(trade: Trade, spot: Optional[float]) -> float:
+    if spot is None or trade.entry_spot is None or trade.entry_spot <= 0:
+        return 0.0
+    move = (spot - trade.entry_spot) / trade.entry_spot
+    if trade.side == "bull_put":
+        return max(0.0, -move)
+    if trade.side == "bear_call":
+        return max(0.0, move)
+    return 0.0
+
+
+def process_profit_takes(
+    trades: Sequence[Trade],
+    timestamp: datetime,
+    snapshot: Sequence[OptionQuote],
+    config: StrategyConfig,
+    signal: Optional[SignalSnapshot] = None,
+) -> List[Trade]:
+    """Close open credit spreads on profit-take / time-exit rules."""
+    if (
+        config.profit_take_credit_fraction <= 0
+        and config.time_exit_after is None
+    ):
+        return []
+    closed: List[Trade] = []
+    spot = snapshot_spot(snapshot)
+    for trade in trades:
+        if trade.exit_reason != "open" or trade.stopped or trade.closed_early:
+            continue
+        if trade.side in ("long_put_overlay", "long_call_overlay") or trade.entry_credit <= 0:
+            continue
+        marked = mark_trade(trade, snapshot, config)
+        per_contract = marked / max(trade.contracts * config.multiplier, 1)
+        capture = per_contract / max(trade.entry_credit, 0.01)
+        reason = ""
+        if config.profit_take_credit_fraction > 0 and capture >= config.profit_take_credit_fraction:
+            if config.profit_take_after is not None and timestamp.time() < config.profit_take_after:
+                pass
+            elif (
+                config.profit_take_vix_below > 0
+                and (signal is None or signal.vix is None or signal.vix >= config.profit_take_vix_below)
+            ):
+                pass
+            elif (
+                config.profit_take_max_adverse_spot_pct > 0
+                and _adverse_spot_move_pct(trade, spot) > config.profit_take_max_adverse_spot_pct
+            ):
+                pass
+            else:
+                reason = "profit_take"
+        if (
+            not reason
+            and config.time_exit_after is not None
+            and timestamp.time() >= config.time_exit_after
+            and capture < config.time_exit_min_credit_fraction
+        ):
+            reason = "time_exit"
+        if reason:
+            close_trade_at_snapshot(trade, timestamp, snapshot, config, reason=reason)
+            closed.append(trade)
+    return closed
+
+
+def effective_entry_end(timestamp: datetime, config: StrategyConfig) -> time:
+    """Entry cutoff for this timestamp (FOMC days may end earlier)."""
+    if not config.use_fomc_entry_cutoff:
+        return config.entry_end
+    from fomc_calendar import is_fomc_day
+
+    trade_date = timestamp.date().isoformat()
+    if is_fomc_day(trade_date, config.fomc_calendar_path or ""):
+        if config.fomc_entry_end <= config.entry_end:
+            return config.fomc_entry_end
+    return config.entry_end
+
+
 def is_entry_time(timestamp: datetime, config: StrategyConfig) -> bool:
-    if not (config.entry_start <= timestamp.time() <= config.entry_end):
+    entry_end = effective_entry_end(timestamp, config)
+    if not (config.entry_start <= timestamp.time() <= entry_end):
         return False
     start_minutes = config.entry_start.hour * 60 + config.entry_start.minute
     current_minutes = timestamp.time().hour * 60 + timestamp.time().minute
@@ -2017,6 +2280,12 @@ def entry_risk_block_reason(
     ]
     if len(same_strike) >= config.max_open_trades_same_side_strike:
         return "same_strike_concentration_limit"
+    if (
+        config.post_stop_min_credit_to_width > 0
+        and side_stop_counts.get(candidate.side, 0) > 0
+        and candidate.credit_to_width < config.post_stop_min_credit_to_width
+    ):
+        return "post_stop_thin_credit"
     if config.block_same_strike_after_stop:
         for trade in trades:
             if (
@@ -2212,6 +2481,9 @@ def simulate_day(
             if config.same_side_stop_cooldown_minutes > 0:
                 side_stop_cooldown_until[stopped_trade.side] = timestamp + timedelta(minutes=config.same_side_stop_cooldown_minutes)
 
+        signal_early = signals_by_ts.get(timestamp)
+        process_profit_takes(trades, timestamp, snapshot, config, signal=signal_early)
+
         marked_pnl = sum(mark_trade(trade, snapshot, config) for trade in trades)
         if not halted and marked_pnl <= daily_loss_limit:
             halted = True
@@ -2256,7 +2528,9 @@ def simulate_day(
                 if base_contracts <= 0:
                     continue
                 selected_candidates, records = select_candidate_entries(snapshot, signal, base_contracts, config)
-                condor_candidates, condor_records = select_condor_entries(snapshot, signal, base_contracts, config)
+                condor_candidates, condor_records = select_condor_entries(
+                    snapshot, signal, base_contracts, config, trades=trades
+                )
                 one_dte_candidates, one_dte_records = select_one_dte_entries(snapshot, signal, base_contracts, config)
                 trend_debit_candidates, trend_debit_records = select_trend_debit_entries(snapshot, signal, base_contracts, config)
                 hedge_candidates, hedge_records = select_long_put_hedge_entries(snapshot, signal, base_contracts, config)
@@ -2419,7 +2693,9 @@ def simulate_day(
             selected_candidates, records = select_candidate_entries(
                 snapshot, signal, base_contracts, config, records=records
             )
-            condor_candidates, condor_records = select_condor_entries(snapshot, signal, base_contracts, config)
+            condor_candidates, condor_records = select_condor_entries(
+                snapshot, signal, base_contracts, config, trades=trades
+            )
             one_dte_candidates, one_dte_records = select_one_dte_entries(snapshot, signal, base_contracts, config)
             trend_debit_candidates, trend_debit_records = select_trend_debit_entries(snapshot, signal, base_contracts, config)
             hedge_candidates, hedge_records = select_long_put_hedge_entries(snapshot, signal, base_contracts, config)

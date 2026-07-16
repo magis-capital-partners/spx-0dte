@@ -43,6 +43,7 @@ from mbh_simulator import (  # noqa: E402  (path injection above)
     build_scored_candidates,
     candidate_margin_per_contract,
     select_candidate_entries,
+    select_condor_entries,
 )
 
 try:  # optional dependency; only needed for paper/live modes
@@ -220,11 +221,13 @@ class IBSignalProvider:
         live: LiveConfig,
         config: StrategyConfig,
         baselines_core: Optional[dict] = None,
+        session_vix: Optional[float] = None,
     ):
         self.ib = ib
         self.live = live
         self.config = config
         self.baselines = baselines_core
+        self.session_vix = session_vix
         self._feature_state = SessionFeatureState()
         self._stream = IBStreamingMarketData(ib, live, config)
 
@@ -288,12 +291,17 @@ class IBSignalProvider:
         at_tranche: bool = False,
     ) -> Optional[SignalSnapshot]:
         if self.baselines is None:
-            return SignalSnapshot(timestamp=now)
+            return SignalSnapshot(timestamp=now, vix=self.session_vix)
         session = now.date().isoformat()
         zero_q, _ = split_session_quotes(quotes, session)
         next_q = self._stream.next_expiry_quotes() if at_tranche else None
         raw = compute_raw_features(zero_q, spot, now, self._feature_state, next_expiry_quotes=next_q)
-        return raw_to_signal_snapshot(raw, self.baselines, now)
+        signal = raw_to_signal_snapshot(raw, self.baselines, now)
+        if self.session_vix is not None:
+            from dataclasses import replace as dc_replace
+
+            signal = dc_replace(signal, vix=self.session_vix)
+        return signal
 
 
 # --------------------------------------------------------------------------- #
@@ -952,6 +960,24 @@ def _process_tranche(
         selected, records = select_candidate_entries(
             quotes, signal, base_contracts, config, records=records
         )
+        # Mirror simulate_day: optional iron-condor overlay (once/day when configured).
+        if config.use_condor_sleeve:
+            # Synthesize Trade-like markers from open spreads for max-entries check.
+            class _CondorMark:
+                def __init__(self, side: str):
+                    self.model = "candidate_condor"
+                    self.side = side
+
+            condor_marks = [
+                _CondorMark(s.candidate.side)
+                for s in open_spreads
+                if (s.candidate.sleeve or "") == "condor"
+            ]
+            condor_selected, condor_records = select_condor_entries(
+                quotes, signal, base_contracts, config, trades=condor_marks
+            )
+            selected.extend(condor_selected)
+            records.extend(condor_records)
 
     executed = 0
     credit_added = 0.0
@@ -1125,6 +1151,8 @@ def run(live: LiveConfig = ACTIVE) -> None:
           f"scheme={live.sizing_scheme or 'flat'} equity=${live.account_equity:,.0f} "
           f"baseline_contracts={config.baseline_contracts} "
           f"wings=put{config.put_wing_width:.0f}/call{config.call_wing_width:.0f} "
+          f"vix_put_widen=>={config.vix_widen_put_wing_above:.0f}+{config.vix_widen_put_wing_extra:.0f} "
+          f"fomc_cutoff={'on@'+config.fomc_entry_end.strftime('%H:%M') if config.use_fomc_entry_cutoff else 'off'} "
           f"gates=trend<={config.candidate_max_adverse_trend}/skew<={config.candidate_max_adverse_skew} "
           f"stop={config.stop_multiple}x/{config.stop_confirmation_count}bar "
           f"side_cooldown={config.same_side_stop_cooldown_minutes}min "
@@ -1176,7 +1204,9 @@ def run(live: LiveConfig = ACTIVE) -> None:
             print(f"Tranche diagnostics -> data/live/{today}/tranches.jsonl")
             if baselines_core is not None:
                 print(f"Signal baselines -> {live.baselines_path}")
-            provider = IBSignalProvider(ib, live, config, baselines_core=baselines_core)
+            provider = IBSignalProvider(
+                ib, live, config, baselines_core=baselines_core, session_vix=vix_open
+            )
             provider.start()
 
         # Rebuild open book from today's fills and verify against IB positions.

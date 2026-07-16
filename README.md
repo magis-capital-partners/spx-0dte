@@ -86,7 +86,7 @@ Run more paper sessions and reconcile against backtest before enabling live.
 
 Details: [`docs/README.md`](docs/README.md), [`DASHBOARD.md`](DASHBOARD.md)
 
-Primary backtest line on the chart: **Production optimal — put wing 150 (Wave 2)**.  
+Primary backtest line on the chart: **Production — put wing 150 + IC8 overlay (VIX≥15)**.  
 Stat cards and strategy guide use `p3_poststop_cooldown_120`. Second line:
 **Trend BC 0.85** comparison.
 
