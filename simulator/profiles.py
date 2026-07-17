@@ -36,9 +36,9 @@ PRODUCTION_DAILY_LOSS_LIMIT_PCT = 0.0225
 # Overnight Calmar Wave 2 winner (put_wing_150, July 2026): tighter put wing vs 200pt substrate.
 PRODUCTION_PUT_WING_WIDTH = 150.0
 PRODUCTION_CALL_WING_WIDTH = 75.0
-# Why-Not-Look-At holdout survivors (2026-07-15): VIX put-wing widen + FOMC afternoon cutoff.
-PRODUCTION_VIX_WIDEN_PUT_ABOVE = 20.0
-PRODUCTION_VIX_WIDEN_PUT_EXTRA = 25.0
+# WNLA: keep FOMC afternoon cutoff; drop VIX put-wing widen (hurt CAGR ~0.7pp on retest).
+PRODUCTION_VIX_WIDEN_PUT_ABOVE = 0.0  # disabled (was 20.0)
+PRODUCTION_VIX_WIDEN_PUT_EXTRA = 25.0  # unused while above == 0
 PRODUCTION_USE_FOMC_ENTRY_CUTOFF = True
 PRODUCTION_FOMC_ENTRY_END = time(13, 30)
 # Peak morning elevated tranche: round(baseline × max_tod_mult × vix_elevated_scale).
@@ -117,7 +117,7 @@ def build_p3_poststop_cooldown_config(
     Wave 1 (July 2026): skew 0.65 + flatten −3.25% (``combo_skew065_flat325``).
     Wave 2 (July 2026): put wing 150pt (``put_wing_150``) — +2.2pp CAGR / Calmar 2.31
     on eligible-calendar OOS vs put-200 substrate.
-    Wave WNLA (July 2026): put wing +25 when VIX>=20; no new entries after 13:30 on FOMC.
+    Wave WNLA (July 2026): no new entries after 13:30 on FOMC (VIX put-widen retired).
     Wave IC (July 2026): short ATM-delta iron condor overlay — 8 contracts @ $13M
     baseline (scales with ``baseline_contracts``), 50pt wings, VIX open >= 15,
     one structure per day (selective-overlay holdout promo).

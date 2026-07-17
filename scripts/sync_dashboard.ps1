@@ -77,7 +77,7 @@ function Wait-PagesBuild {
 if ($doBuild) {
   Write-Host "Building dashboard data (including live/paper sessions)..."
   & $Python "$Root\docs\build_dashboard_data.py" `
-    --run "p3_poststop_cooldown_120=data/dashboard_runs/p3_poststop_cooldown_120:Production — put wing 150 + IC8 overlay (VIX≥15)" `
+    --run "p3_poststop_cooldown_120=data/dashboard_runs/p3_poststop_cooldown_120:Production — put 150 + FOMC 13:30 + IC8 (VIX≥15)" `
     --run "p3_trend_bc_085=data/dashboard_runs/p3_trend_bc_085:Trend BC 0.85 gate (Wave 2 risk-shape)" `
     --primary-run-id "p3_poststop_cooldown_120" `
     --account-equity $Equity `
