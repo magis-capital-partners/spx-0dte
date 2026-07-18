@@ -44,13 +44,13 @@ PRODUCTION_FOMC_ENTRY_END = time(13, 30)
 # Peak morning elevated tranche: round(baseline × max_tod_mult × vix_elevated_scale).
 PRODUCTION_MAX_CONTRACTS_PER_TRANCHE = 48  # round(31 × 1.25 × 1.25)
 LIVE_PILOT_MAX_CONTRACTS_PER_TRANCHE = 3  # round(2 × 1.25 × 1.25)
-# Selective overlay promo (July 2026): short IC @ 8 contracts on $13M / 31-lot baseline.
-# Size scales with baseline_contracts via fraction — e.g. 2× book → 16 IC contracts.
-PRODUCTION_CONDOR_BASELINE_CONTRACTS = 8
+# Production IC (July 2026 A/B): 50pt wings, target |Δ| 0.16, 10 contracts @ $13M / 31-lot
+# baseline (+25% vs prior 8-lot). Size scales via fraction — e.g. 2× book → 20 IC contracts.
+PRODUCTION_CONDOR_BASELINE_CONTRACTS = 10
 PRODUCTION_CONDOR_SIZE_FRACTION = PRODUCTION_CONDOR_BASELINE_CONTRACTS / PRODUCTION_BASELINE_CONTRACTS
 PRODUCTION_CONDOR_WING_WIDTH = 50.0
 PRODUCTION_CONDOR_MIN_VIX = 15.0
-PRODUCTION_CONDOR_TARGET_DELTA = 0.12
+PRODUCTION_CONDOR_TARGET_DELTA = 0.16
 PRODUCTION_CONDOR_MAX_ENTRIES_PER_DAY = 1
 
 # --------------------------------------------------------------------------- #
@@ -118,9 +118,9 @@ def build_p3_poststop_cooldown_config(
     Wave 2 (July 2026): put wing 150pt (``put_wing_150``) — +2.2pp CAGR / Calmar 2.31
     on eligible-calendar OOS vs put-200 substrate.
     Wave WNLA (July 2026): no new entries after 13:30 on FOMC (VIX put-widen retired).
-    Wave IC (July 2026): short ATM-delta iron condor overlay — 8 contracts @ $13M
-    baseline (scales with ``baseline_contracts``), 50pt wings, VIX open >= 15,
-    one structure per day (selective-overlay holdout promo).
+    Wave IC (July 2026): short iron condor overlay — 10 contracts @ $13M baseline
+    (scales with ``baseline_contracts``), 50pt wings, target |Δ| ≈ 0.16, VIX open >= 15,
+    one structure per day (production-path A/B winner + 25% size-up).
     """
     return replace(
         build_p3_trend_skew_config(account_equity, baseline_contracts),

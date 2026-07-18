@@ -12,7 +12,7 @@ from dataclasses import dataclass
 class LiveConfig:
     # --- Strategy selection ------------------------------------------------- #
     # Production: put wing 150, skew 0.65, flatten −3.25%, 120min cooldown,
-    # FOMC 13:30, IC overlay (8/31 size fraction, VIX≥15, 1×/day). No VIX put-widen.
+    # FOMC 13:30, IC overlay (10/31 size fraction, Δ0.16, VIX≥15, 1×/day). No VIX put-widen.
     profile: str = "p3_poststop_cooldown_120"
     sizing_scheme: str = "linear_decay_downsize"
 
@@ -99,7 +99,7 @@ class LiveConfig:
     vix_elevated_min: float = 25.0
     vix_elevated_max: float = 35.0
     vix_elevated_scale: float = 1.25
-    # Production profile also carries: FOMC entry end 13:30 + IC overlay (no VIX put-widen).
+    # Production profile also carries: FOMC 13:30 + IC overlay Δ0.16 / 10-lot (no VIX put-widen).
     # Those live on StrategyConfig from profiles.build_p3_poststop_cooldown_config.
 
 

@@ -418,7 +418,7 @@ def build_p3_poststop_strategy_guide(account_equity: float, hist: Optional[dict]
         "title": "Production — Put Wing 150 + FOMC Cutoff + Iron Condor",
         "subtitle": (
             "Vertical stack (put 150 / call 75, skew 0.65, flatten −3.25%, FOMC 13:30) "
-            "plus short IC overlay: 8 contracts @ $13M baseline, 50pt wings, VIX≥15, once/day"
+            "plus short IC overlay: 10 contracts @ $13M baseline, ~0.16Δ, 50pt wings, VIX≥15, once/day"
         ),
         "sections": [
             {
@@ -432,11 +432,11 @@ def build_p3_poststop_strategy_guide(account_equity: float, hist: Optional[dict]
                         "same-side post-stop cooldown, and FOMC no-new-entries after 13:30."
                     ),
                     (
-                        "Iron condor overlay (July 2026 selective-overlay promo): once per day at/after 10:00, "
-                        "sell a short ~0.12Δ put credit + call credit with 50-point wings when same-day VIX "
-                        "open ≥ 15. Target size is 8 contracts at the $13M / 31-lot vertical baseline "
-                        "(fraction 8/31), so any global size multiplier on baseline contracts scales the "
-                        "IC the same way as verticals. Losses are bounded by wing width − credit."
+                        "Iron condor overlay (July 2026 production A/B): once per day at/after 10:00, "
+                        "sell a short ~0.16Δ put credit + call credit with 50-point wings when same-day VIX "
+                        "open ≥ 15. Target size is 10 contracts at the $13M / 31-lot vertical baseline "
+                        "(fraction 10/31; +25% vs prior 8-lot), so any global size multiplier on baseline "
+                        "contracts scales the IC the same way as verticals. Losses are bounded by wing width − credit."
                     ),
                     (
                         "VIX regime controls for verticals: skip the entire session when same-day VIX open > 35; "
@@ -461,7 +461,7 @@ def build_p3_poststop_strategy_guide(account_equity: float, hist: Optional[dict]
                 "title": "Spread structure, gates, and sizing",
                 "bullets": [
                     "Vertical puts: 150-point wings. Vertical calls: 75-point wings.",
-                    "IC overlay: ~0.12Δ shorts, 50-point wings, 8 contracts @ flat 31-lot baseline (scales with size).",
+                    "IC overlay: ~0.16Δ shorts, 50-point wings, 10 contracts @ flat 31-lot baseline (scales with size).",
                     "IC entry: first eligible tranche ≥ 10:00 when VIX open ≥ 15; max one IC structure per day.",
                     "FOMC: no new entries after 13:30 (open risk still managed).",
                     "Bear-call gate — trend: skip when trend_score > 1.0; skew: skip when skew_z > 0.65.",
@@ -725,7 +725,7 @@ def main() -> None:
     args = parser.parse_args()
 
     default_runs = [
-        "p3_poststop_cooldown_120=data/dashboard_runs/p3_poststop_cooldown_120:Production — put 150 + FOMC 13:30 + IC8 (VIX≥15)",
+        "p3_poststop_cooldown_120=data/dashboard_runs/p3_poststop_cooldown_120:Production — put 150 + FOMC 13:30 + IC10 Δ0.16 (VIX≥15)",
         "p3_trend_bc_085=data/dashboard_runs/p3_trend_bc_085:Trend BC 0.85 gate (Wave 2 risk-shape)",
     ]
     specs = args.run or default_runs
@@ -762,18 +762,18 @@ def main() -> None:
                 "description": (
                     "Production stack: put wing 150 / call 75, skew 0.65, flatten −3.25%, FOMC 13:30 cutoff, "
                     "skip session VIX>35, 1.25× upscale VIX 25–35, plus short IC overlay "
-                    "(8 contracts @ $13M/31-lot baseline, 50pt wings, VIX≥15, once/day). "
+                    "(10 contracts @ $13M/31-lot baseline, ~0.16Δ, 50pt wings, VIX≥15, once/day). "
                     "VIX put-wing widen disabled."
                 ),
                 "gates": (
                     "trend 1.0 · skew 0.65 · put wing 150 · flatten −3.25% · FOMC 13:30 · "
                     "same_side_stop_cooldown_minutes=120 · skip session VIX>35 · "
-                    "IC: VIX≥15 · 50pt wings · 8/31 size fraction · 1×/day · no VIX put-widen"
+                    "IC: VIX≥15 · 50pt wings · Δ0.16 · 10/31 size fraction · 1×/day · no VIX put-widen"
                 ),
                 "sizing_schedule": (
                     "linear_decay_downsize + VIX elevated 1.25× (25–35): "
                     "09:32-10:29 1.25x (39→48 peak elevated) … 14:30-15:30 0.25x (8); "
-                    "IC size = round(vertical_base × 8/31)"
+                    "IC size = round(vertical_base × 10/31)"
                 ),
                 "credit_cap_pct": 50.0,
                 "strategy_guide": build_p3_poststop_strategy_guide(args.account_equity, hist),

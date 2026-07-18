@@ -61,7 +61,7 @@ PRESETS = {
         "kind": "historical_3d",
         "scheme": "linear_decay_downsize",
         "profile": "p3_poststop_cooldown_120",
-        "label": "Production — put 150 + FOMC 13:30 + IC8 (VIX≥15)",
+        "label": "Production — put 150 + FOMC 13:30 + IC10 Δ0.16 (VIX≥15)",
         "use_vix_elevated_policy": True,
         "vix_max_contracts": PRODUCTION_MAX_CONTRACTS_PER_TRANCHE,
         "vix_elevated_scale": VIX_ELEVATED_SCALE,

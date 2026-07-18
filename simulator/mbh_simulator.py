@@ -1074,7 +1074,7 @@ def _exploratory_contracts(base_contracts: int, config: StrategyConfig) -> int:
 def _condor_contracts(base_contracts: int, config: StrategyConfig) -> int:
     """Scale IC size with the same TOD/VIX-adjusted baseline as verticals.
 
-    Production uses ``condor_size_fraction = 8/31`` so flat morning size is 8
+    Production uses ``condor_size_fraction = 10/31`` so flat morning size is 10
     contracts at the $13M / 31-contract vertical baseline, and any global size
     multiplier on ``baseline_contracts`` scales IC proportionally.
     """
