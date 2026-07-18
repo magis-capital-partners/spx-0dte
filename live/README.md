@@ -6,6 +6,9 @@ Production SPX 0DTE executor with **streaming quotes**, **adaptive polling**, an
 call wing **75**, trend/skew gates, **120-minute same-side stop cooldown** after
 any stopped spread).
 
+**Safety overview (PDF):** [`docs/Live_Executor_Safeties.pdf`](../docs/Live_Executor_Safeties.pdf)
+— regenerate with `python scripts/generate_live_safeties_pdf.py`.
+
 ## Low-latency architecture
 
 | Phase | Implementation |
