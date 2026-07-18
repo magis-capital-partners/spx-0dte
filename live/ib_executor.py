@@ -80,6 +80,7 @@ from vix_session import (  # noqa: E402
     vix_elevated_sizing_multiplier,
 )
 from session_recovery import (  # noqa: E402
+    LegKey,
     acquire_executor_lock,
     fetch_ib_spxw_positions,
     load_fills_events,
@@ -97,6 +98,15 @@ from ib_connection import (  # noqa: E402
     format_reconnect_banner,
     ib_is_connected,
     reconnect_ib,
+)
+from stale_quotes import StaleQuoteTracker, evaluate_stale_quotes  # noqa: E402
+from slack_notify import maybe_notify_safety_event  # noqa: E402
+from heartbeat import write_heartbeat  # noqa: E402
+from open_risk_caps import open_risk_block_reason  # noqa: E402
+from live_entry_risk import (  # noqa: E402
+    apply_live_risk_overlays,
+    live_entry_risk_block,
+    recover_side_stop_counts,
 )
 from expiry_calendar import DEFAULT_RULES, is_live_tradable_day, load_era_rules  # noqa: E402
 from profiles import schedule_multiplier  # noqa: E402
@@ -650,7 +660,7 @@ def place_or_replace_native_stop_for_short(
             "stop_price": stop_px,
             "reason": reject,
             "arm_reason": reason,
-        })
+        }, live=live)
         print(
             f"[{datetime.now().isoformat()}] NATIVE STP REJECTED "
             f"{candidate.short_type} {candidate.short_strike} x{total_qty} "
@@ -1120,6 +1130,11 @@ def manage_stops(
         spread.stopped = True
         fill_px = sq.ask
         if not dry and HAS_IB and ib is not None:
+            net_before = (
+                _short_leg_ib_net(ib, spread.candidate, today)
+                if live.confirm_stop_against_ib
+                else None
+            )
             ok, fill_px = _buy_short_leg_stop(
                 ib, spread, spread.candidate, today, sq.ask, live, open_spreads,
             )
@@ -1127,6 +1142,27 @@ def manage_stops(
                 spread.stopped = False
                 spread.stop_confirm_count = 0
                 continue
+            if live.confirm_stop_against_ib and net_before is not None:
+                net_after = _short_leg_ib_net(ib, spread.candidate, today)
+                # Short nets are negative; covering should raise net by ~contracts.
+                if net_after is None or net_after < net_before + int(spread.contracts):
+                    spread.stopped = False
+                    spread.stop_confirm_count = 0
+                    log_event(today, {
+                        "event": "stop_unconfirmed",
+                        "side": spread.candidate.side,
+                        "short_strike": spread.candidate.short_strike,
+                        "contracts": spread.contracts,
+                        "net_before": net_before,
+                        "net_after": net_after,
+                        "fill": round(fill_px, 2),
+                    }, live=live)
+                    print(
+                        f"[{datetime.now().isoformat()}] STOP UNCONFIRMED "
+                        f"{spread.candidate.short_strike} net {net_before}→{net_after} "
+                        f"(expected +{spread.contracts})"
+                    )
+                    continue
         spread.stop_fill_price = fill_px
         newly_stopped.append(spread)
         log_event(
@@ -1141,6 +1177,7 @@ def manage_stops(
                 "contracts": spread.contracts,
                 "dry": dry,
             },
+            live=live,
         )
         print(
             f"[{datetime.now().isoformat()}] STOP short {spread.candidate.short_strike} "
@@ -1303,13 +1340,70 @@ def flatten_all(
 # --------------------------------------------------------------------------- #
 # Logging / session snapshot
 # --------------------------------------------------------------------------- #
-def log_event(today: str, event: dict) -> None:
+def log_event(today: str, event: dict, *, live: Optional[LiveConfig] = None) -> None:
     day_dir = LIVE_DIR / today
     day_dir.mkdir(parents=True, exist_ok=True)
     path = day_dir / "fills.jsonl"
     event = {"ts": datetime.now().isoformat(), **event}
     with path.open("a", encoding="utf-8") as handle:
         handle.write(json.dumps(event) + "\n")
+    cfg = live or ACTIVE
+    if bool(getattr(cfg, "slack_notify_enabled", True)):
+        maybe_notify_safety_event(
+            str(event.get("event") or ""),
+            event,
+            enabled=True,
+        )
+
+
+def _short_leg_ib_net(ib: "IB", candidate: CandidateRecord, today: str) -> Optional[int]:
+    """Signed IB net for the short leg (short < 0). None if IB unavailable."""
+    try:
+        nets = fetch_ib_spxw_positions(ib, today)
+    except Exception:
+        return None
+    right = "P" if candidate.short_type == "PUT" else "C"
+    expiry = today.replace("-", "")
+    key = LegKey(right=right, strike=float(candidate.short_strike), expiry=expiry)
+    return int(nets.get(key, 0))
+
+
+def run_flatten_audit(
+    ib: Optional["IB"],
+    today: str,
+    *,
+    dry: bool,
+    live: LiveConfig,
+) -> dict:
+    """Post-flatten / session audit: IB should show no SPXW residual."""
+    if dry or ib is None or not HAS_IB:
+        payload = {"event": "flatten_audit", "ib_flat": True, "residual_ib_lots": 0, "dry": True}
+        log_event(today, payload, live=live)
+        return payload
+    try:
+        nets = fetch_ib_spxw_positions(ib, today)
+    except Exception as exc:
+        payload = {
+            "event": "flatten_audit",
+            "ib_flat": False,
+            "residual_ib_lots": -1,
+            "error": repr(exc),
+        }
+        log_event(today, payload, live=live)
+        return payload
+    residual = sum(abs(v) for v in nets.values())
+    payload = {
+        "event": "flatten_audit",
+        "ib_flat": residual == 0,
+        "residual_ib_lots": residual,
+    }
+    log_event(today, payload, live=live)
+    if residual > 0:
+        print(
+            f"[{datetime.now().isoformat()}] FLATTEN AUDIT FAIL — "
+            f"IB still shows {residual} SPXW lot(s)"
+        )
+    return payload
 
 
 def log_tranche(today: str, record: dict) -> None:
@@ -1399,9 +1493,12 @@ def _process_tranche(
     provider: Optional["IBSignalProvider"] = None,
     pending_entry: Optional[PendingEntry] = None,
     side_stop_cooldown_until: Optional[Dict[str, datetime]] = None,
+    side_stop_counts: Optional[Dict[str, int]] = None,
     vix_sizing_multiplier: float = 1.0,
 ) -> Tuple[int, float, float, float, Optional[PendingEntry], str]:
     """Evaluate one entry tranche; log diagnostics; submit any selected spreads."""
+    stop_counts = side_stop_counts if side_stop_counts is not None else {}
+    cooldown_map = side_stop_cooldown_until if side_stop_cooldown_until is not None else {}
     if pending_entry is not None and not dry:
         cancelled_cand = pending_entry.candidate
         cancel_pending_entry(ib, pending_entry, today, reason="new_tranche", dry=dry)
@@ -1467,11 +1564,9 @@ def _process_tranche(
     for cand in selected:
         if cand.short_quote is None or cand.long_quote is None:
             continue
-        cooldown_reason = ""
-        if side_stop_cooldown_until is not None:
-            cooldown_reason = side_stop_cooldown_block_reason(
-                cand.side, now, config, side_stop_cooldown_until
-            )
+        cooldown_reason = side_stop_cooldown_block_reason(
+            cand.side, now, config, cooldown_map
+        )
         if cooldown_reason:
             cand.status = "blocked"
             cand.reason = cooldown_reason
@@ -1481,7 +1576,26 @@ def _process_tranche(
                 "short_strike": cand.short_strike,
                 "long_strike": cand.long_strike,
                 "reason": cooldown_reason,
-            })
+            }, live=live)
+            continue
+        risk_reason = live_entry_risk_block(
+            cand,
+            open_spreads,
+            now=now,
+            config=config,
+            side_stop_cooldown_until=cooldown_map,
+            side_stop_counts=stop_counts,
+        )
+        if risk_reason:
+            cand.status = "blocked"
+            cand.reason = risk_reason
+            log_event(today, {
+                "event": "entry_blocked",
+                "side": cand.side,
+                "short_strike": cand.short_strike,
+                "long_strike": cand.long_strike,
+                "reason": risk_reason,
+            }, live=live)
             continue
         contracts = _size_with_caps(
             cand, config, gross_credit_sold + credit_added,
@@ -1492,6 +1606,43 @@ def _process_tranche(
             cand.status = "blocked"
             cand.reason = "risk_blocked_size_cap"
             continue
+        cap_reason = open_risk_block_reason(
+            cand,
+            open_spreads,
+            contracts=contracts,
+            max_open_contracts=live.max_open_contracts,
+            max_open_per_side=live.max_open_per_side,
+            max_open_same_strike=live.max_open_same_strike,
+        )
+        if cap_reason:
+            cand.status = "blocked"
+            cand.reason = cap_reason
+            log_event(today, {
+                "event": "entry_blocked",
+                "side": cand.side,
+                "short_strike": cand.short_strike,
+                "long_strike": cand.long_strike,
+                "reason": cap_reason,
+                "contracts": contracts,
+            }, live=live)
+            continue
+        if live.use_pre_entry_buying_power and ib is not None and not dry and HAS_IB:
+            acct = fetch_account_snapshot(ib)
+            need = candidate_margin_per_contract(cand, config) * contracts
+            bp = acct.buying_power
+            if bp is None or bp < need:
+                cand.status = "blocked"
+                cand.reason = "buying_power"
+                log_event(today, {
+                    "event": "entry_blocked",
+                    "side": cand.side,
+                    "short_strike": cand.short_strike,
+                    "long_strike": cand.long_strike,
+                    "reason": "buying_power",
+                    "buying_power": bp,
+                    "needed": round(need, 2),
+                }, live=live)
+                continue
 
         spread, pending, block = submit_spread_entry(
             ib,
@@ -1592,10 +1743,14 @@ def run(live: LiveConfig = ACTIVE) -> None:
         raise SystemExit("live mode requires allow_live=True in LiveConfig (safety interlock).")
 
     config, sizing_schedule = resolve_strategy_config(live)
+    config = apply_live_risk_overlays(config, live)
     today_date = datetime.now().date()
     today = today_date.isoformat()
     dry = live.mode == "dry"
     needs_signals = gates_require_signals(config)
+    if live.mode == "live":
+        # Fail loud if OPRA/index missing — never silently weaken quote guards.
+        live.auto_fallback_delayed = False
 
     # Single-instance lock before any IB work so two executors cannot share a day.
     lock_path = acquire_executor_lock(today)
@@ -1786,20 +1941,23 @@ def run(live: LiveConfig = ACTIVE) -> None:
         entries_halted = governor.entries_halted
         flattened = governor.flattened
         side_stop_cooldown_until: Dict[str, datetime] = dict(governor.side_stop_cooldown_until)
+        side_stop_counts: Dict[str, int] = recover_side_stop_counts(fills_events)
         for warn in governor.warnings:
             print(f"[{datetime.now().isoformat()}] GOVERNOR WARN: {warn}")
-        if entries_halted or flattened or side_stop_cooldown_until:
+        if entries_halted or flattened or side_stop_cooldown_until or side_stop_counts:
             print(
                 f"[{datetime.now().isoformat()}] governor recovered — "
                 f"halted={entries_halted} flattened={flattened} "
-                f"cooldowns={list(side_stop_cooldown_until)}"
+                f"cooldowns={list(side_stop_cooldown_until)} "
+                f"stop_counts={side_stop_counts}"
             )
             log_event(today, {
                 "event": "governor_recovered",
                 "entries_halted": entries_halted,
                 "flattened": flattened,
                 "cooldowns": {k: v.isoformat() for k, v in side_stop_cooldown_until.items()},
-            })
+                "side_stop_counts": side_stop_counts,
+            }, live=live)
         if flattened and open_spreads and ib is not None and not dry:
             raise SystemExit(
                 "fills.jsonl shows a prior flatten but open SPXW risk remains. "
@@ -1829,6 +1987,8 @@ def run(live: LiveConfig = ACTIVE) -> None:
         last_account_guard_at = datetime.now() - timedelta(seconds=live.account_guard_poll_seconds)
         mark_bad_since: Optional[datetime] = None
         disconnect_halt = False
+        stale_tracker = StaleQuoteTracker()
+        last_heartbeat_at = datetime.now() - timedelta(seconds=live.heartbeat_seconds)
         ib_port = live.port or (7497 if live.mode == "paper" else 7496)
         ib_provider: Optional[IBSignalProvider] = None
         if isinstance(provider, IBSignalProvider):
@@ -1851,7 +2011,15 @@ def run(live: LiveConfig = ACTIVE) -> None:
                 "closed": fres.closed,
                 "failed": fres.failed,
                 "residual_ib_lots": fres.residual_ib_lots,
-            })
+            }, live=live)
+            if not fres.complete:
+                log_event(today, {
+                    "event": "flatten_incomplete",
+                    "reason": reason,
+                    "residual_ib_lots": fres.residual_ib_lots,
+                    "failed": fres.failed,
+                }, live=live)
+            run_flatten_audit(ib, today, dry=dry, live=live)
             return fres
 
         try:
@@ -1869,7 +2037,7 @@ def run(live: LiveConfig = ACTIVE) -> None:
                         "event": "kill_switch",
                         "scope": kill_hit.scope,
                         "path": str(kill_hit.path),
-                    })
+                    }, live=live)
                     _trigger_flatten("kill_switch", last_marked_pnl)
                     raise SystemExit(f"KILL switch activated ({kill_hit.path})")
 
@@ -1885,7 +2053,7 @@ def run(live: LiveConfig = ACTIVE) -> None:
                     disconnect_halt = True
                     entries_halted = True
                     print(f"[{now.isoformat()}] IB DISCONNECTED — halting entries, reconnecting…")
-                    log_event(today, {"event": "ib_disconnected"})
+                    log_event(today, {"event": "ib_disconnected"}, live=live)
                     cancel_pending_entry(ib, pending_entry, today, reason="disconnect", dry=dry)
                     pending_entry = None
                     if ib_provider is not None:
@@ -1913,7 +2081,7 @@ def run(live: LiveConfig = ACTIVE) -> None:
                         "attempts": outcome.attempts,
                         "elapsed_seconds": round(outcome.elapsed_seconds, 2),
                         "reason": outcome.reason,
-                    })
+                    }, live=live)
                     if not outcome.connected:
                         open_risk = [s for s in open_spreads if not s.closed]
                         if open_risk:
@@ -2011,16 +2179,55 @@ def run(live: LiveConfig = ACTIVE) -> None:
                         side_stop_cooldown_until=side_stop_cooldown_until,
                     )
                     for spread in newly_stopped:
+                        side = spread.candidate.side
+                        side_stop_counts[side] = side_stop_counts.get(side, 0) + 1
                         log_event(today, {
                             "event": "side_stop_cooldown_start",
-                            "side": spread.candidate.side,
+                            "side": side,
                             "minutes": config.same_side_stop_cooldown_minutes,
                             "until": (
-                                side_stop_cooldown_until[spread.candidate.side].isoformat()
-                                if spread.candidate.side in side_stop_cooldown_until
+                                side_stop_cooldown_until[side].isoformat()
+                                if side in side_stop_cooldown_until
                                 else None
                             ),
-                        })
+                        }, live=live)
+
+                # --- Stale-quote halt (entries only; never flatten on stale) -----
+                quote_age_fn = None
+                if ib_provider is not None:
+                    quote_age_fn = ib_provider._stream.quote_age_seconds
+                stale = evaluate_stale_quotes(
+                    stale_tracker,
+                    open_spreads,
+                    quotes,
+                    live=live,
+                    quote_age_fn=quote_age_fn,
+                )
+                if stale.confirmed and not entries_halted:
+                    entries_halted = True
+                    print(
+                        f"[{now.isoformat()}] HALT (stale quotes ×{stale.consecutive}) — "
+                        f"{', '.join(stale.stale_legs[:4])}"
+                    )
+                    log_event(today, {
+                        "event": "halt_entries",
+                        "reason": "stale_quotes",
+                        "consecutive": stale.consecutive,
+                        "stale_legs": stale.stale_legs,
+                        "threshold": stale.threshold_used,
+                    }, live=live)
+
+                # --- Heartbeat for local watchdog --------------------------------
+                if (now - last_heartbeat_at).total_seconds() >= live.heartbeat_seconds:
+                    last_heartbeat_at = now
+                    open_n = sum(1 for s in open_spreads if not s.closed)
+                    write_heartbeat(
+                        today,
+                        open_count=open_n,
+                        marked_pnl=last_marked_pnl,
+                        entries_halted=entries_halted,
+                        flattened=flattened,
+                    )
 
                 # --- Phase B: periodic NetLiq overlay -----------------------------
                 if (
@@ -2050,7 +2257,7 @@ def run(live: LiveConfig = ACTIVE) -> None:
                             "detail": loop_guard.reason,
                             "net_liquidation": acct.net_liquidation,
                             "buying_power": acct.buying_power,
-                        })
+                        }, live=live)
                     if loop_guard.flatten and not flattened:
                         print(f"[{now.isoformat()}] FLATTEN (account guard): {loop_guard.reason}")
                         _trigger_flatten("account_guard", last_marked_pnl)
@@ -2069,7 +2276,7 @@ def run(live: LiveConfig = ACTIVE) -> None:
                         log_event(today, {
                             "event": "halt_entries",
                             "marked_pnl": round(mark.pnl, 2),
-                        })
+                        }, live=live)
                     if (
                         config.flatten_on_daily_loss
                         and not flattened
@@ -2102,7 +2309,7 @@ def run(live: LiveConfig = ACTIVE) -> None:
                                 "reason": f"mark_{mark.quality}",
                                 "missing_count": mark.missing_count,
                                 "open_count": mark.open_count,
-                            })
+                            }, live=live)
                     bad_age = (now - mark_bad_since).total_seconds() if mark_bad_since else 0.0
                     if (
                         mark.quality == "unavailable"
@@ -2124,7 +2331,7 @@ def run(live: LiveConfig = ACTIVE) -> None:
                                 "event": "halt_entries",
                                 "marked_pnl": round(mark.pnl, 2),
                                 "reason": "partial_mark",
-                            })
+                            }, live=live)
 
                 if at_tranche:
                     tranche_key = (now.hour, now.minute)
@@ -2148,6 +2355,7 @@ def run(live: LiveConfig = ACTIVE) -> None:
                         provider=ib_provider,
                         pending_entry=pending_entry,
                         side_stop_cooldown_until=side_stop_cooldown_until,
+                        side_stop_counts=side_stop_counts,
                         vix_sizing_multiplier=vix_sizing_mult,
                     )
                     gross_credit_sold += credit_added
@@ -2172,13 +2380,14 @@ def run(live: LiveConfig = ACTIVE) -> None:
             raise
         except Exception as exc:
             print(f"[{datetime.now().isoformat()}] ERROR: {exc!r} -- flattening and exiting.")
-            log_event(today, {"event": "error_flatten", "error": repr(exc)})
+            log_event(today, {"event": "error_flatten", "error": repr(exc)}, live=live)
             cancel_pending_entry(ib, pending_entry, today, reason="error", dry=dry)
             pending_entry = None
             if not dry:
                 flatten_all(
                     ib, [s for s in open_spreads if not s.closed], today, dry, live=live,
                 )
+                run_flatten_audit(ib, today, dry=dry, live=live)
             raise
 
         # End of day: SPXW 0DTE is cash-settled on the close, so open defined-risk
@@ -2186,6 +2395,8 @@ def run(live: LiveConfig = ACTIVE) -> None:
         # the governor or an error flattens early.
         if last_quotes:
             last_marked_pnl = _mark_book(open_spreads, last_quotes, config).pnl
+        if flattened:
+            run_flatten_audit(ib, today, dry=dry, live=live)
         log_event(today, {
             "event": "session_end",
             "spreads": len(open_spreads),
@@ -2193,7 +2404,7 @@ def run(live: LiveConfig = ACTIVE) -> None:
             "flattened": flattened,
             "gross_credit_sold": round(gross_credit_sold, 2),
             "marked_pnl": round(last_marked_pnl, 2),
-        })
+        }, live=live)
         print(f"[{datetime.now().isoformat()}] session end. spreads={len(open_spreads)} "
               f"stopped={sum(1 for s in open_spreads if s.stopped)} "
               f"gross_credit=${gross_credit_sold:,.0f} marked_pnl=${last_marked_pnl:,.0f}")

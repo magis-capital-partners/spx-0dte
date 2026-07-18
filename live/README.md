@@ -112,11 +112,62 @@ Also cancels orphan working SPXW/BAG orders from a crashed prior run. Do **not**
 
 | Control | Behavior |
 |---------|----------|
-| **KILL file** | Create `data/live/KILL` or `data/live/<date>/KILL` — executor flattens (with fill confirm) and exits. Present at startup → refuse to start until removed. |
-| **Account overlay** | PnL halt/flatten still use configured `account_equity`. Startup requires IB NetLiq ≥ equity and BuyingPower ≥ 15% of equity. Loop halts entries if NetLiq < 90% of equity. |
+| **KILL file** | Create `data/live/KILL` or `data/live/<date>/KILL` — executor flattens (with fill confirm) and exits. Present at startup → refuse to start until removed. Portable: works on whichever host runs the session. |
+| **Account overlay** | PnL halt/flatten still use configured `account_equity`. Startup requires IB NetLiq ≥ equity and BuyingPower ≥ 15% of equity. Loop halts entries if NetLiq < 90% of equity. Pre-entry BP check vs estimated margin. |
 | **Disconnect breaker** | On IB disconnect: halt entries, reconnect with backoff (default 120s budget), re-arm native STPs, re-verify book. Failure with open risk → confirmed flatten then exit. |
 | **Mark integrity** | Missing quotes on open risk → halt entries (never treat as $0 PnL). Unavailable marks for 60s → flatten. |
-| **Flatten confirm** | MKT close waits for fill (retry once); only marks `closed` on fill; logs `flatten_incomplete` if IB residual remains. |
+| **Stale quotes** | 3 consecutive polls with short-leg age >20s (10s near stop) → **halt entries only** (never flatten on stale alone). |
+| **Open-risk caps** | Max 6 open contracts / 3 per side / 2 same strike (live overlay). |
+| **Live stop caps** | Max 2 stops/side and 4/day via `entry_risk_block_reason` (profile 999 overridden). |
+| **Flatten confirm + audit** | MKT close waits for fill; `flatten_audit` checks IB flat afterward. |
+| **Stop confirm** | After synthetic stop fill, verify IB short qty dropped; else `stop_unconfirmed` and keep managing. |
+| **Live mode data** | `mode=live` forces `auto_fallback_delayed=False` (no silent delayed downgrade). |
+
+### Slack + local watchdog (portable across machines)
+
+Kill/watchdog stay **local to the host running the executor**. Slack reaches any phone/PC.
+
+```powershell
+$env:SPX_SLACK_WEBHOOK_URL = "https://hooks.slack.com/services/XXX/YYY/ZZZ"
+python live/ib_executor.py
+# Same machine, second terminal:
+.\scripts\run_live_watchdog.ps1
+# Optional: write session KILL if heartbeat dies with open risk
+.\scripts\run_live_watchdog.ps1 -WriteKill
+```
+
+Heartbeat: `data/live/<date>/heartbeat.json` (updated every `heartbeat_seconds`).
+
+**KILL one-liners**
+
+```powershell
+# Windows
+echo. > data\live\KILL
+# or session-scoped:
+echo. > data\live\YYYY-MM-DD\KILL
+```
+
+```bash
+# macOS / Linux
+touch data/live/KILL
+```
+
+### IB Precautionary Settings (TWS / Gateway)
+
+Configure in the brokerage UI on every machine you trade from:
+
+1. **API** — enable socket clients; trusted IP `127.0.0.1`; read-only API **off** for the trading user.
+2. **Precautionary** — max order size ≥ pilot (e.g. 5); max daily loss aligned with flatten (~3.25% of configured equity); outside RTH **off** for SPXW.
+3. **Market data** — OPRA + US index for live; paper may use delayed only if you accept weaker entry guards.
+4. Confirm paper vs live port (7497 / 7496) matches `LiveConfig.mode`.
+
+### Paper soak
+
+See [`scripts/paper_soak_checklist.md`](../scripts/paper_soak_checklist.md). Verify:
+
+```powershell
+python scripts/verify_soak_events.py --date YYYY-MM-DD --expect kill,flatten,governor
+```
 
 Manual reconcile (dual-scale: paper equity + normalized $13M):
 
@@ -147,8 +198,11 @@ python live/ib_executor.py
 | `entry_ladder_step` | `0.05` | Extra concession per ladder step (every 60s) |
 | `entry_require_live_nbbo` | `True` | Reject crossed/missing NBBO on entry |
 
-**Delayed fallback** (no OPRA subs): `market_data_type=3`, `auto_fallback_delayed=True`,
+**Delayed fallback (paper only):** `market_data_type=3`, `auto_fallback_delayed=True`,
 `delayed_quote_fallback=True`, `entry_require_live_nbbo=False`.
+**Live mode never auto-falls back to delayed.**
+
+Enable portfolio allocator when sizing up: `use_portfolio_allocator_live=True`.
 
 Backtest parity: production profile includes `entry_fill_slippage=0.05` matching
 `entry_limit_concession`.
@@ -166,6 +220,11 @@ python live/test_account_guards.py
 python live/test_ib_connection.py
 python live/test_mark_book.py
 python live/test_flatten_confirm.py
+python live/test_stale_quotes.py
+python live/test_open_risk_caps.py
+python live/test_slack_notify.py
+python live/test_heartbeat_watchdog.py
+python live/test_live_entry_risk.py
 python simulator/test_profile_regression.py
 python simulator/test_live_signal_parity.py
 python simulator/reconcile_live.py --date YYYY-MM-DD

@@ -138,8 +138,31 @@ class LiveConfig:
     reconnect_initial_backoff: float = 2.0
     reconnect_max_backoff: float = 30.0
 
+    # --- Next-wave safeties ------------------------------------------------- #
+    # Stale-quote halt (entries only; never flatten on stale alone).
+    stale_quote_confirm_polls: int = 3
+    stale_quote_halt_seconds: float = 20.0
+    stale_quote_near_stop_seconds: float = 10.0
+    # Open-risk caps (live overlay; independent of backtest credit cap).
+    max_open_contracts: int = 6
+    max_open_per_side: int = 3
+    max_open_same_strike: int = 2
+    # Live stop-count caps (production profile uses 999; tighten here).
+    live_max_stops_per_side: int = 2
+    live_max_stops_per_day: int = 4
+    # Slack alerts via SPX_SLACK_WEBHOOK_URL (no-op if unset).
+    slack_notify_enabled: bool = True
+    # Heartbeat for local watchdog (same machine as executor).
+    heartbeat_seconds: float = 5.0
+    # Enable portfolio margin allocator when sizing up past pilot.
+    use_portfolio_allocator_live: bool = False
+    # Confirm synthetic stop against IB short-leg qty after fill.
+    confirm_stop_against_ib: bool = True
+    # Pre-entry buying-power check vs estimated margin.
+    use_pre_entry_buying_power: bool = True
+
 
 # Default: prefer live OPRA (type 1) with auto-fallback to delayed (type 3).
-# For strict real-time only (fail if no subs): auto_fallback_delayed=False.
-# Delayed-only: market_data_type=3, entry_require_live_nbbo=False, delayed_quote_fallback=True.
+# Live mode forces auto_fallback_delayed=False at runtime.
+# Delayed-only paper: market_data_type=3, entry_require_live_nbbo=False, delayed_quote_fallback=True.
 ACTIVE = LiveConfig()

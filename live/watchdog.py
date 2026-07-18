@@ -1,0 +1,133 @@
+"""Portable local watchdog: same machine as the executor.
+
+Monitors ``executor.lock`` + ``heartbeat.json``. Alerts via Slack when the
+executor dies or heartbeats stall while open risk remains. Optionally writes
+a local KILL file.
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import sys
+import time
+from datetime import date, datetime
+from pathlib import Path
+from typing import Optional
+
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT / "live"))
+
+from heartbeat import heartbeat_age_seconds, read_heartbeat  # noqa: E402
+from kill_switch import kill_paths  # noqa: E402
+from session_recovery import _pid_alive, lock_path_for  # noqa: E402
+from slack_notify import notify_slack  # noqa: E402
+
+LIVE_DIR = ROOT / "data" / "live"
+
+
+def evaluate_watchdog(
+    today: str,
+    *,
+    max_heartbeat_age: float = 30.0,
+    live_dir: Path = LIVE_DIR,
+    now: Optional[datetime] = None,
+) -> Optional[str]:
+    """Return an alert reason, or None if healthy / nothing to watch."""
+    clock = now or datetime.now()
+    lock = lock_path_for(today, live_dir=live_dir)
+    hb = read_heartbeat(today, live_dir=live_dir)
+
+    lock_pid = None
+    if lock.is_file():
+        try:
+            lock_pid = int(json.loads(lock.read_text(encoding="utf-8")).get("pid", -1))
+        except Exception:
+            lock_pid = -1
+
+    if hb is None and lock_pid is None:
+        return None  # no session
+
+    open_count = int((hb or {}).get("open_count") or 0)
+    age = heartbeat_age_seconds(hb, now=clock) if hb else None
+
+    if lock_pid is not None and lock_pid > 0 and not _pid_alive(lock_pid):
+        if open_count > 0 or hb is None:
+            return f"executor_pid_dead pid={lock_pid} open_count={open_count}"
+        return None
+
+    if open_count > 0 and age is not None and age > max_heartbeat_age:
+        return f"heartbeat_stale age={age:.0f}s open_count={open_count}"
+
+    if open_count > 0 and hb is None and lock_pid is not None:
+        return f"missing_heartbeat open_count_unknown lock_pid={lock_pid}"
+
+    return None
+
+
+def run_watchdog_loop(
+    *,
+    today: str,
+    poll_seconds: float = 10.0,
+    max_heartbeat_age: float = 30.0,
+    write_kill: bool = False,
+    live_dir: Path = LIVE_DIR,
+) -> None:
+    print(
+        f"[{datetime.now().isoformat()}] watchdog watching {today} "
+        f"(max_age={max_heartbeat_age}s, write_kill={write_kill})"
+    )
+    alerted = False
+    while True:
+        reason = evaluate_watchdog(
+            today, max_heartbeat_age=max_heartbeat_age, live_dir=live_dir
+        )
+        if reason and not alerted:
+            msg = f"[spx-0dte] watchdog_alert — {reason} date={today}"
+            print(f"[{datetime.now().isoformat()}] {msg}")
+            notify_slack(msg, enabled=True)
+            if write_kill:
+                global_kill, session_kill = kill_paths(today, live_dir=live_dir)
+                session_kill.parent.mkdir(parents=True, exist_ok=True)
+                session_kill.write_text(f"watchdog: {reason}\n", encoding="utf-8")
+                print(f"[{datetime.now().isoformat()}] wrote KILL → {session_kill}")
+            alerted = True
+        elif not reason:
+            alerted = False
+        time.sleep(poll_seconds)
+
+
+def main(argv: Optional[list] = None) -> int:
+    parser = argparse.ArgumentParser(description="Local live executor watchdog")
+    parser.add_argument("--date", default=date.today().isoformat())
+    parser.add_argument("--poll-seconds", type=float, default=10.0)
+    parser.add_argument("--max-heartbeat-age", type=float, default=30.0)
+    parser.add_argument(
+        "--write-kill",
+        action="store_true",
+        help="Write data/live/<date>/KILL when an alert fires",
+    )
+    parser.add_argument("--once", action="store_true", help="Evaluate once and exit")
+    args = parser.parse_args(argv)
+
+    if args.once:
+        reason = evaluate_watchdog(
+            args.date, max_heartbeat_age=args.max_heartbeat_age
+        )
+        if reason:
+            print(reason)
+            notify_slack(f"[spx-0dte] watchdog_alert — {reason}", enabled=True)
+            return 1
+        print("ok")
+        return 0
+
+    run_watchdog_loop(
+        today=args.date,
+        poll_seconds=args.poll_seconds,
+        max_heartbeat_age=args.max_heartbeat_age,
+        write_kill=args.write_kill,
+    )
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -131,8 +131,14 @@ class IBStreamingMarketData:
         return _spot_from_ticker(ticker)
 
     def _resolve_market_data_access(self) -> None:
-        """Probe SPX quote; optionally auto-fallback live (1) -> delayed (3)."""
+        """Probe SPX quote; optionally auto-fallback live (1) -> delayed (3).
+
+        Live mode never falls back to delayed — fail loud if OPRA/index missing.
+        """
         requested = self.live.market_data_type
+        allow_fallback = bool(self.live.auto_fallback_delayed)
+        if getattr(self.live, "mode", "") == "live":
+            allow_fallback = False
         self.ib.reqMarketDataType(requested)
         self._effective_market_data_type = requested
         self._delayed_fallback = (
@@ -146,11 +152,13 @@ class IBStreamingMarketData:
             )
             return
 
-        if not self.live.auto_fallback_delayed:
+        if not allow_fallback:
             raise RuntimeError(
                 _MARKET_DATA_HELP
                 + "\n"
-                f"Probe failed with market_data_type={requested} and auto_fallback_delayed=False."
+                f"Probe failed with market_data_type={requested} and "
+                f"auto_fallback_delayed=False"
+                + (" (forced for live mode)." if getattr(self.live, "mode", "") == "live" else ".")
             )
 
         if requested != 3:
