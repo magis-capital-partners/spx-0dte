@@ -161,6 +161,22 @@ Configure in the brokerage UI on every machine you trade from:
 3. **Market data** — OPRA + US index for live; paper may use delayed only if you accept weaker entry guards.
 4. Confirm paper vs live port (7497 / 7496) matches `LiveConfig.mode`.
 
+### Running on another computer
+
+The executor is portable, but each host needs its own local stack. Code alone is not enough:
+
+1. **Repo** — `git pull` on that machine.
+2. **Python deps** — same env (`ib_insync`, etc.).
+3. **IB Gateway / TWS** — installed, logged into paper or live, API enabled, correct port (7497 paper / 7496 live).
+4. **Market data** — OPRA + US index on that IB account (live mode will **not** fall back to delayed).
+5. **Signal baselines** — `python scripts/refresh_live_baselines.py` (and VIX calendar if used).
+6. **Slack (optional)** — set `SPX_SLACK_WEBHOOK_URL` in that machine’s shell/user environment.
+7. **Watchdog** — start `.\scripts\run_live_watchdog.ps1` on the **same** machine as the executor.
+8. **TWS precautionary settings** — redo max order size / daily loss / outside-RTH on that install (see above).
+9. **One host only** — do not run two executors against the same account at once.
+
+Kill files, heartbeat, and the executor lock live under that machine’s `data/live/` and do **not** sync between PCs (by design). Slack is what notifies you wherever you are.
+
 ### Paper soak
 
 See [`scripts/paper_soak_checklist.md`](../scripts/paper_soak_checklist.md). Verify:
