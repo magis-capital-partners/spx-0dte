@@ -74,7 +74,7 @@ python scripts/download_vix_daily.py   # optional; auto-refreshes if today's row
 |-------|-------|---------|
 | `mode` | `"paper"` | Routes orders to paper account (port 7497) |
 | `market_data_type` | `1` | Live/real-time quotes (not 15-min delayed) |
-| `auto_fallback_delayed` | `False` | Fail loudly if subs missing (no silent downgrade) |
+| `auto_fallback_delayed` | `True` | Falls back to delayed if live subs missing (set `False` for strict OPRA) |
 | `delayed_quote_fallback` | `False` | Do not synthesize bid/ask from last/mid |
 | `entry_require_live_nbbo` | `True` | Block entries on crossed or missing NBBO |
 
@@ -103,9 +103,20 @@ The executor now:
 
 1. **Single-instance lock** — `data/live/<date>/executor.lock` (PID). A second process exits unless the prior PID is dead.
 2. **Book recovery** — rebuilds `open_spreads` from today's `fills.jsonl` (entries minus stops/flatten) and resumes stop/flatten management.
-3. **Fail loud** — if IB shows SPXW option risk that does not match the recovered book, startup exits with the residual legs printed. Flatten/reconcile in TWS, then restart.
+3. **Governor recovery** — restores `entries_halted`, `flattened`, and same-side cooldowns from `fills.jsonl` so a restart cannot resume selling after a halt/flatten.
+4. **Fail loud** — if IB shows SPXW option risk that does not match the recovered book, startup exits with the residual legs printed. Flatten/reconcile in TWS, then restart.
 
 Also cancels orphan working SPXW/BAG orders from a crashed prior run. Do **not** start a second executor mid-session; if you must restart, use one process only and let recovery reload the book.
+
+### Operator safeties
+
+| Control | Behavior |
+|---------|----------|
+| **KILL file** | Create `data/live/KILL` or `data/live/<date>/KILL` — executor flattens (with fill confirm) and exits. Present at startup → refuse to start until removed. |
+| **Account overlay** | PnL halt/flatten still use configured `account_equity`. Startup requires IB NetLiq ≥ equity and BuyingPower ≥ 15% of equity. Loop halts entries if NetLiq < 90% of equity. |
+| **Disconnect breaker** | On IB disconnect: halt entries, reconnect with backoff (default 120s budget), re-arm native STPs, re-verify book. Failure with open risk → confirmed flatten then exit. |
+| **Mark integrity** | Missing quotes on open risk → halt entries (never treat as $0 PnL). Unavailable marks for 60s → flatten. |
+| **Flatten confirm** | MKT close waits for fill (retry once); only marks `closed` on fill; logs `flatten_incomplete` if IB residual remains. |
 
 Manual reconcile (dual-scale: paper equity + normalized $13M):
 
@@ -150,6 +161,11 @@ python live/test_loop_timing.py
 python live/test_entry_execution.py
 python live/test_ib_order_hygiene.py
 python live/test_session_recovery.py
+python live/test_kill_switch.py
+python live/test_account_guards.py
+python live/test_ib_connection.py
+python live/test_mark_book.py
+python live/test_flatten_confirm.py
 python simulator/test_profile_regression.py
 python simulator/test_live_signal_parity.py
 python simulator/reconcile_live.py --date YYYY-MM-DD

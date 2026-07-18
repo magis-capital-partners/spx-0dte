@@ -67,9 +67,20 @@ class LiveConfig:
     stop_limit_slippage_abs: float = 0.15
     stop_limit_timeout_seconds: float = 3.0
     stop_near_fraction: float = 0.80
-    # Native STP on the short leg conflicts with scale-in (IB error 201). Synthetic
-    # stops in the run loop are primary; leave this False unless you never add size
-    # at the same short strike across tranches.
+    # Cancel → add → replace native BUY STP on the short leg at strategy 3×.
+    # Synthetic loop stops remain primary while the executor is healthy; native
+    # STP is the backstop if the process/loop dies. Before a same-strike combo
+    # add, existing STPs are cancelled (IB error 201), then replaced for the
+    # aggregated short qty after fill — or re-armed immediately on reject.
+    use_native_stop_replace: bool = True
+    # None → StrategyConfig.stop_multiple (production 3.0). Override only for tests.
+    native_stop_multiple: float | None = None
+    # Cap how long same-strike scale-ins may leave STPs disarmed (also caps
+    # pending work_until when adding onto an existing short).
+    native_stop_disarm_max_seconds: float = 45.0
+    # Re-check working STP still exists in IB; replace if cancelled/missing.
+    native_stop_verify_seconds: float = 30.0
+    # Legacy disaster-only STP at stop_price×1.5. Prefer use_native_stop_replace.
     use_native_stop_backstop: bool = False
 
     # --- Phase 5: entry execution ------------------------------------------- #
@@ -101,6 +112,31 @@ class LiveConfig:
     vix_elevated_scale: float = 1.25
     # Production profile also carries: FOMC 13:30 + IC overlay Δ0.16 / 10-lot (no VIX put-widen).
     # Those live on StrategyConfig from profiles.build_p3_poststop_cooldown_config.
+
+    # --- Safety overlays (Phases A–F) ---------------------------------------- #
+    # External KILL file: data/live/KILL or data/live/<date>/KILL
+    kill_switch_enabled: bool = True
+    # Account overlay: PnL governor still uses account_equity; these only gate
+    # that IB NetLiq / BuyingPower are sufficient to run the configured book.
+    use_account_guards: bool = True
+    netliq_min_ratio: float = 1.0          # startup: NetLiq >= equity × ratio
+    buying_power_min_ratio: float = 0.15   # startup: BP >= equity × ratio
+    netliq_halt_ratio: float = 0.90        # loop: halt entries if NetLiq < equity × ratio
+    netliq_flatten_ratio: float = 0.0      # loop flatten floor (0 = disabled)
+    flatten_on_netliq_breach: bool = False
+    account_guard_poll_seconds: float = 45.0
+    # Mark integrity: halt/flatten when open risk cannot be marked.
+    mark_degraded_halt: bool = True
+    mark_unavailable_halt_seconds: float = 15.0
+    mark_unavailable_flatten_seconds: float = 60.0
+    # Flatten confirmation
+    flatten_fill_timeout_seconds: float = 12.0
+    flatten_retry_mkt: bool = True
+    # Disconnect / reconnect circuit breaker
+    use_disconnect_breaker: bool = True
+    reconnect_max_seconds: float = 120.0
+    reconnect_initial_backoff: float = 2.0
+    reconnect_max_backoff: float = 30.0
 
 
 # Default: prefer live OPRA (type 1) with auto-fallback to delayed (type 3).

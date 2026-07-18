@@ -21,6 +21,7 @@ from session_recovery import (  # noqa: E402
     acquire_executor_lock,
     expected_leg_net_from_spreads,
     open_entry_events_from_fills,
+    recover_governor_state,
     recover_session_book,
     release_executor_lock,
     rebuild_open_spreads_from_entries,
@@ -163,6 +164,62 @@ class RecoverSessionBookTests(unittest.TestCase):
                 "IB has SPXW positions" in msg or "IB SPXW risk not explained" in msg,
                 msg,
             )
+
+
+class RecoverGovernorTests(unittest.TestCase):
+    def test_halt_and_flatten(self) -> None:
+        events = [
+            {"event": "halt_entries", "marked_pnl": -12000},
+            {"event": "flatten", "marked_pnl": -17000},
+        ]
+        gov = recover_governor_state(events)
+        self.assertTrue(gov.entries_halted)
+        self.assertTrue(gov.flattened)
+
+    def test_cooldown_from_explicit_event(self) -> None:
+        now = datetime(2026, 7, 18, 12, 0, 0)
+        events = [
+            {
+                "event": "side_stop_cooldown_start",
+                "side": "bear_call",
+                "until": "2026-07-18T13:30:00",
+            }
+        ]
+        gov = recover_governor_state(events, now=now, cooldown_minutes=120)
+        self.assertIn("bear_call", gov.side_stop_cooldown_until)
+        self.assertEqual(
+            gov.side_stop_cooldown_until["bear_call"],
+            datetime(2026, 7, 18, 13, 30, 0),
+        )
+
+    def test_cooldown_derived_from_stop(self) -> None:
+        now = datetime(2026, 7, 18, 11, 0, 0)
+        events = [
+            {
+                "event": "stop",
+                "side": "bull_put",
+                "ts": "2026-07-18T10:00:00",
+                "short_strike": 7400,
+                "long_strike": 7200,
+            }
+        ]
+        gov = recover_governor_state(events, now=now, cooldown_minutes=120)
+        self.assertEqual(
+            gov.side_stop_cooldown_until["bull_put"],
+            datetime(2026, 7, 18, 12, 0, 0),
+        )
+
+    def test_expired_cooldown_ignored(self) -> None:
+        now = datetime(2026, 7, 18, 14, 0, 0)
+        events = [
+            {
+                "event": "side_stop_cooldown_start",
+                "side": "bear_call",
+                "until": "2026-07-18T13:00:00",
+            }
+        ]
+        gov = recover_governor_state(events, now=now, cooldown_minutes=120)
+        self.assertEqual(gov.side_stop_cooldown_until, {})
 
 
 class ExecutorLockTests(unittest.TestCase):

@@ -10,7 +10,7 @@ import json
 import os
 import sys
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
@@ -37,6 +37,22 @@ class RecoveredBook:
     warnings: List[str] = None  # type: ignore[assignment]
 
     def __post_init__(self) -> None:
+        if self.warnings is None:
+            self.warnings = []
+
+
+@dataclass
+class RecoveredGovernor:
+    """Risk-governor flags restored from fills.jsonl after a mid-session restart."""
+
+    entries_halted: bool = False
+    flattened: bool = False
+    side_stop_cooldown_until: Dict[str, datetime] = None  # type: ignore[assignment]
+    warnings: List[str] = None  # type: ignore[assignment]
+
+    def __post_init__(self) -> None:
+        if self.side_stop_cooldown_until is None:
+            self.side_stop_cooldown_until = {}
         if self.warnings is None:
             self.warnings = []
 
@@ -171,6 +187,77 @@ def load_fills_events(today: str, live_dir: Path = LIVE_DIR) -> List[dict]:
         except json.JSONDecodeError:
             continue
     return events
+
+
+def _parse_event_ts(raw: object, fallback: datetime) -> datetime:
+    if raw is None:
+        return fallback
+    try:
+        return datetime.fromisoformat(str(raw).replace("Z", ""))
+    except ValueError:
+        return fallback
+
+
+def recover_governor_state(
+    events: Sequence[dict],
+    *,
+    now: Optional[datetime] = None,
+    cooldown_minutes: int = 0,
+) -> RecoveredGovernor:
+    """Rebuild halt/flatten/cooldown flags from persisted fill events.
+
+    - Any ``halt_entries`` → entries halted for the rest of the session.
+    - Any ``flatten`` / ``error_flatten`` / ``kill_switch`` → flattened + halted.
+    - ``side_stop_cooldown_start`` restores ``until`` when still in the future.
+    - Bare ``stop`` events derive cooldown as ``ts + cooldown_minutes`` when no
+      explicit cooldown event was logged (older sessions).
+    """
+    clock = now or datetime.now()
+    entries_halted = False
+    flattened = False
+    cooldowns: Dict[str, datetime] = {}
+    warnings: List[str] = []
+
+    for event in events:
+        name = event.get("event")
+        if name == "halt_entries":
+            entries_halted = True
+            continue
+        if name in {"flatten", "error_flatten", "kill_switch", "flatten_incomplete"}:
+            flattened = True
+            entries_halted = True
+            continue
+        if name == "side_stop_cooldown_start":
+            side = str(event.get("side") or "")
+            until_raw = event.get("until")
+            if side and until_raw:
+                until = _parse_event_ts(until_raw, clock)
+                if until > clock:
+                    prev = cooldowns.get(side)
+                    if prev is None or until > prev:
+                        cooldowns[side] = until
+            continue
+        if name == "stop" and cooldown_minutes > 0:
+            side = str(event.get("side") or "")
+            if not side:
+                continue
+            ts = _parse_event_ts(event.get("ts"), clock)
+            until = ts + timedelta(minutes=cooldown_minutes)
+            if until > clock:
+                prev = cooldowns.get(side)
+                if prev is None or until > prev:
+                    cooldowns[side] = until
+
+    if flattened and not entries_halted:
+        entries_halted = True
+        warnings.append("flattened implies entries_halted")
+
+    return RecoveredGovernor(
+        entries_halted=entries_halted,
+        flattened=flattened,
+        side_stop_cooldown_until=cooldowns,
+        warnings=warnings,
+    )
 
 
 def _spread_key(side: str, short_strike: float, long_strike: float) -> Tuple[str, float, float]:

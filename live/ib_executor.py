@@ -81,8 +81,22 @@ from vix_session import (  # noqa: E402
 )
 from session_recovery import (  # noqa: E402
     acquire_executor_lock,
+    fetch_ib_spxw_positions,
+    load_fills_events,
+    recover_governor_state,
     recover_session_book,
     release_executor_lock,
+)
+from kill_switch import check_kill_switch  # noqa: E402
+from account_guards import (  # noqa: E402
+    check_loop_account_guard,
+    check_startup_account_guard,
+    fetch_account_snapshot,
+)
+from ib_connection import (  # noqa: E402
+    format_reconnect_banner,
+    ib_is_connected,
+    reconnect_ib,
 )
 from expiry_calendar import DEFAULT_RULES, is_live_tradable_day, load_era_rules  # noqa: E402
 from profiles import schedule_multiplier  # noqa: E402
@@ -438,7 +452,7 @@ def _cancel_open_orders_on_short_leg(
 
 
 def cancel_stop_backstop(
-    ib: "IB",
+    ib: Optional["IB"],
     spread: OpenSpread,
     today: str,
     *,
@@ -446,7 +460,7 @@ def cancel_stop_backstop(
     reason: str = "",
 ) -> None:
     """Cancel the optional native STP backstop on the short leg."""
-    if dry or not HAS_IB or spread.stop_order_id is None:
+    if dry or not HAS_IB or ib is None or spread.stop_order_id is None:
         return
     order_id = spread.stop_order_id
     if _cancel_order_by_id(ib, order_id):
@@ -460,7 +474,7 @@ def cancel_stop_backstop(
 
 
 def clear_short_leg_backstops(
-    ib: "IB",
+    ib: Optional["IB"],
     candidate: CandidateRecord,
     open_spreads: Sequence[OpenSpread],
     today: str,
@@ -480,14 +494,17 @@ def clear_short_leg_backstops(
         if _same_short_leg(spread.candidate, candidate):
             cancel_stop_backstop(ib, spread, today, dry=dry, reason=reason)
 
-    if dry or not HAS_IB:
-        return
-
-    cancelled = _cancel_open_orders_on_short_leg(ib, candidate, today)
-    if cancelled:
+    if dry or not HAS_IB or ib is None:
         for spread in open_spreads:
             if not spread.closed and _same_short_leg(spread.candidate, candidate):
                 spread.stop_order_id = None
+        return
+
+    cancelled = _cancel_open_orders_on_short_leg(ib, candidate, today)
+    for spread in open_spreads:
+        if not spread.closed and _same_short_leg(spread.candidate, candidate):
+            spread.stop_order_id = None
+    if cancelled:
         log_event(today, {
             "event": "short_leg_orders_cancelled",
             "short_strike": candidate.short_strike,
@@ -495,6 +512,306 @@ def clear_short_leg_backstops(
             "count": cancelled,
             "reason": reason or "unspecified",
         })
+
+
+def native_stops_enabled(live: LiveConfig) -> bool:
+    return bool(live.use_native_stop_replace or live.use_native_stop_backstop)
+
+
+def active_spreads_on_short(
+    open_spreads: Sequence[OpenSpread],
+    candidate: CandidateRecord,
+) -> List[OpenSpread]:
+    """Open, unstopped verticals sharing this short option."""
+    return [
+        s
+        for s in open_spreads
+        if (
+            not s.closed
+            and not s.stopped
+            and s.contracts > 0
+            and s.stop_price > 0
+            and _same_short_leg(s.candidate, candidate)
+        )
+    ]
+
+
+def aggregated_native_stop_plan(
+    siblings: Sequence[OpenSpread],
+    live: LiveConfig,
+    config: StrategyConfig,
+) -> Tuple[int, float]:
+    """Total short qty and tightest BUY-stop trigger for an aggregated STP."""
+    if not siblings:
+        return 0, 0.0
+    total_qty = int(sum(s.contracts for s in siblings))
+    if live.use_native_stop_replace:
+        multiple = (
+            live.native_stop_multiple
+            if live.native_stop_multiple is not None
+            else config.stop_multiple
+        )
+        stop_px = min(s.short_entry_sell * multiple for s in siblings)
+    else:
+        # Legacy disaster backstop: wider than the synthetic 3×.
+        stop_px = min(s.stop_price * 1.5 for s in siblings)
+    return total_qty, _round_spx_premium(stop_px)
+
+
+def _order_still_working(ib: "IB", order_id: Optional[int]) -> bool:
+    if order_id is None or not HAS_IB:
+        return False
+    for trade in ib.openTrades():
+        if trade.order.orderId != order_id:
+            continue
+        status = _open_order_status(trade)
+        if status in {"filled", "cancelled", "inactive", "apicancelled"}:
+            return False
+        return True
+    return False
+
+
+def place_or_replace_native_stop_for_short(
+    ib: Optional["IB"],
+    candidate: CandidateRecord,
+    open_spreads: Sequence[OpenSpread],
+    today: str,
+    *,
+    dry: bool,
+    live: LiveConfig,
+    config: StrategyConfig,
+    reason: str = "rearm",
+) -> Optional[int]:
+    """Cancel any short-leg orders, then place one aggregated BUY STP.
+
+    Safeties:
+    - One STP per short contract covering total open size (avoids duplicate STPs).
+    - Trigger uses the tightest (lowest) 3× among siblings so earlier/richer
+      credits are not under-protected.
+    - On reject, leave ``stop_order_id`` cleared and log loudly — synthetic
+      stops remain primary while the loop is alive.
+    """
+    if not native_stops_enabled(live):
+        return None
+    siblings = active_spreads_on_short(open_spreads, candidate)
+    if not siblings:
+        return None
+    total_qty, stop_px = aggregated_native_stop_plan(siblings, live, config)
+    if total_qty <= 0 or stop_px <= 0:
+        return None
+
+    clear_short_leg_backstops(
+        ib, candidate, open_spreads, today, dry=dry, reason=f"pre_{reason}",
+    )
+    # Re-resolve after clear (same objects; stop_order_id wiped).
+    siblings = active_spreads_on_short(open_spreads, candidate)
+    if not siblings:
+        return None
+
+    if dry or not HAS_IB or ib is None:
+        fake_id = -(
+            abs(hash((candidate.short_type, float(candidate.short_strike), total_qty, stop_px)))
+            % 10_000_000
+            or 1
+        )
+        for spread in siblings:
+            spread.stop_order_id = fake_id
+        log_event(today, {
+            "event": "native_stop_armed",
+            "short_strike": candidate.short_strike,
+            "short_type": candidate.short_type,
+            "contracts": total_qty,
+            "stop_price": stop_px,
+            "order_id": fake_id,
+            "reason": reason,
+            "dry": True,
+            "spread_count": len(siblings),
+        })
+        return fake_id
+
+    short_opt = _short_option(ib, candidate, today)
+    stop_order = StopOrder("BUY", total_qty, stop_px)
+    stop_order.tif = "DAY"
+    trade = ib.placeOrder(short_opt, stop_order)
+    order_id = trade.order.orderId
+    reject = _trade_rejection_reason(trade)
+    if reject:
+        try:
+            ib.cancelOrder(trade.order)
+        except Exception:
+            pass
+        for spread in siblings:
+            spread.stop_order_id = None
+        log_event(today, {
+            "event": "native_stop_rejected",
+            "short_strike": candidate.short_strike,
+            "short_type": candidate.short_type,
+            "contracts": total_qty,
+            "stop_price": stop_px,
+            "reason": reject,
+            "arm_reason": reason,
+        })
+        print(
+            f"[{datetime.now().isoformat()}] NATIVE STP REJECTED "
+            f"{candidate.short_type} {candidate.short_strike} x{total_qty} "
+            f"@{stop_px:.2f}: {reject}"
+        )
+        return None
+
+    for spread in siblings:
+        spread.stop_order_id = order_id
+    log_event(today, {
+        "event": "native_stop_armed",
+        "short_strike": candidate.short_strike,
+        "short_type": candidate.short_type,
+        "contracts": total_qty,
+        "stop_price": stop_px,
+        "order_id": order_id,
+        "reason": reason,
+        "dry": False,
+        "spread_count": len(siblings),
+    })
+    print(
+        f"[{datetime.now().isoformat()}] NATIVE STP {candidate.short_type} "
+        f"{candidate.short_strike} x{total_qty} @{stop_px:.2f} ({reason})"
+    )
+    return order_id
+
+
+def rearm_all_native_stops(
+    ib: Optional["IB"],
+    open_spreads: Sequence[OpenSpread],
+    today: str,
+    *,
+    dry: bool,
+    live: LiveConfig,
+    config: StrategyConfig,
+    reason: str = "rearm_all",
+) -> int:
+    """Place/replace aggregated STPs for every distinct open short leg."""
+    if not native_stops_enabled(live):
+        return 0
+    seen: set = set()
+    armed = 0
+    for spread in open_spreads:
+        if spread.closed or spread.stopped:
+            continue
+        key = (spread.candidate.short_type, float(spread.candidate.short_strike))
+        if key in seen:
+            continue
+        seen.add(key)
+        if place_or_replace_native_stop_for_short(
+            ib,
+            spread.candidate,
+            open_spreads,
+            today,
+            dry=dry,
+            live=live,
+            config=config,
+            reason=reason,
+        ) is not None:
+            armed += 1
+    return armed
+
+
+def verify_native_stops(
+    ib: Optional["IB"],
+    open_spreads: Sequence[OpenSpread],
+    today: str,
+    *,
+    dry: bool,
+    live: LiveConfig,
+    config: StrategyConfig,
+) -> int:
+    """Replace missing/cancelled native STPs (loop crash / TWS cancel safety)."""
+    if not native_stops_enabled(live) or dry or not HAS_IB or ib is None:
+        return 0
+    repaired = 0
+    seen: set = set()
+    for spread in open_spreads:
+        if spread.closed or spread.stopped:
+            continue
+        key = (spread.candidate.short_type, float(spread.candidate.short_strike))
+        if key in seen:
+            continue
+        seen.add(key)
+        siblings = active_spreads_on_short(open_spreads, spread.candidate)
+        if not siblings:
+            continue
+        order_id = next((s.stop_order_id for s in siblings if s.stop_order_id is not None), None)
+        if order_id is not None and _order_still_working(ib, order_id):
+            continue
+        log_event(today, {
+            "event": "native_stop_missing",
+            "short_strike": spread.candidate.short_strike,
+            "short_type": spread.candidate.short_type,
+            "prior_order_id": order_id,
+        })
+        if place_or_replace_native_stop_for_short(
+            ib,
+            spread.candidate,
+            open_spreads,
+            today,
+            dry=dry,
+            live=live,
+            config=config,
+            reason="verify_repair",
+        ) is not None:
+            repaired += 1
+    return repaired
+
+
+def enforce_native_stop_disarm_budget(
+    ib: Optional["IB"],
+    pending: Optional[PendingEntry],
+    open_spreads: Sequence[OpenSpread],
+    today: str,
+    *,
+    now: datetime,
+    dry: bool,
+    live: LiveConfig,
+    config: StrategyConfig,
+) -> Optional[PendingEntry]:
+    """Cancel a same-strike add that has left existing shorts unprotected too long."""
+    if (
+        pending is None
+        or not live.use_native_stop_replace
+        or live.native_stop_disarm_max_seconds <= 0
+    ):
+        return pending
+    siblings = active_spreads_on_short(open_spreads, pending.candidate)
+    if not siblings:
+        return pending
+    disarmed = any(s.stop_order_id is None for s in siblings)
+    age = (now - pending.submitted_at).total_seconds()
+    if not disarmed or age < live.native_stop_disarm_max_seconds:
+        return pending
+    cancel_pending_entry(
+        ib, pending, today, reason="native_stop_disarm_timeout", dry=dry,
+    )
+    place_or_replace_native_stop_for_short(
+        ib,
+        pending.candidate,
+        open_spreads,
+        today,
+        dry=dry,
+        live=live,
+        config=config,
+        reason="disarm_timeout_rearm",
+    )
+    log_event(today, {
+        "event": "native_stop_disarm_timeout",
+        "short_strike": pending.candidate.short_strike,
+        "short_type": pending.candidate.short_type,
+        "age_seconds": round(age, 1),
+        "max_seconds": live.native_stop_disarm_max_seconds,
+    })
+    print(
+        f"[{now.isoformat()}] NATIVE STP disarm timeout — cancelled pending "
+        f"{pending.candidate.side} {pending.candidate.short_strike}/"
+        f"{pending.candidate.long_strike} after {age:.0f}s"
+    )
+    return None
 
 
 def cancel_pending_entry(
@@ -520,7 +837,7 @@ def cancel_pending_entry(
         "reason": reason,
         "limit_credit": round(pending.limit_credit, 2),
     })
-    if reason in {"new_tranche", "flatten", "error"}:
+    if reason in {"new_tranche", "flatten", "error", "native_stop_disarm_timeout"}:
         log_event(today, {
             "event": "order_rejected",
             "side": pending.candidate.side,
@@ -571,6 +888,7 @@ def submit_spread_entry(
         spread.fill_credit = limit
         return spread, None, ""
 
+    # Cancel→add→replace: disarm native STP on this short before the combo SELL.
     clear_short_leg_backstops(
         ib, candidate, open_spreads, today, dry=dry, reason="pre_entry",
     )
@@ -581,6 +899,17 @@ def submit_spread_entry(
     spread.combo_order_id = trade.order.orderId
 
     submitted = now
+    work_until = work_deadline(submitted, live, config.entry_interval_minutes)
+    # Same-strike scale-in leaves existing shorts unprotected until fill/reject —
+    # cap work time so STPs are re-armed quickly.
+    if (
+        live.use_native_stop_replace
+        and live.native_stop_disarm_max_seconds > 0
+        and active_spreads_on_short(open_spreads, candidate)
+    ):
+        disarm_deadline = submitted + timedelta(seconds=live.native_stop_disarm_max_seconds)
+        if disarm_deadline < work_until:
+            work_until = disarm_deadline
     pending = PendingEntry(
         spread=spread,
         trade=trade,
@@ -589,7 +918,7 @@ def submit_spread_entry(
         natural_credit=nat,
         limit_credit=limit,
         submitted_at=submitted,
-        work_until=work_deadline(submitted, live, config.entry_interval_minutes),
+        work_until=work_until,
         next_ladder_at=submitted + timedelta(seconds=live.entry_ladder_interval_seconds),
         tranche_time=now,
         sleeve=candidate.sleeve or "core",
@@ -621,32 +950,61 @@ def apply_pending_resolution(
     config: StrategyConfig,
     sleeve_margin_used: dict,
     portfolio_margin_used: float,
+    ib: Optional["IB"] = None,
+    today: str = "",
+    dry: bool = True,
+    live: Optional[LiveConfig] = None,
 ) -> Tuple[int, float, float, float]:
-    """Apply a filled or rejected pending entry."""
+    """Apply a filled or rejected pending entry; re-arm native STP afterward."""
+    filled = 0
+    credit_added = 0.0
+    margin = 0.0
     if event.get("event") == "entry":
         spread = pending.spread
         fill_credit = float(event.get("credit", pending.limit_credit))
         spread.fill_credit = fill_credit
+        # Keep stop_price aligned with strategy multiple on the short bid at submit.
+        if live is not None and live.use_native_stop_replace:
+            multiple = (
+                live.native_stop_multiple
+                if live.native_stop_multiple is not None
+                else config.stop_multiple
+            )
+            if spread.short_entry_sell > 0 and multiple > 0:
+                spread.stop_price = _round_spx_premium(spread.short_entry_sell * multiple)
         open_spreads.append(spread)
         contracts = pending.contracts
         credit_added = fill_credit * contracts * config.multiplier
         margin = candidate_margin_per_contract(pending.candidate, config) * contracts
         sleeve = pending.sleeve or "core"
         sleeve_margin_used[sleeve] = sleeve_margin_used.get(sleeve, 0.0) + margin
+        filled = 1
         print(
             f"[{datetime.now().isoformat()}] ENTRY filled {pending.candidate.side} "
             f"{pending.candidate.short_strike}/{pending.candidate.long_strike} "
             f"x{contracts} fill={fill_credit:.2f} "
             f"(natural={event.get('natural_credit')} slippage={event.get('fill_slippage')})"
         )
-        return 1, credit_added, margin, portfolio_margin_used + margin
+    else:
+        print(
+            f"[{datetime.now().isoformat()}] ENTRY failed {pending.candidate.side} "
+            f"{pending.candidate.short_strike}/{pending.candidate.long_strike} "
+            f"reason={event.get('reason')}"
+        )
 
-    print(
-        f"[{datetime.now().isoformat()}] ENTRY failed {pending.candidate.side} "
-        f"{pending.candidate.short_strike}/{pending.candidate.long_strike} "
-        f"reason={event.get('reason')}"
-    )
-    return 0, 0.0, 0.0, portfolio_margin_used
+    if live is not None and today and native_stops_enabled(live):
+        place_or_replace_native_stop_for_short(
+            ib,
+            pending.candidate,
+            open_spreads,
+            today,
+            dry=dry,
+            live=live,
+            config=config,
+            reason="post_fill" if filled else "post_reject",
+        )
+
+    return filled, credit_added, margin, portfolio_margin_used + margin
 
 
 def place_spread(
@@ -700,10 +1058,12 @@ def _buy_short_leg_stop(
     today: str,
     short_ask: float,
     live: LiveConfig,
+    open_spreads: Sequence[OpenSpread],
 ) -> Tuple[bool, float]:
     """Phase 4: limit at ask + buffer, escalate to MKT if unfilled."""
+    # Cancel aggregated native STP on this short before the protective BUY.
     clear_short_leg_backstops(
-        ib, candidate, [spread], today, dry=False, reason="synthetic_stop",
+        ib, candidate, open_spreads, today, dry=False, reason="synthetic_stop",
     )
     short_opt = _short_option(ib, candidate, today)
     limit_px = _stop_limit_price(short_ask, live)
@@ -761,7 +1121,7 @@ def manage_stops(
         fill_px = sq.ask
         if not dry and HAS_IB and ib is not None:
             ok, fill_px = _buy_short_leg_stop(
-                ib, spread, spread.candidate, today, sq.ask, live
+                ib, spread, spread.candidate, today, sq.ask, live, open_spreads,
             )
             if not ok:
                 spread.stopped = False
@@ -787,22 +1147,157 @@ def manage_stops(
             f"ask={sq.ask:.2f}>={spread.stop_price:.2f} fill={fill_px:.2f} (keep long wing)"
             f"{' (dry)' if dry else ''}"
         )
+
+    # Re-arm aggregated STP for any remaining size on shorts that just stopped.
+    if newly_stopped and native_stops_enabled(live):
+        seen: set = set()
+        for spread in newly_stopped:
+            key = (spread.candidate.short_type, float(spread.candidate.short_strike))
+            if key in seen:
+                continue
+            seen.add(key)
+            place_or_replace_native_stop_for_short(
+                ib,
+                spread.candidate,
+                open_spreads,
+                today,
+                dry=dry,
+                live=live,
+                config=config,
+                reason="post_synthetic_stop",
+            )
     return newly_stopped
 
 
-def flatten_all(ib: "IB", open_spreads: Sequence[OpenSpread], today: str, dry: bool) -> None:
-    """Flatten governor: close every open spread immediately (both legs)."""
+@dataclass
+class FlattenResult:
+    """Outcome of a confirmed flatten attempt."""
+
+    closed: int = 0
+    failed: int = 0
+    residual_ib_lots: int = 0
+    complete: bool = True
+
+
+def flatten_all(
+    ib: "IB",
+    open_spreads: Sequence[OpenSpread],
+    today: str,
+    dry: bool,
+    *,
+    live: Optional[LiveConfig] = None,
+    timeout_sec: Optional[float] = None,
+) -> FlattenResult:
+    """Flatten governor: MKT-close open spreads and confirm fills / IB residual."""
+    cfg = live or ACTIVE
+    wait_sec = (
+        timeout_sec
+        if timeout_sec is not None
+        else float(getattr(cfg, "flatten_fill_timeout_seconds", 12.0))
+    )
+    retry_mkt = bool(getattr(cfg, "flatten_retry_mkt", True))
+    result = FlattenResult()
+
     for spread in open_spreads:
         if spread.closed:
             continue
-        if not dry and HAS_IB:
-            clear_short_leg_backstops(
-                ib, spread.candidate, [spread], today, dry=dry, reason="flatten",
+        if dry or not HAS_IB or ib is None:
+            spread.closed = True
+            result.closed += 1
+            continue
+
+        clear_short_leg_backstops(
+            ib, spread.candidate, [spread], today, dry=dry, reason="flatten",
+        )
+        bag, _short_leg_opt = build_combo(ib, spread.candidate, today)
+        trade = ib.placeOrder(
+            bag,
+            Order(action="SELL", totalQuantity=spread.contracts, orderType="MKT"),
+        )
+        state, reason = _wait_for_order(ib, trade, timeout_sec=wait_sec)
+        if state != "filled" and retry_mkt:
+            if state == "pending":
+                try:
+                    ib.cancelOrder(trade.order)
+                    ib.sleep(0.25)
+                except Exception:
+                    pass
+            trade = ib.placeOrder(
+                bag,
+                Order(action="SELL", totalQuantity=spread.contracts, orderType="MKT"),
             )
-            bag, _short_leg_opt = build_combo(ib, spread.candidate, today)
-            # Close an opened combo with SELL (inverse of opening BUY).
-            ib.placeOrder(bag, Order(action="SELL", totalQuantity=spread.contracts, orderType="MKT"))
-        spread.closed = True
+            state, reason = _wait_for_order(ib, trade, timeout_sec=wait_sec)
+
+        if state == "filled":
+            fill_px = float(trade.orderStatus.avgFillPrice or 0.0)
+            spread.closed = True
+            result.closed += 1
+            log_event(today, {
+                "event": "flatten_fill",
+                "side": spread.candidate.side,
+                "short_strike": spread.candidate.short_strike,
+                "long_strike": spread.candidate.long_strike,
+                "contracts": spread.contracts,
+                "fill_price": round(fill_px, 4),
+            })
+        else:
+            result.failed += 1
+            result.complete = False
+            log_event(today, {
+                "event": "flatten_unfilled",
+                "side": spread.candidate.side,
+                "short_strike": spread.candidate.short_strike,
+                "long_strike": spread.candidate.long_strike,
+                "contracts": spread.contracts,
+                "state": state,
+                "reason": reason,
+            })
+            print(
+                f"[{datetime.now().isoformat()}] FLATTEN UNFILLED "
+                f"{spread.candidate.side} {spread.candidate.short_strike}/"
+                f"{spread.candidate.long_strike} x{spread.contracts} "
+                f"state={state} reason={reason or 'timeout'}"
+            )
+
+    # Confirm no residual SPXW risk remains in IB for still-open local book.
+    still_open = [s for s in open_spreads if not s.closed]
+    if not dry and HAS_IB and ib is not None:
+        try:
+            ib_nets = fetch_ib_spxw_positions(ib, today)
+        except Exception:
+            ib_nets = {}
+        residual_lots = sum(abs(v) for v in ib_nets.values())
+        result.residual_ib_lots = residual_lots
+        if residual_lots > 0 and still_open:
+            result.complete = False
+            log_event(today, {
+                "event": "flatten_incomplete",
+                "residual_ib_lots": residual_lots,
+                "still_open_local": len(still_open),
+                "closed": result.closed,
+                "failed": result.failed,
+            })
+            print(
+                f"[{datetime.now().isoformat()}] FLATTEN INCOMPLETE — "
+                f"IB still shows {residual_lots} SPXW lot(s); "
+                f"local open={len(still_open)}"
+            )
+        elif residual_lots > 0 and not still_open:
+            # Local book closed but IB residual — treat as incomplete.
+            result.complete = False
+            result.residual_ib_lots = residual_lots
+            log_event(today, {
+                "event": "flatten_incomplete",
+                "residual_ib_lots": residual_lots,
+                "still_open_local": 0,
+                "closed": result.closed,
+                "failed": result.failed,
+                "note": "local_closed_ib_residual",
+            })
+
+    if result.failed == 0 and result.residual_ib_lots == 0:
+        result.complete = True
+    return result
 
 
 # --------------------------------------------------------------------------- #
@@ -884,35 +1379,6 @@ def _tranche_base_contracts(
     return max(0, base)
 
 
-def _finalize_spread_entry(
-    ib: "IB",
-    spread: OpenSpread,
-    candidate: CandidateRecord,
-    contracts: int,
-    config: StrategyConfig,
-    today: str,
-    live: LiveConfig,
-    short_leg_opt,
-) -> None:
-    if live.use_native_stop_backstop and HAS_IB and ib is not None:
-        backstop = _round_spx_premium(spread.stop_price * 1.5)
-        if backstop > 0:
-            stop_order = StopOrder("BUY", contracts, backstop)
-            stop_order.tif = "DAY"
-            stop_trade = ib.placeOrder(short_leg_opt, stop_order)
-            spread.stop_order_id = stop_trade.order.orderId
-            stop_reason = _trade_rejection_reason(stop_trade)
-            if stop_reason:
-                ib.cancelOrder(stop_trade.order)
-                spread.stop_order_id = None
-                log_event(today, {
-                    "event": "stop_backstop_rejected",
-                    "short_strike": candidate.short_strike,
-                    "backstop": backstop,
-                    "reason": stop_reason,
-                })
-
-
 def _process_tranche(
     *,
     now: datetime,
@@ -937,7 +1403,19 @@ def _process_tranche(
 ) -> Tuple[int, float, float, float, Optional[PendingEntry], str]:
     """Evaluate one entry tranche; log diagnostics; submit any selected spreads."""
     if pending_entry is not None and not dry:
+        cancelled_cand = pending_entry.candidate
         cancel_pending_entry(ib, pending_entry, today, reason="new_tranche", dry=dry)
+        # Re-arm STPs that were disarmed for the abandoned working entry.
+        place_or_replace_native_stop_for_short(
+            ib,
+            cancelled_cand,
+            open_spreads,
+            today,
+            dry=dry,
+            live=live,
+            config=config,
+            reason="new_tranche_rearm",
+        )
         pending_entry = None
 
     base_contracts = _tranche_base_contracts(
@@ -1049,6 +1527,16 @@ def _process_tranche(
             sleeve = cand.sleeve or "core"
             sleeve_margin_used[sleeve] = sleeve_margin_used.get(sleeve, 0.0) + margin
             margin_added += margin
+            place_or_replace_native_stop_for_short(
+                ib,
+                cand,
+                open_spreads,
+                today,
+                dry=True,
+                live=live,
+                config=config,
+                reason="dry_entry",
+            )
             log_event(today, {
                 "event": "entry",
                 "side": cand.side,
@@ -1113,6 +1601,14 @@ def run(live: LiveConfig = ACTIVE) -> None:
     lock_path = acquire_executor_lock(today)
     print(f"[{datetime.now().isoformat()}] executor lock acquired → {lock_path}")
 
+    kill_hit = check_kill_switch(today, enabled=live.kill_switch_enabled)
+    if kill_hit is not None:
+        release_executor_lock(lock_path)
+        raise SystemExit(
+            f"KILL switch present ({kill_hit.scope}: {kill_hit.path}). "
+            "Remove the file before starting the executor."
+        )
+
     eligible, skip_reason = check_session_eligible(today_date)
     if not eligible:
         release_executor_lock(lock_path)
@@ -1156,6 +1652,7 @@ def run(live: LiveConfig = ACTIVE) -> None:
           f"fomc_cutoff={'on@'+config.fomc_entry_end.strftime('%H:%M') if config.use_fomc_entry_cutoff else 'off'} "
           f"gates=trend<={config.candidate_max_adverse_trend}/skew<={config.candidate_max_adverse_skew} "
           f"stop={config.stop_multiple}x/{config.stop_confirmation_count}bar "
+          f"native_stp={'replace@' + (f'{live.native_stop_multiple}x' if live.native_stop_multiple is not None else f'{config.stop_multiple}x') if live.use_native_stop_replace else ('legacy_1.5x' if live.use_native_stop_backstop else 'off')} "
           f"side_cooldown={config.same_side_stop_cooldown_minutes}min "
           f"halt={config.daily_loss_limit_pct:.2%} "
           f"flatten={config.flatten_loss_limit_pct or config.daily_loss_limit_pct:.2%} "
@@ -1205,6 +1702,33 @@ def run(live: LiveConfig = ACTIVE) -> None:
             print(f"Tranche diagnostics -> data/live/{today}/tranches.jsonl")
             if baselines_core is not None:
                 print(f"Signal baselines -> {live.baselines_path}")
+            if live.use_account_guards and not dry:
+                acct = fetch_account_snapshot(ib)
+                guard = check_startup_account_guard(
+                    acct,
+                    account_equity=live.account_equity,
+                    netliq_min_ratio=live.netliq_min_ratio,
+                    buying_power_min_ratio=live.buying_power_min_ratio,
+                )
+                log_event(today, {
+                    "event": "account_guard_startup",
+                    "ok": guard.ok,
+                    "reason": guard.reason,
+                    "net_liquidation": acct.net_liquidation,
+                    "buying_power": acct.buying_power,
+                    "account_equity": live.account_equity,
+                })
+                if not guard.ok:
+                    release_executor_lock(lock_path)
+                    raise SystemExit(
+                        f"account guard failed at startup: {guard.reason} "
+                        f"(NetLiq={acct.net_liquidation}, BP={acct.buying_power}, "
+                        f"configured equity={live.account_equity:,.0f})"
+                    )
+                print(
+                    f"Account guard OK — NetLiq=${acct.net_liquidation:,.0f} "
+                    f"BP=${acct.buying_power:,.0f} (equity=${live.account_equity:,.0f})"
+                )
             provider = IBSignalProvider(
                 ib, live, config, baselines_core=baselines_core, session_vix=vix_open
             )
@@ -1237,6 +1761,50 @@ def run(live: LiveConfig = ACTIVE) -> None:
                 "ib_matched_legs": recovered.ib_matched_legs,
                 "warnings": recovered.warnings,
             })
+            if open_spreads and native_stops_enabled(live):
+                armed = rearm_all_native_stops(
+                    ib,
+                    open_spreads,
+                    today,
+                    dry=dry,
+                    live=live,
+                    config=config,
+                    reason="session_recovery",
+                )
+                print(
+                    f"[{datetime.now().isoformat()}] native STP armed on "
+                    f"{armed} short leg(s) after recovery"
+                )
+
+        # Restore halt/flatten/cooldown so a restart cannot re-arm selling after a halt.
+        fills_events = load_fills_events(today)
+        governor = recover_governor_state(
+            fills_events,
+            now=datetime.now(),
+            cooldown_minutes=config.same_side_stop_cooldown_minutes,
+        )
+        entries_halted = governor.entries_halted
+        flattened = governor.flattened
+        side_stop_cooldown_until: Dict[str, datetime] = dict(governor.side_stop_cooldown_until)
+        for warn in governor.warnings:
+            print(f"[{datetime.now().isoformat()}] GOVERNOR WARN: {warn}")
+        if entries_halted or flattened or side_stop_cooldown_until:
+            print(
+                f"[{datetime.now().isoformat()}] governor recovered — "
+                f"halted={entries_halted} flattened={flattened} "
+                f"cooldowns={list(side_stop_cooldown_until)}"
+            )
+            log_event(today, {
+                "event": "governor_recovered",
+                "entries_halted": entries_halted,
+                "flattened": flattened,
+                "cooldowns": {k: v.isoformat() for k, v in side_stop_cooldown_until.items()},
+            })
+        if flattened and open_spreads and ib is not None and not dry:
+            raise SystemExit(
+                "fills.jsonl shows a prior flatten but open SPXW risk remains. "
+                "Manually flatten/reconcile in TWS, then restart."
+            )
 
         daily_credit_cap = config.account_equity * config.daily_credit_cap_pct
         # Two-threshold governor: halt NEW entries at daily_loss_limit_pct, force-
@@ -1253,23 +1821,143 @@ def run(live: LiveConfig = ACTIVE) -> None:
             sleeve = spread.candidate.sleeve or "core"
             sleeve_margin_used[sleeve] = sleeve_margin_used.get(sleeve, 0.0) + mpc
             portfolio_margin_used += mpc
-        entries_halted = False
-        flattened = False
         traded_tranches: set = set()
         pending_entry = None
-        side_stop_cooldown_until: Dict[str, datetime] = {}
         last_quotes = []
         last_marked_pnl = 0.0
+        last_native_stop_verify_at = datetime.now()
+        last_account_guard_at = datetime.now() - timedelta(seconds=live.account_guard_poll_seconds)
+        mark_bad_since: Optional[datetime] = None
+        disconnect_halt = False
+        ib_port = live.port or (7497 if live.mode == "paper" else 7496)
         ib_provider: Optional[IBSignalProvider] = None
         if isinstance(provider, IBSignalProvider):
             ib_provider = provider
 
+        def _trigger_flatten(reason: str, marked_pnl: float) -> FlattenResult:
+            nonlocal pending_entry, flattened, entries_halted
+            flattened = True
+            entries_halted = True
+            cancel_pending_entry(ib, pending_entry, today, reason=reason, dry=dry)
+            pending_entry = None
+            fres = flatten_all(
+                ib, [s for s in open_spreads if not s.closed], today, dry, live=live,
+            )
+            log_event(today, {
+                "event": "flatten",
+                "reason": reason,
+                "marked_pnl": round(marked_pnl, 2),
+                "complete": fres.complete,
+                "closed": fres.closed,
+                "failed": fres.failed,
+                "residual_ib_lots": fres.residual_ib_lots,
+            })
+            return fres
+
         try:
             while datetime.now().time() <= config.force_flat_time:
                 now = datetime.now()
+
+                # --- Phase F: external KILL switch ---------------------------------
+                kill_hit = check_kill_switch(today, enabled=live.kill_switch_enabled)
+                if kill_hit is not None:
+                    print(
+                        f"[{now.isoformat()}] KILL switch ({kill_hit.scope}: {kill_hit.path}) "
+                        "— flattening and exiting."
+                    )
+                    log_event(today, {
+                        "event": "kill_switch",
+                        "scope": kill_hit.scope,
+                        "path": str(kill_hit.path),
+                    })
+                    _trigger_flatten("kill_switch", last_marked_pnl)
+                    raise SystemExit(f"KILL switch activated ({kill_hit.path})")
+
+                # --- Phase C: disconnect / reconnect breaker ----------------------
+                if (
+                    live.use_disconnect_breaker
+                    and connect_ib
+                    and ib is not None
+                    and not dry
+                    and not ib_is_connected(ib)
+                ):
+                    halted_before_disconnect = entries_halted
+                    disconnect_halt = True
+                    entries_halted = True
+                    print(f"[{now.isoformat()}] IB DISCONNECTED — halting entries, reconnecting…")
+                    log_event(today, {"event": "ib_disconnected"})
+                    cancel_pending_entry(ib, pending_entry, today, reason="disconnect", dry=dry)
+                    pending_entry = None
+                    if ib_provider is not None:
+                        try:
+                            ib_provider.shutdown()
+                        except Exception:
+                            pass
+                    outcome = reconnect_ib(
+                        ib,
+                        host=live.host,
+                        port=ib_port,
+                        client_id=live.client_id,
+                        max_seconds=live.reconnect_max_seconds,
+                        initial_backoff=live.reconnect_initial_backoff,
+                        max_backoff=live.reconnect_max_backoff,
+                        on_attempt=lambda n, b: print(
+                            f"[{datetime.now().isoformat()}] reconnect attempt {n} (backoff {b:.0f}s)"
+                        ),
+                        sleep_fn=(ib.sleep if HAS_IB else _time.sleep),
+                    )
+                    print(format_reconnect_banner(outcome))
+                    log_event(today, {
+                        "event": "ib_reconnect",
+                        "connected": outcome.connected,
+                        "attempts": outcome.attempts,
+                        "elapsed_seconds": round(outcome.elapsed_seconds, 2),
+                        "reason": outcome.reason,
+                    })
+                    if not outcome.connected:
+                        open_risk = [s for s in open_spreads if not s.closed]
+                        if open_risk:
+                            _trigger_flatten("reconnect_failed", last_marked_pnl)
+                        raise SystemExit("IB reconnect failed — exiting")
+                    register_ib_error_handler(ib, today)
+                    if ib_provider is not None:
+                        ib_provider.ib = ib
+                        ib_provider.start()
+                    # Re-check book vs IB after reconnect (fail loud on residual).
+                    recovered_chk = recover_session_book(
+                        today=today,
+                        stop_multiple=config.stop_multiple,
+                        OpenSpread=OpenSpread,
+                        CandidateRecord=CandidateRecord,
+                        ib=ib,
+                        fail_on_unmatched=True,
+                        cancel_orphans=False,
+                    )
+                    open_spreads[:] = list(recovered_chk.spreads)
+                    if open_spreads and native_stops_enabled(live):
+                        rearm_all_native_stops(
+                            ib, open_spreads, today, dry=dry, live=live, config=config,
+                            reason="post_reconnect",
+                        )
+                    # Clear only the disconnect-induced halt; keep PnL/account/mark halts.
+                    disconnect_halt = False
+                    entries_halted = halted_before_disconnect or flattened
+                    continue
+
                 at_tranche = should_fire_tranche(now, config, traded_tranches)
                 quotes, signal = provider.fetch(now, at_tranche=at_tranche)
                 last_quotes = list(quotes)
+
+                pending_entry = enforce_native_stop_disarm_budget(
+                    ib,
+                    pending_entry,
+                    open_spreads,
+                    today,
+                    now=now,
+                    dry=dry,
+                    live=live,
+                    config=config,
+                )
 
                 if pending_entry is not None and ib is not None and not dry:
                     active_pending = pending_entry
@@ -1285,8 +1973,34 @@ def run(live: LiveConfig = ACTIVE) -> None:
                             config=config,
                             sleeve_margin_used=sleeve_margin_used,
                             portfolio_margin_used=portfolio_margin_used,
+                            ib=ib,
+                            today=today,
+                            dry=dry,
+                            live=live,
                         )
                         gross_credit_sold += credit_added
+
+                if (
+                    native_stops_enabled(live)
+                    and live.native_stop_verify_seconds > 0
+                    and (now - last_native_stop_verify_at).total_seconds()
+                    >= live.native_stop_verify_seconds
+                ):
+                    # Skip verify while a same-strike entry is working (STP must stay off).
+                    pending_blocks_verify = (
+                        pending_entry is not None
+                        and bool(active_spreads_on_short(open_spreads, pending_entry.candidate))
+                    )
+                    if not pending_blocks_verify:
+                        verify_native_stops(
+                            ib,
+                            open_spreads,
+                            today,
+                            dry=dry,
+                            live=live,
+                            config=config,
+                        )
+                    last_native_stop_verify_at = now
 
                 newly_stopped = manage_stops(ib, open_spreads, quotes, config, today, dry, live)
                 if newly_stopped:
@@ -1308,20 +2022,109 @@ def run(live: LiveConfig = ACTIVE) -> None:
                             ),
                         })
 
-                marked = _mark_book(open_spreads, quotes, config)
-                last_marked_pnl = marked
-                if not entries_halted and marked <= halt_limit:
-                    entries_halted = True
-                    print(f"[{now.isoformat()}] HALT new entries (marked ${marked:,.0f} <= ${halt_limit:,.0f}).")
-                    log_event(today, {"event": "halt_entries", "marked_pnl": round(marked, 2)})
-                if config.flatten_on_daily_loss and not flattened and marked <= flatten_limit:
-                    flattened = True
-                    entries_halted = True
-                    print(f"[{now.isoformat()}] FLATTEN (marked ${marked:,.0f} <= ${flatten_limit:,.0f}).")
-                    cancel_pending_entry(ib, pending_entry, today, reason="flatten", dry=dry)
-                    pending_entry = None
-                    flatten_all(ib, open_spreads, today, dry)
-                    log_event(today, {"event": "flatten", "marked_pnl": round(marked, 2)})
+                # --- Phase B: periodic NetLiq overlay -----------------------------
+                if (
+                    live.use_account_guards
+                    and ib is not None
+                    and not dry
+                    and (now - last_account_guard_at).total_seconds()
+                    >= live.account_guard_poll_seconds
+                ):
+                    last_account_guard_at = now
+                    acct = fetch_account_snapshot(ib)
+                    loop_guard = check_loop_account_guard(
+                        acct,
+                        account_equity=live.account_equity,
+                        netliq_halt_ratio=live.netliq_halt_ratio,
+                        netliq_flatten_ratio=live.netliq_flatten_ratio,
+                        flatten_on_netliq_breach=live.flatten_on_netliq_breach,
+                    )
+                    if loop_guard.halt_entries and not entries_halted:
+                        entries_halted = True
+                        print(
+                            f"[{now.isoformat()}] HALT (account guard): {loop_guard.reason}"
+                        )
+                        log_event(today, {
+                            "event": "halt_entries",
+                            "reason": "account_guard",
+                            "detail": loop_guard.reason,
+                            "net_liquidation": acct.net_liquidation,
+                            "buying_power": acct.buying_power,
+                        })
+                    if loop_guard.flatten and not flattened:
+                        print(f"[{now.isoformat()}] FLATTEN (account guard): {loop_guard.reason}")
+                        _trigger_flatten("account_guard", last_marked_pnl)
+
+                # --- Phase D: mark integrity + PnL governor -----------------------
+                mark = _mark_book(open_spreads, quotes, config)
+                if mark.quality == "ok":
+                    mark_bad_since = None
+                    last_marked_pnl = mark.pnl
+                    if not entries_halted and mark.pnl <= halt_limit:
+                        entries_halted = True
+                        print(
+                            f"[{now.isoformat()}] HALT new entries "
+                            f"(marked ${mark.pnl:,.0f} <= ${halt_limit:,.0f})."
+                        )
+                        log_event(today, {
+                            "event": "halt_entries",
+                            "marked_pnl": round(mark.pnl, 2),
+                        })
+                    if (
+                        config.flatten_on_daily_loss
+                        and not flattened
+                        and mark.pnl <= flatten_limit
+                    ):
+                        print(
+                            f"[{now.isoformat()}] FLATTEN "
+                            f"(marked ${mark.pnl:,.0f} <= ${flatten_limit:,.0f})."
+                        )
+                        _trigger_flatten("daily_loss", mark.pnl)
+                else:
+                    if mark_bad_since is None:
+                        mark_bad_since = now
+                        log_event(today, {
+                            "event": "mark_degraded",
+                            "quality": mark.quality,
+                            "open_count": mark.open_count,
+                            "marked_count": mark.marked_count,
+                            "missing_count": mark.missing_count,
+                        })
+                    if live.mark_degraded_halt and mark.open_count > 0:
+                        if not entries_halted:
+                            entries_halted = True
+                            print(
+                                f"[{now.isoformat()}] HALT (mark {mark.quality}) — "
+                                f"missing quotes on {mark.missing_count}/{mark.open_count} spread(s)."
+                            )
+                            log_event(today, {
+                                "event": "halt_entries",
+                                "reason": f"mark_{mark.quality}",
+                                "missing_count": mark.missing_count,
+                                "open_count": mark.open_count,
+                            })
+                    bad_age = (now - mark_bad_since).total_seconds() if mark_bad_since else 0.0
+                    if (
+                        mark.quality == "unavailable"
+                        and mark.open_count > 0
+                        and not flattened
+                        and bad_age >= live.mark_unavailable_flatten_seconds
+                    ):
+                        print(
+                            f"[{now.isoformat()}] FLATTEN (mark unavailable "
+                            f"for {bad_age:.0f}s with open risk)."
+                        )
+                        _trigger_flatten("mark_unavailable", last_marked_pnl)
+                    elif mark.quality == "partial" and mark.marked_count > 0:
+                        # Use partial mark only to tighten halt, never to clear it.
+                        last_marked_pnl = mark.pnl
+                        if not entries_halted and mark.pnl <= halt_limit:
+                            entries_halted = True
+                            log_event(today, {
+                                "event": "halt_entries",
+                                "marked_pnl": round(mark.pnl, 2),
+                                "reason": "partial_mark",
+                            })
 
                 if at_tranche:
                     tranche_key = (now.hour, now.minute)
@@ -1336,7 +2139,7 @@ def run(live: LiveConfig = ACTIVE) -> None:
                         live=live,
                         ib=ib,
                         dry=dry,
-                        entries_halted=entries_halted,
+                        entries_halted=entries_halted or disconnect_halt,
                         open_spreads=open_spreads,
                         gross_credit_sold=gross_credit_sold,
                         daily_credit_cap=daily_credit_cap,
@@ -1361,23 +2164,28 @@ def run(live: LiveConfig = ACTIVE) -> None:
                     sleep_for = min(sleep_for, live.entry_poll_seconds)
                 if sleep_for > 0:
                     self_sleep = sleep_for
-                    if HAS_IB and ib is not None:
+                    if HAS_IB and ib is not None and ib_is_connected(ib):
                         ib.sleep(self_sleep)
                     else:
                         _time.sleep(self_sleep)
+        except SystemExit:
+            raise
         except Exception as exc:
             print(f"[{datetime.now().isoformat()}] ERROR: {exc!r} -- flattening and exiting.")
             log_event(today, {"event": "error_flatten", "error": repr(exc)})
             cancel_pending_entry(ib, pending_entry, today, reason="error", dry=dry)
+            pending_entry = None
             if not dry:
-                flatten_all(ib, [s for s in open_spreads if not s.closed], today, dry)
+                flatten_all(
+                    ib, [s for s in open_spreads if not s.closed], today, dry, live=live,
+                )
             raise
 
         # End of day: SPXW 0DTE is cash-settled on the close, so open defined-risk
         # spreads are left to settle (matches the backtest's settle-at-close). Only
         # the governor or an error flattens early.
         if last_quotes:
-            last_marked_pnl = _mark_book(open_spreads, last_quotes, config)
+            last_marked_pnl = _mark_book(open_spreads, last_quotes, config).pnl
         log_event(today, {
             "event": "session_end",
             "spreads": len(open_spreads),
@@ -1423,29 +2231,68 @@ def _size_with_caps(cand: CandidateRecord, config: StrategyConfig, gross_credit_
     return max(0, contracts)
 
 
-def _mark_book(open_spreads: Sequence[OpenSpread], quotes: Sequence[OptionQuote], config: StrategyConfig) -> float:
+@dataclass(frozen=True)
+class MarkBookResult:
+    """Marked PnL plus quality so the governor never treats missing quotes as $0."""
+
+    pnl: float
+    quality: str  # ok | partial | unavailable
+    open_count: int
+    marked_count: int
+    missing_count: int
+
+
+def _mark_book(
+    open_spreads: Sequence[OpenSpread],
+    quotes: Sequence[OptionQuote],
+    config: StrategyConfig,
+) -> MarkBookResult:
+    active = [s for s in open_spreads if not s.closed]
+    if not active:
+        return MarkBookResult(pnl=0.0, quality="ok", open_count=0, marked_count=0, missing_count=0)
     if not quotes:
-        return 0.0
+        return MarkBookResult(
+            pnl=0.0,
+            quality="unavailable",
+            open_count=len(active),
+            marked_count=0,
+            missing_count=len(active),
+        )
     lookup = {(q.option_type, q.strike): q for q in quotes}
     total = 0.0
-    for spread in open_spreads:
-        if spread.closed:
-            continue
+    marked = 0
+    missing = 0
+    for spread in active:
         cand = spread.candidate
         opt_type = _candidate_option_type(cand)
         lq = lookup.get((opt_type, cand.long_strike))
-        if lq is None:
+        if lq is None or lq.bid is None:
+            missing += 1
             continue
         if spread.stopped:
             stop_px = spread.stop_fill_price if spread.stop_fill_price is not None else spread.stop_price
-            per_contract = spread.short_entry_sell - stop_px - spread.long_entry_buy + lq.bid
+            per_contract = spread.short_entry_sell - stop_px - spread.long_entry_buy + float(lq.bid)
         else:
             sq = lookup.get((opt_type, cand.short_strike))
-            if sq is None:
+            if sq is None or sq.ask is None or sq.ask <= 0:
+                missing += 1
                 continue
-            per_contract = spread.short_entry_sell - sq.ask - spread.long_entry_buy + lq.bid
+            per_contract = spread.short_entry_sell - sq.ask - spread.long_entry_buy + float(lq.bid)
         total += per_contract * spread.contracts * config.multiplier
-    return total
+        marked += 1
+    if missing == 0:
+        quality = "ok"
+    elif marked == 0:
+        quality = "unavailable"
+    else:
+        quality = "partial"
+    return MarkBookResult(
+        pnl=total,
+        quality=quality,
+        open_count=len(active),
+        marked_count=marked,
+        missing_count=missing,
+    )
 
 
 class _NeutralProvider:
