@@ -19,7 +19,9 @@ from ib_executor import OpenSpread  # noqa: E402
 from session_recovery import (  # noqa: E402
     LegKey,
     acquire_executor_lock,
+    cancel_orphan_open_orders,
     expected_leg_net_from_spreads,
+    fetch_ib_spxw_positions,
     open_entry_events_from_fills,
     recover_governor_state,
     recover_session_book,
@@ -164,6 +166,72 @@ class RecoverSessionBookTests(unittest.TestCase):
                 "IB has SPXW positions" in msg or "IB SPXW risk not explained" in msg,
                 msg,
             )
+
+
+class StrategyIsolationTests(unittest.TestCase):
+    """Same-day-only filters so long-dated B5 puts are never 0DTE inventory."""
+
+    @staticmethod
+    def _contract(**kw):
+        base = dict(
+            secType="OPT", symbol="SPX", tradingClass="SPXW",
+            localSymbol="SPXW  260709P07000000",
+            lastTradeDateOrContractMonth="20260709", right="P", strike=7000.0,
+        )
+        base.update(kw)
+        return SimpleNamespace(**base)
+
+    def _fake_ib(self, positions=(), trades=()):
+        return SimpleNamespace(
+            reqPositions=lambda: None,
+            sleep=lambda _s: None,
+            positions=lambda: list(positions),
+            openTrades=lambda: list(trades),
+            cancelOrder=lambda o: setattr(o, "cancelled", True),
+            reqAllOpenOrders=lambda: None,
+        )
+
+    def test_fetch_ignores_non_today_expiries(self) -> None:
+        today = "2026-07-09"
+        long_dated = self._contract(
+            tradingClass="SPX", localSymbol="SPX   270115P05600000",
+            lastTradeDateOrContractMonth="20270115", strike=5600.0,
+        )
+        same_day = self._contract()
+        ib = self._fake_ib(positions=[
+            SimpleNamespace(contract=long_dated, position=4),   # B5-style hedge
+            SimpleNamespace(contract=same_day, position=-2),    # real 0DTE risk
+        ])
+        nets = fetch_ib_spxw_positions(ib, today)
+        self.assertEqual(nets, {LegKey(right="P", strike=7000.0, expiry="20260709"): -2})
+
+    def test_cancel_orphans_skips_b5_namespace_and_long_dated(self) -> None:
+        today = "2026-07-09"
+
+        def _trade(contract, order_ref=""):
+            return SimpleNamespace(
+                contract=contract,
+                order=SimpleNamespace(orderRef=order_ref, cancelled=False),
+                orderStatus=SimpleNamespace(status="Submitted"),
+            )
+
+        b5_order = _trade(
+            self._contract(symbol="XSP", tradingClass="XSP",
+                           localSymbol="XSP   270115P00560000",
+                           lastTradeDateOrContractMonth="20270115"),
+            order_ref="B5P|B5-PUTBUY-20260709-abc123",
+        )
+        long_dated_spx = _trade(
+            self._contract(tradingClass="SPX", localSymbol="SPX   270115P05600000",
+                           lastTradeDateOrContractMonth="20270115"),
+        )
+        same_day = _trade(self._contract())
+        ib = self._fake_ib(trades=[b5_order, long_dated_spx, same_day])
+        n = cancel_orphan_open_orders(ib, today)
+        self.assertEqual(n, 1)
+        self.assertFalse(b5_order.order.cancelled)
+        self.assertFalse(long_dated_spx.order.cancelled)
+        self.assertTrue(same_day.order.cancelled)
 
 
 class RecoverGovernorTests(unittest.TestCase):

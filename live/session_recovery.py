@@ -403,8 +403,14 @@ def fetch_ib_spxw_positions(ib: Any, today: str) -> Dict[LegKey, int]:
         local = str(getattr(contract, "localSymbol", "") or "").upper()
         if symbol not in {"SPX", "SPXW"} and "SPXW" not in local and trading_class not in {"SPXW", "SPX"}:
             continue
-        # Prefer 0DTE / today's expiry; still capture other SPXW if present.
+        # SAME-DAY ONLY (strategy isolation): this engine trades 0DTE, so only
+        # today's expiry is session inventory. Long-dated SPX/XSP puts belong to
+        # other strategies (e.g. ls-algo Bucket 5 Production B, orderRef
+        # namespace "B5P|") and must never be treated as 0DTE risk, matched
+        # against spreads, or flattened by this executor.
         expiry = _expiry_yyyymmdd(getattr(contract, "lastTradeDateOrContractMonth", ""), expiry_today)
+        if expiry != expiry_today:
+            continue
         try:
             right = _normalize_right(getattr(contract, "right", ""))
             strike = float(getattr(contract, "strike"))
@@ -442,7 +448,15 @@ def format_leg_nets(nets: Dict[LegKey, int]) -> str:
 
 
 def cancel_orphan_open_orders(ib: Any, today: str) -> int:
-    """Cancel working non-filled orders left from a prior crashed session."""
+    """Cancel working non-filled orders left from a prior crashed session.
+
+    Cancel hygiene (strategy isolation): scope is strictly this engine's own
+    inventory — SPX/SPXW option (or BAG) orders expiring TODAY. Orders from
+    other strategies are never touched; in particular any order whose orderRef
+    is in the ls-algo Bucket 5 namespace (``B5P|``) or on other underlyings
+    (e.g. XSP long-dated puts) must survive a 0DTE session restart.
+    """
+    expiry_today = today.replace("-", "")
     cancelled = 0
     try:
         trades = list(ib.openTrades())
@@ -461,11 +475,26 @@ def cancel_orphan_open_orders(ib: Any, today: str) -> int:
         status = str(getattr(getattr(trade, "orderStatus", None), "status", "") or "")
         if status.upper() in {"FILLED", "CANCELLED", "APICANCELLED", "INACTIVE"}:
             continue
+        order_ref = str(getattr(order, "orderRef", "") or "")
+        if order_ref.startswith("B5P|"):
+            continue  # foreign strategy namespace — never cancel
         symbol = str(getattr(contract, "symbol", "") or "").upper()
         sec_type = str(getattr(contract, "secType", "") or "").upper()
         local = str(getattr(contract, "localSymbol", "") or "").upper()
-        if sec_type not in {"OPT", "BAG"} and "SPXW" not in local and symbol not in {"SPX", "SPXW"}:
+        trading_class = str(getattr(contract, "tradingClass", "") or "").upper()
+        is_spx_family = (
+            symbol in {"SPX", "SPXW"}
+            or "SPXW" in local
+            or trading_class in {"SPXW", "SPX"}
+        )
+        if sec_type not in {"OPT", "BAG"} or not is_spx_family:
             continue
+        if sec_type == "OPT":
+            expiry = _expiry_yyyymmdd(
+                getattr(contract, "lastTradeDateOrContractMonth", ""), expiry_today
+            )
+            if expiry != expiry_today:
+                continue  # long-dated SPX puts are not 0DTE inventory
         try:
             ib.cancelOrder(order)
             cancelled += 1
