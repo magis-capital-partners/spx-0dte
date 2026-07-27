@@ -231,11 +231,13 @@ def build_run(run_id: str, results_dir: Path, label: str, account_equity: float,
         d = row.get("date", "")
         net = safe_float(row.get("net_pnl"))
         cum += net
+        equity_open = safe_float(row.get("equity_open"), default=0.0)
+        base_for_ret = equity_open if equity_open > 0 else account_equity
         equity += net
         peak = max(peak, equity)
         dd_pct = ((peak - equity) / peak * 100.0) if peak > 0 else 0.0
-        ret_pct = net / account_equity * 100.0
-        daily.append({
+        ret_pct = net / base_for_ret * 100.0 if base_for_ret else 0.0
+        day_row = {
             "date": d,
             "net_pnl": round(net, 2),
             "cum_pnl": round(cum, 2),
@@ -249,7 +251,11 @@ def build_run(run_id: str, results_dir: Path, label: str, account_equity: float,
             "event_bucket": row.get("event_bucket", ""),
             "gross_credit_sold": round(credit_by_date.get(d, safe_float(row.get("gross_credit_sold"))), 2),
             "approx_spread_margin": round(margin_by_date.get(d, safe_float(row.get("approx_spread_margin"))), 2),
-        })
+        }
+        if equity_open > 0:
+            day_row["equity_open"] = round(equity_open, 2)
+            day_row["k"] = round(safe_float(row.get("k"), default=1.0), 4)
+        daily.append(day_row)
 
     trades_by_date: Dict[str, List[dict]] = {}
     for t in trade_rows:
@@ -477,6 +483,59 @@ def build_p3_poststop_strategy_guide(account_equity: float, hist: Optional[dict]
                     "Eligible Mon/Wed (pre-Apr 2022) then all weekdays; metrics on eligible days only.",
                     "Data: local SPXW 1-minute quotes + reconstructed signals (ThetaData history).",
                     "Compare to Trend BC 0.85 on the Overview cumulative P&L chart for a tighter risk-shape variant.",
+                ],
+            },
+        ],
+        "results": _strategy_guide_results(hist),
+    }
+
+
+def build_p3_compounding_strategy_guide(account_equity: float, hist: Optional[dict] = None) -> dict:
+    """Strategy guide for equity-proportional compounding sizing."""
+    eq = f"${account_equity:,.0f}"
+    peak_k = ((hist or {}).get("compounding") or {}).get("peak_k")
+    peak_txt = f"{peak_k:.2f}×" if peak_k else "path-dependent"
+    return {
+        "title": "Compounding f=1 — Size Tracks Equity",
+        "subtitle": (
+            "Same production stack as the primary run, but each day's baseline contracts "
+            "and account equity scale with prior-day ending equity (k = E_t / E_0)"
+        ),
+        "sections": [
+            {
+                "title": "What differs from production",
+                "paragraphs": [
+                    (
+                        "Production trades a fixed 31-lot baseline every day against a constant "
+                        f"{eq} notional. This comparison run keeps every gate, wing, VIX policy, "
+                        "IC overlay, and time-of-day schedule identical — but multiplies "
+                        "baseline_contracts, account_equity, and the VIX tranche cap by "
+                        "k = equity_open / E_0 at the start of each day."
+                    ),
+                    (
+                        "Because every risk governor is expressed as a percent of account equity, "
+                        "scaling contracts and equity together leaves the percentage risk profile "
+                        "unchanged. The result is leverage-through-time: CAGR and max drawdown "
+                        "rise together while Calmar stays roughly flat. Peak size on this path "
+                        f"reached {peak_txt}."
+                    ),
+                ],
+            },
+            {
+                "title": "How to read this vs production",
+                "bullets": [
+                    "Primary production line remains the live / fixed-lot deployment target.",
+                    "Use this run on the Overview chart to see what reinvesting P&L into size would have done.",
+                    "Max drawdown here is the stationary DD risk of the strategy; production's smaller DD is flattered by not resizing.",
+                    "No market-impact model — large peak tranche sizes assume fills at the same mid as the 31-lot book.",
+                ],
+            },
+            {
+                "title": "Shared structure (same as production)",
+                "bullets": [
+                    "Put 150 / call 75 · skew 0.65 · flatten −3.25% · FOMC 13:30 · 120min cooldown.",
+                    "IC overlay: ~0.16Δ, 50pt wings, size fraction 10/31 (scales with k).",
+                    f"Starting equity: {eq} · same eligible-calendar OOS window as primary run.",
                 ],
             },
         ],
@@ -726,6 +785,7 @@ def main() -> None:
 
     default_runs = [
         "p3_poststop_cooldown_120=data/dashboard_runs/p3_poststop_cooldown_120:Production — put 150 + FOMC 13:30 + IC10 Δ0.16 (VIX≥15)",
+        "p3_poststop_compounding_f1=data/dashboard_runs/p3_poststop_compounding_f1:Compounding f=1 — size tracks equity",
         "p3_trend_bc_085=data/dashboard_runs/p3_trend_bc_085:Trend BC 0.85 gate (Wave 2 risk-shape)",
     ]
     specs = args.run or default_runs
@@ -777,6 +837,26 @@ def main() -> None:
                 ),
                 "credit_cap_pct": 50.0,
                 "strategy_guide": build_p3_poststop_strategy_guide(args.account_equity, hist),
+            }
+        elif id_part == "p3_poststop_compounding_f1":
+            peak_k = ((hist or {}).get("compounding") or {}).get("peak_k")
+            peak_txt = f"{peak_k:.2f}×" if peak_k else "path-dependent"
+            meta = {
+                "description": (
+                    "Production stack with true equity compounding: each day scales "
+                    "baseline_contracts, account_equity, and the VIX tranche cap by "
+                    f"k = equity_open / $13M (peak k ≈ {peak_txt}). Same gates/IC/TOD as production. "
+                    "Dashboard comparison — not the live fixed-lot deployment."
+                ),
+                "gates": (
+                    "same as production · compounding k=E_t/E_0 on contracts + equity + tranche cap"
+                ),
+                "sizing_schedule": (
+                    "linear_decay_downsize × k + VIX elevated 1.25× (25–35); "
+                    "tranche cap = round(48 × k); IC = round(vertical_base × 10/31)"
+                ),
+                "credit_cap_pct": 50.0,
+                "strategy_guide": build_p3_compounding_strategy_guide(args.account_equity, hist),
             }
         elif id_part == "p3_trend_bc_085":
             meta = {

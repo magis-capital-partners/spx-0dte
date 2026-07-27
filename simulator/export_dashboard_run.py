@@ -66,6 +66,13 @@ PRESETS = {
         "vix_max_contracts": PRODUCTION_MAX_CONTRACTS_PER_TRANCHE,
         "vix_elevated_scale": VIX_ELEVATED_SCALE,
     },
+    "p3_poststop_compounding_f1": {
+        "kind": "compounding",
+        "scheme": "linear_decay_downsize",
+        "profile": "p3_poststop_cooldown_120",
+        "label": "Compounding f=1 — size tracks equity",
+        "compounding_variant": "full",
+    },
     "p3_trend_bc_085": {
         "kind": "historical_3d",
         "scheme": "linear_decay_downsize",
@@ -402,6 +409,25 @@ def main() -> None:
             incremental=args.incremental,
             settlement_spot_overrides=settlement_overrides or None,
         )
+    elif spec["kind"] == "compounding":
+        # Sequential equity-proportional path; writes dashboard_runs via the suite.
+        import sys
+
+        scripts = root / "scripts"
+        if str(scripts) not in sys.path:
+            sys.path.insert(0, str(scripts))
+        from run_compounding_sizing_suite import run_suite  # noqa: WPS433
+
+        if args.incremental:
+            print("Note: --incremental is ignored for compounding presets (path-dependent).")
+        variant = spec.get("compounding_variant", "full")
+        run_suite(shard=0, shards=1, resume=True, variants_filter=[variant])
+        summary_path = out / "summary.json"
+        if not summary_path.is_file():
+            # Suite writes to the canonical dashboard folder for `full`.
+            summary_path = root / "data" / "dashboard_runs" / "p3_poststop_compounding_f1" / "summary.json"
+        summary = json.loads(summary_path.read_text(encoding="utf-8"))
+        row = summary["headline"]
     else:
         vid = spec["variant_id"]
         kwargs = spec["kwargs"]
