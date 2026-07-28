@@ -157,6 +157,9 @@ class StrategyConfig:
     target_long_abs_delta: float = 0.05
     min_wing_width: float = 25.0
     max_wing_width: float = 400.0
+    # After delta short pick: shift put short N listed strikes lower / call short
+    # N listed strikes higher (further OTM). 0 = production default (no shift).
+    short_strike_otm_offset_steps: int = 0
     stop_multiple: float = 2.0
     daily_credit_cap_pct: float = 0.015
     daily_loss_limit_pct: float = 0.0225
@@ -344,6 +347,10 @@ class StrategyConfig:
     stop_fill_slippage: float = 0.0
     entry_fill_slippage: float = 0.0
     stop_confirmation_count: int = 1
+    # Wall-clock seconds short ask must stay >= stop before firing.
+    # When > 0, overrides stop_confirmation_count (production: 120 ≡ live).
+    # On 1-minute bars this usually fires on the 3rd consecutive breached bar.
+    stop_confirm_seconds: float = 0.0
     spread_stop_loss_multiple: float = 1.5
     block_same_strike_after_stop: bool = False
     # --- Why-not-look-at research knobs (defaults preserve production) ---
@@ -418,6 +425,7 @@ class Trade:
     stop_fill: Optional[float] = None
     long_stop_exit: Optional[float] = None
     stop_confirm_count: int = 0
+    stop_breach_since: Optional[datetime] = None
     exit_reason: str = "open"
     closed_early: bool = False
     close_fee_legs: int = 0
@@ -688,6 +696,49 @@ def snapshot_spot(snapshot: Sequence[OptionQuote]) -> float:
     raise ValueError("Snapshot is missing underlying_price")
 
 
+def _shift_short_further_otm(
+    trading_snapshot: Sequence[OptionQuote],
+    short_quote: OptionQuote,
+    side: str,
+    steps: int,
+) -> Optional[OptionQuote]:
+    """Move put short lower / call short higher by ``steps`` listed strikes."""
+    if steps <= 0:
+        return short_quote
+    option_type = normalize_option_type(short_quote.option_type)
+    strikes = sorted(
+        {
+            q.strike
+            for q in trading_snapshot
+            if normalize_option_type(q.option_type) == option_type
+            and q.expiry == short_quote.expiry
+        }
+    )
+    try:
+        idx = strikes.index(short_quote.strike)
+    except ValueError:
+        return None
+    if side == "bull_put":
+        new_idx = idx - steps
+    elif side == "bear_call":
+        new_idx = idx + steps
+    else:
+        return None
+    if new_idx < 0 or new_idx >= len(strikes):
+        return None
+    target = strikes[new_idx]
+    for q in trading_snapshot:
+        if (
+            q.expiry == short_quote.expiry
+            and normalize_option_type(q.option_type) == option_type
+            and abs(q.strike - target) < 1e-6
+            and q.bid is not None
+            and q.bid > 0
+        ):
+            return q
+    return None
+
+
 def select_spread(
     snapshot: Sequence[OptionQuote],
     side: str,
@@ -715,11 +766,22 @@ def select_spread(
     if not candidates:
         return None
 
+    offset_steps = max(0, int(config.short_strike_otm_offset_steps or 0))
     candidates.sort(key=lambda item: item[0])
     for _, short_quote in candidates:
-        long_quote = select_long_wing(trading_snapshot, short_quote, long_direction, config, side=side)
+        chosen_short = short_quote
+        if offset_steps > 0:
+            shifted = _shift_short_further_otm(
+                trading_snapshot, short_quote, side, offset_steps
+            )
+            if shifted is None:
+                continue
+            chosen_short = shifted
+        long_quote = select_long_wing(
+            trading_snapshot, chosen_short, long_direction, config, side=side
+        )
         if long_quote is not None:
-            return short_quote, long_quote
+            return chosen_short, long_quote
     return None
 
 
@@ -968,6 +1030,7 @@ def build_scored_candidates(
         long_direction = _side_long_direction(side)
         gate_reason = _side_gate_reason(side, signal, eff_config)
 
+        offset_steps = max(0, int(config.short_strike_otm_offset_steps or 0))
         for short_quote in trading_snapshot:
             if normalize_option_type(short_quote.option_type) != option_type or short_quote.delta is None:
                 continue
@@ -978,20 +1041,34 @@ def build_scored_candidates(
                 short_quote.strike, config.prefer_strike_multiple or 25.0
             ):
                 continue
-            long_quote = select_long_wing(trading_snapshot, short_quote, long_direction, eff_config, side=side)
+            # Delta-band seed, then optional further-OTM short shift (puts down / calls up).
+            chosen_short = short_quote
+            if offset_steps > 0:
+                shifted = _shift_short_further_otm(
+                    trading_snapshot, short_quote, side, offset_steps
+                )
+                if shifted is None:
+                    continue
+                chosen_short = shifted
+            long_quote = select_long_wing(
+                trading_snapshot, chosen_short, long_direction, eff_config, side=side
+            )
             if long_quote is None:
                 continue
 
-            width = abs(long_quote.strike - short_quote.strike)
+            width = abs(long_quote.strike - chosen_short.strike)
             if width <= 0:
                 continue
-            credit = short_quote.bid - long_quote.ask
+            if chosen_short.bid is None or long_quote.ask is None:
+                continue
+            credit = chosen_short.bid - long_quote.ask
             credit_to_width = credit / width if width else 0.0
-            distance_pct = _distance_pct(side, short_quote.strike, spot)
-            raw_stop_loss = short_quote.bid * max(eff_config.stop_multiple - 1.0, 0.0) + long_quote.ask
+            distance_pct = _distance_pct(side, chosen_short.strike, spot)
+            raw_stop_loss = chosen_short.bid * max(eff_config.stop_multiple - 1.0, 0.0) + long_quote.ask
             stop_loss_to_credit = raw_stop_loss / max(credit, 0.01)
+            score_delta = abs(chosen_short.delta) if chosen_short.delta is not None else abs_delta
             score = _candidate_score(
-                side, signal, abs_delta, credit_to_width, distance_pct, stop_loss_to_credit, eff_config
+                side, signal, score_delta, credit_to_width, distance_pct, stop_loss_to_credit, eff_config
             )
 
             status = "pass"
@@ -1019,16 +1096,16 @@ def build_scored_candidates(
 
             records.append(
                 CandidateRecord(
-                    timestamp=short_quote.timestamp,
+                    timestamp=chosen_short.timestamp,
                     side=side,
                     status=status,
                     reason=reason,
                     score=score,
-                    expiry=short_quote.expiry,
-                    short_type=normalize_option_type(short_quote.option_type),
-                    short_strike=short_quote.strike,
+                    expiry=chosen_short.expiry,
+                    short_type=normalize_option_type(chosen_short.option_type),
+                    short_strike=chosen_short.strike,
                     long_strike=long_quote.strike,
-                    short_delta=short_quote.delta,
+                    short_delta=chosen_short.delta,
                     long_delta=long_quote.delta,
                     spot=spot,
                     distance_pct=distance_pct,
@@ -1041,10 +1118,20 @@ def build_scored_candidates(
                     term_ratio_z=signal.term_ratio_z,
                     trend_score=signal.trend_score,
                     realized_vs_implied_z=signal.realized_vs_implied_z,
-                    short_quote=short_quote,
+                    short_quote=chosen_short,
                     long_quote=long_quote,
                 )
             )
+
+    if max(0, int(config.short_strike_otm_offset_steps or 0)) > 0:
+        # Multiple delta seeds can map to the same shifted short — keep best score.
+        best: Dict[Tuple[str, float], CandidateRecord] = {}
+        for record in records:
+            key = (record.side, float(record.short_strike))
+            prev = best.get(key)
+            if prev is None or record.score > prev.score:
+                best[key] = record
+        records = list(best.values())
 
     records.sort(key=lambda record: _credit_sort_key(record, config), reverse=True)
     return records
@@ -1943,8 +2030,14 @@ def open_trade(
     is_debit_candidate = candidate is not None and candidate.sleeve in {"trend_debit", "long_put_hedge"}
     if credit <= 0 and not is_debit_candidate:
         return None
+    # Apply entry concession to the short leg so P&L paths (settle/mark/close)
+    # see the same haircut as entry_credit — previously only entry_credit shrank
+    # and gross/net PnL still used unslipped legs.
     if config.entry_fill_slippage > 0 and not is_debit_candidate:
-        credit = max(credit - config.entry_fill_slippage, 0.0)
+        short_sell = max(short_sell - config.entry_fill_slippage, 0.0)
+        credit = short_sell - long_buy
+        if credit <= 0:
+            return None
 
     spot = candidate.spot if candidate else short_quote.underlying_price
     width = abs(long_quote.strike - short_quote.strike)
@@ -2073,6 +2166,7 @@ def process_stops(
             continue
         short_quote = lookup.get((trade.expiry, trade.short_type, trade.short_strike))
         if short_quote is None:
+            # Missing quote: do not reset breach clock (gaps cluster in fast markets).
             continue
         long_quote = lookup.get((trade.expiry, trade.long_type, trade.long_strike))
 
@@ -2088,21 +2182,35 @@ def process_stops(
             triggered = short_quote.ask >= trade.stop_price
 
         if triggered:
+            if trade.stop_breach_since is None:
+                trade.stop_breach_since = timestamp
             trade.stop_confirm_count += 1
         else:
             trade.stop_confirm_count = 0
+            trade.stop_breach_since = None
+            continue
 
-        if trade.stop_confirm_count < config.stop_confirmation_count:
+        if config.stop_confirm_seconds > 0:
+            if trade.stop_breach_since is None:
+                continue
+            breached_for = (timestamp - trade.stop_breach_since).total_seconds()
+            if breached_for < config.stop_confirm_seconds:
+                continue
+        elif trade.stop_confirm_count < config.stop_confirmation_count:
             continue
 
         trade.stopped = True
         trade.stop_time = timestamp
         trade.stop_spot = spot
+        trade.stop_breach_since = None
+        # Adverse fill vs printed ask (matches live limit buffer / MKT slippage).
+        slip = max(float(config.stop_fill_slippage), 0.0)
         if config.stop_mode == "spread_value" and long_quote is not None:
-            trade.stop_fill = short_quote.ask + config.stop_fill_slippage
+            trade.stop_fill = short_quote.ask + slip
             trade.long_stop_exit = long_quote.bid
         else:
-            trade.stop_fill = short_quote.ask + config.stop_fill_slippage
+            # Blowthrough: never fill better than the stop trigger itself.
+            trade.stop_fill = max(short_quote.ask, trade.stop_price) + slip
         newly_stopped.append(trade)
     return newly_stopped
 

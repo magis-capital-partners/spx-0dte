@@ -14,7 +14,8 @@ three share one canonical config in `simulator/profiles.py`.
 |-----------|--------|
 | Put / call wings | **150 / 75** pt |
 | Bear-call gates | skip if `trend_score > 1.0` or `skew_z > 0.65` |
-| Stops | 3.0× short leg, 2-bar confirm |
+| Stops | 3.0× short leg, **120s** sustained confirm (live + backtest) |
+| Entry / stop fill | **$0.05** entry slip; **$0.25** stop slip; **$1.25**/contract fee |
 | Daily halt | −2.25% MTM (no new entries) |
 | Flatten | −3.25% MTM (close all) |
 | Post-stop cooldown | **120 min**, same side only |
@@ -25,8 +26,9 @@ better risk shape in backtest; **not** used for live.
 
 Wave 2 campaign write-up: [`overnight_calmar_wave2_results_2026-07-10.md`](overnight_calmar_wave2_results_2026-07-10.md)
 
-Eligible-calendar OOS backtest (through 2026-07-10, SPX settle override where noted):
-~**19.9% CAGR**, Calmar **~2.32**, max DD **~8.6%**.
+Eligible-calendar OOS backtest with realism package (through 2026-07-27):
+~**16.3% CAGR**, Calmar **~1.46**, max DD **~11.2%** (was ~19.9% / ~2.3 / ~8.6%
+before entry-slip P&L fix, 120s stop clock, $0.25 stop slip, and $1.25 fees).
 
 ---
 

@@ -70,6 +70,7 @@ from live_features import (  # noqa: E402
     split_session_quotes,
     validate_baselines_freshness,
 )
+from feature_state_io import load_feature_state, save_feature_state  # noqa: E402
 from ib_market_data import IBStreamingMarketData  # noqa: E402
 from loop_timing import adaptive_sleep_seconds, should_fire_tranche  # noqa: E402
 from risk_gates import apply_side_stop_cooldowns, side_stop_cooldown_block_reason  # noqa: E402
@@ -163,6 +164,7 @@ class OpenSpread:
     combo_order_id: Optional[int] = None
     stop_order_id: Optional[int] = None
     stop_confirm_count: int = 0
+    stop_breach_since: Optional[datetime] = None
     stopped: bool = False
     closed: bool = False
     stop_fill_price: Optional[float] = None
@@ -246,13 +248,23 @@ class IBSignalProvider:
         config: StrategyConfig,
         baselines_core: Optional[dict] = None,
         session_vix: Optional[float] = None,
+        *,
+        today: Optional[str] = None,
     ):
         self.ib = ib
         self.live = live
         self.config = config
         self.baselines = baselines_core
         self.session_vix = session_vix
-        self._feature_state = SessionFeatureState()
+        self.today = today or datetime.now().date().isoformat()
+        restored = load_feature_state(self.today)
+        self._feature_state = restored if restored is not None else SessionFeatureState()
+        if restored is not None:
+            print(
+                f"[{datetime.now().isoformat()}] restored SessionFeatureState "
+                f"(first_straddle={restored.first_straddle}, "
+                f"spot_history={len(restored.spot_history)})"
+            )
         self._stream = IBStreamingMarketData(ib, live, config)
 
     @staticmethod
@@ -325,6 +337,11 @@ class IBSignalProvider:
             from dataclasses import replace as dc_replace
 
             signal = dc_replace(signal, vix=self.session_vix)
+        if at_tranche:
+            try:
+                save_feature_state(self.today, self._feature_state)
+            except OSError:
+                pass
         return signal
 
 
@@ -973,26 +990,29 @@ def apply_pending_resolution(
         spread = pending.spread
         fill_credit = float(event.get("credit", pending.limit_credit))
         spread.fill_credit = fill_credit
-        # Keep stop_price aligned with strategy multiple on the short bid at submit.
-        if live is not None and live.use_native_stop_replace:
-            multiple = (
-                live.native_stop_multiple
-                if live.native_stop_multiple is not None
-                else config.stop_multiple
+        # Partial fills: shrink local book to filled qty.
+        filled_contracts = int(event.get("contracts") or pending.contracts)
+        if filled_contracts > 0:
+            spread.contracts = filled_contracts
+        # Synthetic stop always uses strategy stop_multiple × short premium.
+        # Native STP uses live.native_stop_multiple separately (wider backstop).
+        if spread.short_entry_sell > 0 and config.stop_multiple > 0:
+            spread.stop_price = _round_spx_premium(
+                spread.short_entry_sell * config.stop_multiple
             )
-            if spread.short_entry_sell > 0 and multiple > 0:
-                spread.stop_price = _round_spx_premium(spread.short_entry_sell * multiple)
         open_spreads.append(spread)
-        contracts = pending.contracts
+        contracts = spread.contracts
         credit_added = fill_credit * contracts * config.multiplier
         margin = candidate_margin_per_contract(pending.candidate, config) * contracts
         sleeve = pending.sleeve or "core"
         sleeve_margin_used[sleeve] = sleeve_margin_used.get(sleeve, 0.0) + margin
         filled = 1
+        partial_note = " partial" if event.get("partial") else ""
         print(
-            f"[{datetime.now().isoformat()}] ENTRY filled {pending.candidate.side} "
+            f"[{datetime.now().isoformat()}] ENTRY filled{partial_note} {pending.candidate.side} "
             f"{pending.candidate.short_strike}/{pending.candidate.long_strike} "
             f"x{contracts} fill={fill_credit:.2f} "
+            f"stop={spread.stop_price:.2f} "
             f"(natural={event.get('natural_credit')} slippage={event.get('fill_slippage')})"
         )
     else:
@@ -1107,10 +1127,17 @@ def manage_stops(
     today: str,
     dry: bool,
     live: LiveConfig,
+    *,
+    now: Optional[datetime] = None,
 ) -> List[OpenSpread]:
-    """Short-leg stop with N-bar confirmation; limit buy then MKT fallback."""
+    """Short-leg stop with time (or poll-count) confirmation; limit→MKT.
+
+    Default live.stop_confirm_seconds=120 mirrors backtest 2×1-minute bars.
+    When stop_confirm_seconds ≤ 0, falls back to config.stop_confirmation_count.
+    """
     if not config.use_short_leg_stops or not quotes:
         return []
+    clock = now or datetime.now()
     lookup = {(q.option_type, q.strike): q for q in quotes}
     newly_stopped: List[OpenSpread] = []
     for spread in open_spreads:
@@ -1119,12 +1146,22 @@ def manage_stops(
         sq = lookup.get((spread.candidate.short_type, spread.candidate.short_strike))
         if sq is None or sq.ask <= 0:
             spread.stop_confirm_count = 0
+            spread.stop_breach_since = None
             continue
         if sq.ask >= spread.stop_price:
+            if spread.stop_breach_since is None:
+                spread.stop_breach_since = clock
             spread.stop_confirm_count += 1
         else:
             spread.stop_confirm_count = 0
-        if spread.stop_confirm_count < config.stop_confirmation_count:
+            spread.stop_breach_since = None
+            continue
+
+        if live.stop_confirm_seconds > 0:
+            breached_for = (clock - spread.stop_breach_since).total_seconds()
+            if breached_for < live.stop_confirm_seconds:
+                continue
+        elif spread.stop_confirm_count < config.stop_confirmation_count:
             continue
 
         spread.stopped = True
@@ -1141,6 +1178,7 @@ def manage_stops(
             if not ok:
                 spread.stopped = False
                 spread.stop_confirm_count = 0
+                spread.stop_breach_since = None
                 continue
             if live.confirm_stop_against_ib and net_before is not None:
                 net_after = _short_leg_ib_net(ib, spread.candidate, today)
@@ -1148,6 +1186,7 @@ def manage_stops(
                 if net_after is None or net_after < net_before + int(spread.contracts):
                     spread.stopped = False
                     spread.stop_confirm_count = 0
+                    spread.stop_breach_since = None
                     log_event(today, {
                         "event": "stop_unconfirmed",
                         "side": spread.candidate.side,
@@ -1164,6 +1203,7 @@ def manage_stops(
                     )
                     continue
         spread.stop_fill_price = fill_px
+        spread.stop_breach_since = None
         newly_stopped.append(spread)
         log_event(
             today,
@@ -1171,10 +1211,12 @@ def manage_stops(
                 "event": "stop",
                 "side": spread.candidate.side,
                 "short_strike": spread.candidate.short_strike,
+                "long_strike": spread.candidate.long_strike,
                 "stop_price": round(spread.stop_price, 2),
                 "short_ask": round(sq.ask, 2),
                 "stop_fill": round(fill_px, 2),
                 "contracts": spread.contracts,
+                "confirm_seconds": live.stop_confirm_seconds,
                 "dry": dry,
             },
             live=live,
@@ -1696,6 +1738,8 @@ def _process_tranche(
                 "long_strike": cand.long_strike,
                 "contracts": contracts,
                 "credit": round(fill_credit, 2),
+                "short_entry_sell": round(spread.short_entry_sell, 4),
+                "long_entry_buy": round(spread.long_entry_buy, 4),
                 "score": round(cand.score, 3),
                 "dry": True,
             })
@@ -1806,7 +1850,7 @@ def run(live: LiveConfig = ACTIVE) -> None:
           f"{'off' if config.vix_widen_put_wing_above <= 0 else f'>={config.vix_widen_put_wing_above:.0f}+{config.vix_widen_put_wing_extra:.0f}'} "
           f"fomc_cutoff={'on@'+config.fomc_entry_end.strftime('%H:%M') if config.use_fomc_entry_cutoff else 'off'} "
           f"gates=trend<={config.candidate_max_adverse_trend}/skew<={config.candidate_max_adverse_skew} "
-          f"stop={config.stop_multiple}x/{config.stop_confirmation_count}bar "
+          f"stop={config.stop_multiple}x/{live.stop_confirm_seconds:.0f}s "
           f"native_stp={'replace@' + (f'{live.native_stop_multiple}x' if live.native_stop_multiple is not None else f'{config.stop_multiple}x') if live.use_native_stop_replace else ('legacy_1.5x' if live.use_native_stop_backstop else 'off')} "
           f"side_cooldown={config.same_side_stop_cooldown_minutes}min "
           f"halt={config.daily_loss_limit_pct:.2%} "
@@ -1885,7 +1929,7 @@ def run(live: LiveConfig = ACTIVE) -> None:
                     f"BP=${acct.buying_power:,.0f} (equity=${live.account_equity:,.0f})"
                 )
             provider = IBSignalProvider(
-                ib, live, config, baselines_core=baselines_core, session_vix=vix_open
+                ib, live, config, baselines_core=baselines_core, session_vix=vix_open, today=today
             )
             provider.start()
 
@@ -2170,7 +2214,9 @@ def run(live: LiveConfig = ACTIVE) -> None:
                         )
                     last_native_stop_verify_at = now
 
-                newly_stopped = manage_stops(ib, open_spreads, quotes, config, today, dry, live)
+                newly_stopped = manage_stops(
+                    ib, open_spreads, quotes, config, today, dry, live, now=now,
+                )
                 if newly_stopped:
                     apply_side_stop_cooldowns(
                         newly_stopped,

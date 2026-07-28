@@ -102,6 +102,24 @@ def _is_filled(trade, quantity: int) -> bool:
     return status == "filled" or filled >= float(quantity)
 
 
+def _filled_qty(trade) -> int:
+    try:
+        return int(round(float(trade.orderStatus.filled or 0)))
+    except (TypeError, ValueError):
+        return 0
+
+
+def _entry_leg_fields(pending: PendingEntry) -> dict:
+    """Persist short/long premiums so restart rebuilds stop = 3× short premium."""
+    spread = pending.spread
+    short_sell = float(getattr(spread, "short_entry_sell", 0.0) or 0.0)
+    long_buy = float(getattr(spread, "long_entry_buy", 0.0) or 0.0)
+    return {
+        "short_entry_sell": round(short_sell, 4),
+        "long_entry_buy": round(long_buy, 4),
+    }
+
+
 def poll_pending_entry(
     ib,
     pending: PendingEntry,
@@ -116,6 +134,7 @@ def poll_pending_entry(
     if _is_filled(trade, pending.contracts):
         fill_credit = abs(float(trade.orderStatus.avgFillPrice or pending.limit_credit))
         slippage = round(pending.natural_credit - fill_credit, 4)
+        legs = _entry_leg_fields(pending)
         return None, {
             "event": "entry",
             "side": pending.candidate.side,
@@ -129,6 +148,7 @@ def poll_pending_entry(
             "fill_slippage": slippage,
             "score": round(pending.score, 3),
             "ladder_steps": pending.ladder_step,
+            **legs,
         }
 
     hard = _hard_rejection_reason(trade)
@@ -144,9 +164,34 @@ def poll_pending_entry(
             "credit": round(pending.limit_credit, 2),
             "status": trade.orderStatus.status,
             "reason": hard,
+            **_entry_leg_fields(pending),
         }
 
     if now >= pending.work_until:
+        filled = _filled_qty(trade)
+        if 0 < filled < pending.contracts:
+            # Book the partial before cancelling the remainder — never orphan IB legs.
+            ib.cancelOrder(trade.order)
+            ib.sleep(0.25)
+            fill_credit = abs(float(trade.orderStatus.avgFillPrice or pending.limit_credit))
+            slippage = round(pending.natural_credit - fill_credit, 4)
+            return None, {
+                "event": "entry",
+                "side": pending.candidate.side,
+                "sleeve": pending.sleeve,
+                "short_strike": pending.candidate.short_strike,
+                "long_strike": pending.candidate.long_strike,
+                "contracts": filled,
+                "requested_contracts": pending.contracts,
+                "partial": True,
+                "natural_credit": round(pending.natural_credit, 2),
+                "limit_credit": round(pending.limit_credit, 2),
+                "credit": round(fill_credit, 2),
+                "fill_slippage": slippage,
+                "score": round(pending.score, 3),
+                "ladder_steps": pending.ladder_step,
+                **_entry_leg_fields(pending),
+            }
         ib.cancelOrder(trade.order)
         ib.sleep(0.25)
         return None, {
@@ -160,6 +205,7 @@ def poll_pending_entry(
             "credit": round(pending.limit_credit, 2),
             "status": "Cancelled",
             "reason": "entry_unfilled",
+            **_entry_leg_fields(pending),
         }
 
     if (

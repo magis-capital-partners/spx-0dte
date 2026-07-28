@@ -64,23 +64,29 @@ class LiveConfig:
 
     # --- Phase 4: stop execution ------------------------------------------ #
     stop_limit_slippage_pct: float = 0.05
-    stop_limit_slippage_abs: float = 0.15
+    stop_limit_slippage_abs: float = 0.25  # aligned with production stop_fill_slippage
     stop_limit_timeout_seconds: float = 3.0
     stop_near_fraction: float = 0.80
-    # Cancel → add → replace native BUY STP on the short leg at strategy 3×.
-    # Synthetic loop stops remain primary while the executor is healthy; native
-    # STP is the backstop if the process/loop dies. Before a same-strike combo
-    # add, existing STPs are cancelled (IB error 201), then replaced for the
-    # aggregated short qty after fill — or re-armed immediately on reject.
+    # Synthetic stop must stay breached for this many seconds (matches backtest
+    # stop_confirm_seconds=120). Set ≤0 to fall back to poll-count confirmation
+    # via StrategyConfig.stop_confirmation_count.
+    stop_confirm_seconds: float = 120.0
+    # Cancel → add → replace native BUY STP on the short leg.
+    # Synthetic loop stops remain primary (at strategy 3× after confirm_seconds);
+    # native STP is a WIDER disaster backstop if the process dies. Default
+    # native_stop_multiple=4.5 so it cannot race the synthetic 3× path.
+    # Before a same-strike combo add, existing STPs are cancelled (IB error 201),
+    # then replaced for the aggregated short qty after fill — or re-armed on reject.
     use_native_stop_replace: bool = True
-    # None → StrategyConfig.stop_multiple (production 3.0). Override only for tests.
-    native_stop_multiple: float | None = None
+    # Wider than StrategyConfig.stop_multiple (3.0) so native cannot race synthetic.
+    native_stop_multiple: float | None = 4.5
     # Cap how long same-strike scale-ins may leave STPs disarmed (also caps
     # pending work_until when adding onto an existing short).
     native_stop_disarm_max_seconds: float = 45.0
     # Re-check working STP still exists in IB; replace if cancelled/missing.
     native_stop_verify_seconds: float = 30.0
-    # Legacy disaster-only STP at stop_price×1.5. Prefer use_native_stop_replace.
+    # Legacy disaster-only STP at stop_price×1.5. Prefer use_native_stop_replace
+    # with a wider native_stop_multiple.
     use_native_stop_backstop: bool = False
 
     # --- Phase 5: entry execution ------------------------------------------- #

@@ -88,6 +88,38 @@ class AccountGuardTests(unittest.TestCase):
         self.assertTrue(res.halt_entries)
         self.assertTrue(res.flatten)
 
+    def test_fetch_cancels_account_summary(self) -> None:
+        from account_guards import fetch_account_snapshot
+        from types import SimpleNamespace
+
+        class FakeIB:
+            def __init__(self):
+                self.cancelled = []
+                self._summary = [
+                    SimpleNamespace(tag="NetLiquidation", value="500000"),
+                    SimpleNamespace(tag="BuyingPower", value="100000"),
+                ]
+
+            def reqAccountSummary(self):
+                return None
+
+            def sleep(self, _s):
+                return None
+
+            def accountSummary(self):
+                return list(self._summary)
+
+            def cancelAccountSummary(self, group):
+                self.cancelled.append(group)
+
+            def accountValues(self):
+                return []
+
+        ib = FakeIB()
+        snap = fetch_account_snapshot(ib)
+        self.assertEqual(snap.net_liquidation, 500_000.0)
+        self.assertEqual(ib.cancelled, ["All"])
+
 
 if __name__ == "__main__":
     unittest.main()

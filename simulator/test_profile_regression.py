@@ -52,6 +52,10 @@ def test_poststop_profile_cooldown() -> None:
     assert cfg.daily_loss_limit_pct == 0.0225
     assert cfg.put_wing_width == 150.0  # Wave 2 Calmar winner put_wing_150
     assert cfg.call_wing_width == 75.0
+    assert cfg.entry_fill_slippage == 0.05
+    assert cfg.stop_fill_slippage == 0.25
+    assert cfg.fee_per_contract == 1.25
+    assert cfg.stop_confirm_seconds == 120.0
     assert "p3_poststop_cooldown_120" in PROFILE_BUILDERS
 
 
@@ -62,6 +66,8 @@ def test_trend_bc_085_profile() -> None:
     assert cfg.candidate_max_adverse_trend == 0.85
     assert cfg.put_wing_width == 150.0
     assert cfg.candidate_max_adverse_skew == 0.65
+    assert cfg.stop_fill_slippage == 0.25
+    assert cfg.stop_confirm_seconds == 120.0
     assert "p3_trend_bc_085" in PROFILE_BUILDERS
 
 

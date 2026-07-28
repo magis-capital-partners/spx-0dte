@@ -54,17 +54,23 @@ PRODUCTION_CONDOR_TARGET_DELTA = 0.16
 PRODUCTION_CONDOR_MAX_ENTRIES_PER_DAY = 1
 
 # --------------------------------------------------------------------------- #
-# Frozen 3D winner (wide wings + 3x stop + 2-bar confirm + flatten governor).
-# --------------------------------------------------------------------------- #
+# Frozen 3D winner + July 2026 realism package (aligned with live executor).
+# Entry slip 0.05 matches live entry_limit_concession (now applied to P&L legs).
+# Stop slip 0.25 ≈ live limit buffer / partial MKT adverse vs printed ask.
+# Fee 1.25 ≈ IB all-in SPXW (vs optimistic 0.79).
+# stop_confirm_seconds 120 matches live synthetic confirm (replaces bare 2-bar).
 WINNERS: Dict[str, object] = {
     "stop_multiple": 3.0,
-    "stop_confirmation_count": 2,
+    "stop_confirmation_count": 2,  # fallback if stop_confirm_seconds == 0
+    "stop_confirm_seconds": 120.0,
     "same_side_stop_cooldown_minutes": 0,
     "max_stops_per_side": 999,
     "daily_loss_limit_pct": 0.0225,   # halt NEW entries here
     "flatten_on_daily_loss": True,
     "flatten_loss_limit_pct": 0.035,  # force-flatten OPEN positions here
     "entry_fill_slippage": 0.05,      # matches live entry_limit_concession
+    "stop_fill_slippage": 0.25,
+    "fee_per_contract": 1.25,
 }
 
 

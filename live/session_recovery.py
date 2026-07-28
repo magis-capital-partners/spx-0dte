@@ -294,6 +294,29 @@ def open_entry_events_from_fills(events: Sequence[dict]) -> List[dict]:
     return open_entries
 
 
+def _require_short_entry_sell(event: dict) -> float:
+    """Stop distance must use short-leg premium, never net credit.
+
+    Falling back to net credit made recovered stops ~3× too tight
+    (e.g. credit 0.60 → stop 1.80 instead of short 2.50 → stop 7.50).
+    """
+    raw = event.get("short_entry_sell")
+    if raw is None or raw == "":
+        raise ValueError(
+            "entry event missing short_entry_sell — refuse to rebuild stop from "
+            "net credit (would set stop ≈ 3× credit instead of 3× short premium). "
+            f"side={event.get('side')} short={event.get('short_strike')} "
+            f"long={event.get('long_strike')}"
+        )
+    short_sell = float(raw)
+    if short_sell <= 0:
+        raise ValueError(
+            f"entry event has non-positive short_entry_sell={short_sell!r} "
+            f"side={event.get('side')} short={event.get('short_strike')}"
+        )
+    return short_sell
+
+
 def rebuild_open_spreads_from_entries(
     entries: Sequence[dict],
     *,
@@ -302,7 +325,11 @@ def rebuild_open_spreads_from_entries(
     OpenSpread,
     CandidateRecord,
 ) -> Tuple[List[Any], float]:
-    """Materialize OpenSpread objects from persisted entry events."""
+    """Materialize OpenSpread objects from persisted entry events.
+
+    Stop price is always ``short_entry_sell × stop_multiple`` (production 3×
+    short premium). Net credit is never used as a short-premium proxy.
+    """
     spreads: List[Any] = []
     gross = 0.0
     expiry = today.replace("-", "")
@@ -315,10 +342,13 @@ def rebuild_open_spreads_from_entries(
         credit = float(event.get("credit") or event.get("limit_credit") or 0.0)
         short_strike = float(event["short_strike"])
         long_strike = float(event["long_strike"])
-        # Best available short-leg premium proxy for stop distance.
-        short_sell = float(event.get("short_entry_sell") or credit or 0.0)
-        long_buy = float(event.get("long_entry_buy") or max(short_sell - credit, 0.0))
-        stop_price = short_sell * float(stop_multiple) if short_sell > 0 else 0.0
+        short_sell = _require_short_entry_sell(event)
+        raw_long = event.get("long_entry_buy")
+        if raw_long is None or raw_long == "":
+            long_buy = max(short_sell - credit, 0.0)
+        else:
+            long_buy = float(raw_long)
+        stop_price = short_sell * float(stop_multiple)
         ts_raw = event.get("ts") or event.get("timestamp")
         try:
             ts = datetime.fromisoformat(str(ts_raw).replace("Z", "")) if ts_raw else datetime.now()
@@ -364,9 +394,42 @@ def rebuild_open_spreads_from_entries(
 
 
 def expected_leg_net_from_spreads(spreads: Sequence[Any], today: str) -> Dict[LegKey, int]:
-    """Net option lots implied by recovered verticals (short −contracts, long +contracts)."""
+    """Net option lots implied by recovered verticals (short −contracts, long +contracts).
+
+    Stopped (short covered, long wing kept) contribute only the long wing.
+    Fully closed spreads contribute nothing.
+    """
     expiry_fallback = today.replace("-", "")
     nets: Dict[LegKey, int] = {}
+    for spread in spreads:
+        if getattr(spread, "closed", False):
+            continue
+        cand = spread.candidate
+        right = _normalize_right(cand.short_type)
+        expiry = _expiry_yyyymmdd(cand.expiry, expiry_fallback)
+        contracts = int(spread.contracts)
+        long_key = LegKey(right=right, strike=float(cand.long_strike), expiry=expiry)
+        if getattr(spread, "stopped", False):
+            nets[long_key] = nets.get(long_key, 0) + contracts
+            continue
+        short_key = LegKey(right=right, strike=float(cand.short_strike), expiry=expiry)
+        nets[short_key] = nets.get(short_key, 0) - contracts
+        nets[long_key] = nets.get(long_key, 0) + contracts
+    return {k: v for k, v in nets.items() if v != 0}
+
+
+def mark_stopped_wings_from_ib(
+    spreads: Sequence[Any],
+    ib_nets: Dict[LegKey, int],
+    today: str,
+) -> List[str]:
+    """If IB shows short flat but long wing still held, mark spread stopped.
+
+    Happens when native STP fired while the executor was down. Returns warning
+    strings for each wing marked. Leaves unexplained residuals to the caller.
+    """
+    expiry_fallback = today.replace("-", "")
+    warnings: List[str] = []
     for spread in spreads:
         if getattr(spread, "closed", False) or getattr(spread, "stopped", False):
             continue
@@ -376,9 +439,20 @@ def expected_leg_net_from_spreads(spreads: Sequence[Any], today: str) -> Dict[Le
         contracts = int(spread.contracts)
         short_key = LegKey(right=right, strike=float(cand.short_strike), expiry=expiry)
         long_key = LegKey(right=right, strike=float(cand.long_strike), expiry=expiry)
-        nets[short_key] = nets.get(short_key, 0) - contracts
-        nets[long_key] = nets.get(long_key, 0) + contracts
-    return {k: v for k, v in nets.items() if v != 0}
+        ib_short = int(ib_nets.get(short_key, 0))
+        ib_long = int(ib_nets.get(long_key, 0))
+        # Intact vertical: short=-N, long=+N
+        if ib_short == -contracts and ib_long == contracts:
+            continue
+        # Native STP covered short; long wing remains.
+        if ib_short == 0 and ib_long == contracts:
+            spread.stopped = True
+            spread.stop_fill_price = float(getattr(spread, "stop_price", 0.0) or 0.0)
+            warnings.append(
+                f"marked stopped wing {cand.side} {cand.short_strike}/{cand.long_strike} "
+                f"x{contracts} (IB short flat, long still held — likely native STP while down)"
+            )
+    return warnings
 
 
 def fetch_ib_spxw_positions(ib: Any, today: str) -> Dict[LegKey, int]:
@@ -518,17 +592,23 @@ def recover_session_book(
     live_dir: Path = LIVE_DIR,
     cancel_orphans: bool = True,
     fail_on_unmatched: bool = True,
+    manage_only_on_stopped_wings: bool = True,
 ) -> RecoveredBook:
     """Rebuild open book from fills.jsonl and verify against IB positions."""
     events = load_fills_events(today, live_dir)
     entries = open_entry_events_from_fills(events)
-    spreads, gross = rebuild_open_spreads_from_entries(
-        entries,
-        today=today,
-        stop_multiple=stop_multiple,
-        OpenSpread=OpenSpread,
-        CandidateRecord=CandidateRecord,
-    )
+    try:
+        spreads, gross = rebuild_open_spreads_from_entries(
+            entries,
+            today=today,
+            stop_multiple=stop_multiple,
+            OpenSpread=OpenSpread,
+            CandidateRecord=CandidateRecord,
+        )
+    except ValueError as exc:
+        raise SystemExit(
+            f"session recovery refused — cannot rebuild stops safely: {exc}"
+        ) from exc
     warnings: List[str] = []
     ib_matched = 0
 
@@ -538,8 +618,11 @@ def recover_session_book(
             warnings.append(f"cancelled {n_cancelled} orphan open order(s) from prior run")
 
     if ib is not None:
-        expected = expected_leg_net_from_spreads(spreads, today)
         ib_nets = fetch_ib_spxw_positions(ib, today)
+        if manage_only_on_stopped_wings and spreads:
+            wing_warns = mark_stopped_wings_from_ib(spreads, ib_nets, today)
+            warnings.extend(wing_warns)
+        expected = expected_leg_net_from_spreads(spreads, today)
         # Count legs that match exactly.
         for key, qty in expected.items():
             if ib_nets.get(key) == qty:

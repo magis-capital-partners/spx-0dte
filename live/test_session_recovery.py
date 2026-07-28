@@ -59,7 +59,7 @@ class OpenEntryEventsTests(unittest.TestCase):
 
 
 class RebuildSpreadsTests(unittest.TestCase):
-    def test_rebuild_sets_stop_and_gross(self) -> None:
+    def test_rebuild_sets_stop_from_short_premium_not_credit(self) -> None:
         entries = [
             {
                 "event": "entry",
@@ -68,6 +68,8 @@ class RebuildSpreadsTests(unittest.TestCase):
                 "long_strike": 7625,
                 "contracts": 2,
                 "credit": 1.65,
+                "short_entry_sell": 2.50,
+                "long_entry_buy": 0.85,
                 "score": 1.7,
                 "sleeve": "core",
                 "ts": "2026-07-09T11:47:14",
@@ -76,17 +78,66 @@ class RebuildSpreadsTests(unittest.TestCase):
         spreads, gross = rebuild_open_spreads_from_entries(
             entries,
             today="2026-07-09",
-            stop_multiple=2.0,
+            stop_multiple=3.0,
             OpenSpread=OpenSpread,
             CandidateRecord=CandidateRecord,
         )
         self.assertEqual(len(spreads), 1)
         self.assertEqual(spreads[0].contracts, 2)
+        self.assertAlmostEqual(spreads[0].short_entry_sell, 2.50)
+        self.assertAlmostEqual(spreads[0].stop_price, 7.50)  # 3 × short premium
+        self.assertNotAlmostEqual(spreads[0].stop_price, 1.65 * 3.0)  # not 3 × credit
         self.assertAlmostEqual(gross, 1.65 * 2 * 100)
         self.assertEqual(spreads[0].candidate.short_type, "CALL")
         nets = expected_leg_net_from_spreads(spreads, "2026-07-09")
         self.assertEqual(nets[LegKey("C", 7545.0, "20260709")], -2)
         self.assertEqual(nets[LegKey("C", 7625.0, "20260709")], 2)
+
+    def test_rebuild_refuses_missing_short_premium(self) -> None:
+        entries = [
+            {
+                "event": "entry",
+                "side": "bear_call",
+                "short_strike": 7545,
+                "long_strike": 7625,
+                "contracts": 2,
+                "credit": 1.65,
+            }
+        ]
+        with self.assertRaises(ValueError) as ctx:
+            rebuild_open_spreads_from_entries(
+                entries,
+                today="2026-07-09",
+                stop_multiple=3.0,
+                OpenSpread=OpenSpread,
+                CandidateRecord=CandidateRecord,
+            )
+        self.assertIn("short_entry_sell", str(ctx.exception))
+
+    def test_stopped_wing_expected_nets_long_only(self) -> None:
+        entries = [
+            {
+                "event": "entry",
+                "side": "bear_call",
+                "short_strike": 7545,
+                "long_strike": 7625,
+                "contracts": 2,
+                "credit": 1.65,
+                "short_entry_sell": 2.50,
+                "long_entry_buy": 0.85,
+            }
+        ]
+        spreads, _ = rebuild_open_spreads_from_entries(
+            entries,
+            today="2026-07-09",
+            stop_multiple=3.0,
+            OpenSpread=OpenSpread,
+            CandidateRecord=CandidateRecord,
+        )
+        spreads[0].stopped = True
+        nets = expected_leg_net_from_spreads(spreads, "2026-07-09")
+        self.assertEqual(nets, {LegKey("C", 7625.0, "20260709"): 2})
+        self.assertNotIn(LegKey("C", 7545.0, "20260709"), nets)
 
 
 class UnmatchedRiskTests(unittest.TestCase):
@@ -106,8 +157,26 @@ class RecoverSessionBookTests(unittest.TestCase):
             day_dir.mkdir(parents=True)
             fills = day_dir / "fills.jsonl"
             rows = [
-                {"event": "entry", "side": "bear_call", "short_strike": 7545, "long_strike": 7625, "contracts": 2, "credit": 1.65},
-                {"event": "entry", "side": "bear_call", "short_strike": 7545, "long_strike": 7610, "contracts": 1, "credit": 1.7},
+                {
+                    "event": "entry",
+                    "side": "bear_call",
+                    "short_strike": 7545,
+                    "long_strike": 7625,
+                    "contracts": 2,
+                    "credit": 1.65,
+                    "short_entry_sell": 2.50,
+                    "long_entry_buy": 0.85,
+                },
+                {
+                    "event": "entry",
+                    "side": "bear_call",
+                    "short_strike": 7545,
+                    "long_strike": 7610,
+                    "contracts": 1,
+                    "credit": 1.7,
+                    "short_entry_sell": 2.40,
+                    "long_entry_buy": 0.70,
+                },
             ]
             fills.write_text("\n".join(json.dumps(r) for r in rows) + "\n", encoding="utf-8")
             book = recover_session_book(

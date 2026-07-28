@@ -8,12 +8,13 @@ then the same z-score lookup against rolling baselines.
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, time
 from typing import Dict, List, Optional, Sequence, Tuple
 
 from historical_baselines import FEATURES, minute_key, zscore
 from mbh_simulator import OptionQuote, SignalSnapshot
+from rv_feature import atm_iv_from_pair, realized_vs_implied_raw
 
 
 @dataclass
@@ -23,6 +24,28 @@ class SessionFeatureState:
     first_straddle: Optional[float] = None
     first_minutes: Optional[float] = None
     previous_spot: Optional[float] = None
+    spot_history: List[float] = field(default_factory=list)
+
+    def to_dict(self) -> dict:
+        return {
+            "first_straddle": self.first_straddle,
+            "first_minutes": self.first_minutes,
+            "previous_spot": self.previous_spot,
+            # Cap history so mid-day restarts stay cheap to serialize.
+            "spot_history": list(self.spot_history[-390:]),
+        }
+
+    @classmethod
+    def from_dict(cls, payload: Optional[dict]) -> "SessionFeatureState":
+        if not payload:
+            return cls()
+        hist = payload.get("spot_history") or []
+        return cls(
+            first_straddle=payload.get("first_straddle"),
+            first_minutes=payload.get("first_minutes"),
+            previous_spot=payload.get("previous_spot"),
+            spot_history=[float(x) for x in hist if x is not None],
+        )
 
 
 def minutes_to_close(ts: datetime, close: time = time(16, 0)) -> float:
@@ -93,10 +116,11 @@ def compute_raw_features(
     next_expiry_quotes: Optional[Sequence[OptionQuote]] = None,
 ) -> Dict[str, float]:
     """Compute pre-zscore features matching ``feature_builder.build_for_day``."""
-    straddle, _, _ = _atm_straddle_from_quotes(quotes, spot)
+    straddle, atm_call, atm_put = _atm_straddle_from_quotes(quotes, spot)
     if not math.isfinite(straddle) or straddle <= 0:
         return {feature: 0.0 for feature in FEATURES}
 
+    state.spot_history.append(float(spot))
     mins = minutes_to_close(ts)
     if state.first_straddle is None:
         state.first_straddle = straddle
@@ -125,12 +149,20 @@ def compute_raw_features(
         trend_score = (spot - state.previous_spot) / straddle
     state.previous_spot = spot
 
+    atm_iv = atm_iv_from_pair(
+        float(atm_call.iv) if atm_call and atm_call.iv is not None else None,
+        float(atm_put.iv) if atm_put and atm_put.iv is not None else None,
+    )
+    realized = realized_vs_implied_raw(
+        state.spot_history, spot=spot, straddle=straddle, atm_iv=atm_iv
+    )
+
     return {
         "straddle_residual_z": straddle_residual_z,
         "skew_z": skew_z,
         "term_ratio_z": term_ratio_z,
         "trend_score": trend_score,
-        "realized_vs_implied_z": 0.0,
+        "realized_vs_implied_z": realized,
     }
 
 

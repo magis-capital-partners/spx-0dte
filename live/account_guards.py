@@ -47,16 +47,22 @@ def snapshot_from_account_values(values: Mapping[str, object]) -> AccountSnapsho
 
 
 def fetch_account_snapshot(ib: Any, *, timeout_sec: float = 3.0) -> AccountSnapshot:
-    """Pull NetLiquidation and BuyingPower from a connected IB client."""
+    """Pull NetLiquidation and BuyingPower from a connected IB client.
+
+    Cancels the account-summary subscription after reading to avoid IB error
+    322 (maximum number of account summary requests exceeded).
+    """
     tags = {
         "NetLiquidation": None,
         "BuyingPower": None,
         "AvailableFunds": None,
     }
+    summary_requested = False
     try:
         # Prefer accountSummary (async subscription); fall back to accountValues.
         try:
             ib.reqAccountSummary()
+            summary_requested = True
             ib.sleep(min(timeout_sec, 1.5))
             for row in list(getattr(ib, "accountSummary", lambda: [])()):
                 tag = str(getattr(row, "tag", "") or "")
@@ -64,6 +70,15 @@ def fetch_account_snapshot(ib: Any, *, timeout_sec: float = 3.0) -> AccountSnaps
                     tags[tag] = getattr(row, "value", None)
         except Exception:
             pass
+        finally:
+            if summary_requested:
+                try:
+                    # groupName "All" is the ib_insync default for reqAccountSummary.
+                    cancel = getattr(ib, "cancelAccountSummary", None)
+                    if callable(cancel):
+                        cancel("All")
+                except Exception:
+                    pass
         if tags["NetLiquidation"] is None or (
             tags["BuyingPower"] is None and tags["AvailableFunds"] is None
         ):
