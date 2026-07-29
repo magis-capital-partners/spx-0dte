@@ -73,12 +73,25 @@ while ($true) {
         -RedirectStandardError (Join-Path $LogDir "executor-stderr.log")
 
     Wait-Process -Id $p.Id
+    try { $p.Refresh() } catch {}
     $code = $p.ExitCode
-    Write-SupLog "ib_executor exited code=$code pid=$($p.Id)"
+    if ($null -eq $code) { $code = -1 }
 
-    # Clean session_end / intentional exit - do not spin overnight.
-    if ($code -eq 0) {
-        Write-SupLog "clean exit - supervisor stopping"
+    # After force_flat_time (~16:00) the executor ends cleanly; Start-Process can
+    # leave ExitCode null on Windows. Treat "session end" in stdout as clean stop.
+    $stdoutPath = Join-Path $LogDir "executor-stdout.log"
+    $sawSessionEnd = $false
+    if (Test-Path $stdoutPath) {
+        $tail = Get-Content $stdoutPath -Tail 30 -ErrorAction SilentlyContinue
+        if ($tail -match 'session end') { $sawSessionEnd = $true }
+    }
+    $nowT = Get-Date
+    $afterFlat = ($nowT.TimeOfDay -ge [TimeSpan]::Parse("16:00:00"))
+
+    Write-SupLog "ib_executor exited code=$code pid=$($p.Id) session_end=$sawSessionEnd after_flat=$afterFlat"
+
+    if ($code -eq 0 -or $sawSessionEnd -or $afterFlat) {
+        Write-SupLog "clean / end-of-day exit - supervisor stopping"
         break
     }
 

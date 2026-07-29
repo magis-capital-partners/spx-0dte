@@ -104,15 +104,18 @@ function SessionNow() {
   const [logs, setLogs] = useState([]);
   const [localErr, setLocalErr] = useState(null);
   const logRef = React.useRef(null);
+  const isHttpsPage = typeof location !== "undefined" && location.protocol === "https:";
 
   useEffect(() => {
     let cancelled = false;
     const tick = () => {
-      fetch(LOCAL_STATUS + "/status", { cache: "no-store" })
+      // From HTTPS Pages, Chromium may block loopback until Private Network Access
+      // is allowed; always also load same-origin cloud status.
+      fetch(LOCAL_STATUS + "/status", { cache: "no-store", mode: "cors" })
         .then(r => { if (!r.ok) throw new Error(String(r.status)); return r.json(); })
         .then(j => { if (!cancelled) { setLocal(j); setLocalErr(null); } })
         .catch(e => { if (!cancelled) { setLocal(null); setLocalErr(String(e.message || e)); } });
-      fetch(LOCAL_STATUS + "/logs?tail=120", { cache: "no-store" })
+      fetch(LOCAL_STATUS + "/logs?tail=120", { cache: "no-store", mode: "cors" })
         .then(r => r.ok ? r.json() : null)
         .then(j => { if (!cancelled && j?.lines) setLogs(j.lines); })
         .catch(() => {});
@@ -152,8 +155,8 @@ function SessionNow() {
       {!src && (
         <p className="muted" style={{margin:0}}>
           No live status yet. On the trading PC start <code>Magis SPX 0DTE Status API</code>
-          (or <code>.\scripts\run_session_status_server.ps1</code>). Cloud status appears after
-          <code> publish_live_status.ps1 -Deploy</code>.
+          {" "}and <code>Magis SPX 0DTE Status Publish</code>, or run
+          {" "}<code>.\scripts\run_session_status_server.ps1</code>.
         </p>
       )}
       {src && (
@@ -187,9 +190,10 @@ function SessionNow() {
             </div>
           ) : (
             <p className="muted" style={{margin:"8px 0 0"}}>
-              Full command-prompt stream is local-only. On the trading PC open
-              {" "}<code>http://127.0.0.1:5500/</code> via <code>.\scripts\serve_dashboard_local.ps1</code>
-              {localErr ? <> (local API: {localErr})</> : null}.
+              {isHttpsPage
+                ? <>Full console needs the trading PC. If Chrome asks to allow local network access, click Allow — or open <code>http://127.0.0.1:5500/</code> via <code>.\scripts\serve_dashboard_local.ps1</code>.</>
+                : <>Full command-prompt stream needs the Status API on this PC (<code>http://127.0.0.1:8765</code>).</>}
+              {localErr && isHttpsPage ? <> Browser blocked local API ({localErr}).</> : null}
             </p>
           )}
         </>
