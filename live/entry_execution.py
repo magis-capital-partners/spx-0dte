@@ -1,7 +1,6 @@
 """Entry order pricing, quote guards, and non-blocking combo fill polling."""
 from __future__ import annotations
 
-import time as _time
 import math
 from dataclasses import dataclass
 from datetime import datetime, timedelta
@@ -9,6 +8,10 @@ from typing import Any, List, Optional, Tuple
 
 from live_config import LiveConfig
 from mbh_simulator import CandidateRecord, OptionQuote
+
+# Match ib_insync.OrderStatus DoneStates / ActiveStates (lowercase).
+_DONE_STATUSES = frozenset({"filled", "cancelled", "apicancelled"})
+_ACTIVE_STATUSES = frozenset({"apipending", "presubmitted", "submitted", "pendingsubmit"})
 
 
 def round_spx_premium(price: float) -> float:
@@ -82,6 +85,15 @@ def _order_status(trade) -> str:
     return (trade.orderStatus.status or "").lower()
 
 
+def _is_active_status(trade) -> bool:
+    return _order_status(trade) in _ACTIVE_STATUSES
+
+
+def pending_trade_is_active(pending: PendingEntry) -> bool:
+    """True when the working entry order is still amendable/cancellable."""
+    return _is_active_status(pending.trade)
+
+
 def _hard_rejection_reason(trade) -> str:
     for entry in reversed(trade.log):
         msg = entry.message or ""
@@ -91,7 +103,7 @@ def _hard_rejection_reason(trade) -> str:
         if msg and "permission" in msg.lower():
             return msg
     status = _order_status(trade)
-    if status in {"inactive", "apicancelled"} or "reject" in status:
+    if status in {"inactive", "apicancelled", "cancelled"} or "reject" in status:
         return trade.orderStatus.status or "rejected"
     return ""
 
@@ -120,6 +132,62 @@ def _entry_leg_fields(pending: PendingEntry) -> dict:
     }
 
 
+def _entry_fill_event(pending: PendingEntry, *, contracts: int, partial: bool = False) -> dict:
+    trade = pending.trade
+    fill_credit = abs(float(trade.orderStatus.avgFillPrice or pending.limit_credit))
+    slippage = round(pending.natural_credit - fill_credit, 4)
+    event = {
+        "event": "entry",
+        "side": pending.candidate.side,
+        "sleeve": pending.sleeve,
+        "short_strike": pending.candidate.short_strike,
+        "long_strike": pending.candidate.long_strike,
+        "contracts": contracts,
+        "natural_credit": round(pending.natural_credit, 2),
+        "limit_credit": round(pending.limit_credit, 2),
+        "credit": round(fill_credit, 2),
+        "fill_slippage": slippage,
+        "score": round(pending.score, 3),
+        "ladder_steps": pending.ladder_step,
+        **_entry_leg_fields(pending),
+    }
+    if partial:
+        event["partial"] = True
+        event["requested_contracts"] = pending.contracts
+    return event
+
+
+def _entry_reject_event(pending: PendingEntry, *, reason: str, status: Optional[str] = None) -> dict:
+    trade = pending.trade
+    return {
+        "event": "order_rejected",
+        "side": pending.candidate.side,
+        "short_strike": pending.candidate.short_strike,
+        "long_strike": pending.candidate.long_strike,
+        "contracts": pending.contracts,
+        "natural_credit": round(pending.natural_credit, 2),
+        "limit_credit": round(pending.limit_credit, 2),
+        "credit": round(pending.limit_credit, 2),
+        "status": status if status is not None else (trade.orderStatus.status or "unknown"),
+        "reason": reason,
+        **_entry_leg_fields(pending),
+    }
+
+
+def _resolve_terminal_or_reject(
+    pending: PendingEntry,
+    *,
+    reason: str,
+) -> Tuple[Optional[PendingEntry], dict]:
+    """Book a partial fill if any, otherwise reject. Never leaves a Done trade pending."""
+    filled = _filled_qty(pending.trade)
+    if 0 < filled < pending.contracts:
+        return None, _entry_fill_event(pending, contracts=filled, partial=True)
+    if filled >= pending.contracts:
+        return None, _entry_fill_event(pending, contracts=pending.contracts)
+    return None, _entry_reject_event(pending, reason=reason)
+
+
 def poll_pending_entry(
     ib,
     pending: PendingEntry,
@@ -132,40 +200,18 @@ def poll_pending_entry(
     """Advance a working entry; return (remaining pending, resolution event)."""
     trade = pending.trade
     if _is_filled(trade, pending.contracts):
-        fill_credit = abs(float(trade.orderStatus.avgFillPrice or pending.limit_credit))
-        slippage = round(pending.natural_credit - fill_credit, 4)
-        legs = _entry_leg_fields(pending)
-        return None, {
-            "event": "entry",
-            "side": pending.candidate.side,
-            "sleeve": pending.sleeve,
-            "short_strike": pending.candidate.short_strike,
-            "long_strike": pending.candidate.long_strike,
-            "contracts": pending.contracts,
-            "natural_credit": round(pending.natural_credit, 2),
-            "limit_credit": round(pending.limit_credit, 2),
-            "credit": round(fill_credit, 2),
-            "fill_slippage": slippage,
-            "score": round(pending.score, 3),
-            "ladder_steps": pending.ladder_step,
-            **legs,
-        }
+        return None, _entry_fill_event(pending, contracts=pending.contracts)
 
     hard = _hard_rejection_reason(trade)
     if hard:
-        return None, {
-            "event": "order_rejected",
-            "side": pending.candidate.side,
-            "short_strike": pending.candidate.short_strike,
-            "long_strike": pending.candidate.long_strike,
-            "contracts": pending.contracts,
-            "natural_credit": round(pending.natural_credit, 2),
-            "limit_credit": round(pending.limit_credit, 2),
-            "credit": round(pending.limit_credit, 2),
-            "status": trade.orderStatus.status,
-            "reason": hard,
-            **_entry_leg_fields(pending),
-        }
+        return _resolve_terminal_or_reject(pending, reason=hard)
+
+    status = _order_status(trade)
+    if status in _DONE_STATUSES:
+        # Cancelled / ApiCancelled (Filled already handled above).
+        return _resolve_terminal_or_reject(
+            pending, reason=f"entry_terminal_{trade.orderStatus.status or status}",
+        )
 
     if now >= pending.work_until:
         filled = _filled_qty(trade)
@@ -173,52 +219,49 @@ def poll_pending_entry(
             # Book the partial before cancelling the remainder — never orphan IB legs.
             ib.cancelOrder(trade.order)
             ib.sleep(0.25)
-            fill_credit = abs(float(trade.orderStatus.avgFillPrice or pending.limit_credit))
-            slippage = round(pending.natural_credit - fill_credit, 4)
-            return None, {
-                "event": "entry",
-                "side": pending.candidate.side,
-                "sleeve": pending.sleeve,
-                "short_strike": pending.candidate.short_strike,
-                "long_strike": pending.candidate.long_strike,
-                "contracts": filled,
-                "requested_contracts": pending.contracts,
-                "partial": True,
-                "natural_credit": round(pending.natural_credit, 2),
-                "limit_credit": round(pending.limit_credit, 2),
-                "credit": round(fill_credit, 2),
-                "fill_slippage": slippage,
-                "score": round(pending.score, 3),
-                "ladder_steps": pending.ladder_step,
-                **_entry_leg_fields(pending),
-            }
+            return None, _entry_fill_event(pending, contracts=filled, partial=True)
         ib.cancelOrder(trade.order)
         ib.sleep(0.25)
-        return None, {
-            "event": "order_rejected",
-            "side": pending.candidate.side,
-            "short_strike": pending.candidate.short_strike,
-            "long_strike": pending.candidate.long_strike,
-            "contracts": pending.contracts,
-            "natural_credit": round(pending.natural_credit, 2),
-            "limit_credit": round(pending.limit_credit, 2),
-            "credit": round(pending.limit_credit, 2),
-            "status": "Cancelled",
-            "reason": "entry_unfilled",
-            **_entry_leg_fields(pending),
-        }
+        return None, _entry_reject_event(
+            pending, reason="entry_unfilled", status="Cancelled",
+        )
 
     if (
         live.entry_ladder_step > 0
         and now >= pending.next_ladder_at
         and pending.ladder_step < live.entry_max_ladder_steps
     ):
-        pending.ladder_step += 1
-        new_limit = entry_limit_credit(pending.natural_credit, live, ladder_step=pending.ladder_step)
+        if not _is_active_status(trade):
+            # Not amendable and not filled — clear pending without placeOrder.
+            raw = trade.orderStatus.status or status or "unknown"
+            return _resolve_terminal_or_reject(
+                pending, reason=f"entry_terminal_{raw}",
+            )
+
+        next_step = pending.ladder_step + 1
+        new_limit = entry_limit_credit(
+            pending.natural_credit, live, ladder_step=next_step,
+        )
         if new_limit < pending.limit_credit:
-            pending.limit_credit = new_limit
+            old_price = trade.order.lmtPrice
             trade.order.lmtPrice = -new_limit
-            ib.placeOrder(trade.contract, trade.order)
+            try:
+                ib.placeOrder(trade.contract, trade.order)
+            except Exception:
+                trade.order.lmtPrice = old_price
+                try:
+                    if _is_active_status(trade):
+                        ib.cancelOrder(trade.order)
+                        ib.sleep(0.25)
+                except Exception:
+                    pass
+                return None, _entry_reject_event(
+                    pending,
+                    reason="entry_ladder_failed",
+                    status=trade.orderStatus.status or "unknown",
+                )
+            pending.ladder_step = next_step
+            pending.limit_credit = new_limit
             log_event(today, {
                 "event": "entry_ladder",
                 "side": pending.candidate.side,
@@ -231,6 +274,8 @@ def poll_pending_entry(
                 f"[{now.isoformat()}] ENTRY ladder step {pending.ladder_step} "
                 f"{pending.candidate.side} limit={new_limit:.2f}"
             )
+        else:
+            pending.ladder_step = next_step
         pending.next_ladder_at = now + timedelta(seconds=live.entry_ladder_interval_seconds)
 
     return pending, None

@@ -88,38 +88,62 @@ class AccountGuardTests(unittest.TestCase):
         self.assertTrue(res.halt_entries)
         self.assertTrue(res.flatten)
 
-    def test_fetch_cancels_account_summary(self) -> None:
+    def test_fetch_uses_account_values_without_req_summary(self) -> None:
         from account_guards import fetch_account_snapshot
         from types import SimpleNamespace
 
         class FakeIB:
             def __init__(self):
-                self.cancelled = []
-                self._summary = [
+                self.req_summary_calls = 0
+                self.summary_calls = 0
+                self._values = [
                     SimpleNamespace(tag="NetLiquidation", value="500000"),
                     SimpleNamespace(tag="BuyingPower", value="100000"),
                 ]
 
             def reqAccountSummary(self):
-                return None
+                self.req_summary_calls += 1
 
-            def sleep(self, _s):
-                return None
+            def accountSummary(self):
+                self.summary_calls += 1
+                return []
+
+            def accountValues(self):
+                return list(self._values)
+
+        ib = FakeIB()
+        snap = fetch_account_snapshot(ib)
+        self.assertEqual(snap.net_liquidation, 500_000.0)
+        self.assertEqual(snap.buying_power, 100_000.0)
+        self.assertEqual(ib.req_summary_calls, 0)
+        self.assertEqual(ib.summary_calls, 0)
+
+    def test_fetch_falls_back_to_cached_account_summary(self) -> None:
+        from account_guards import fetch_account_snapshot
+        from types import SimpleNamespace
+
+        class FakeIB:
+            def __init__(self):
+                self.req_summary_calls = 0
+                self._summary = [
+                    SimpleNamespace(tag="NetLiquidation", value="520000"),
+                    SimpleNamespace(tag="AvailableFunds", value="90000"),
+                ]
+
+            def reqAccountSummary(self):
+                self.req_summary_calls += 1
 
             def accountSummary(self):
                 return list(self._summary)
-
-            def cancelAccountSummary(self, group):
-                self.cancelled.append(group)
 
             def accountValues(self):
                 return []
 
         ib = FakeIB()
         snap = fetch_account_snapshot(ib)
-        self.assertEqual(snap.net_liquidation, 500_000.0)
-        self.assertEqual(ib.cancelled, ["All"])
-
+        self.assertEqual(snap.net_liquidation, 520_000.0)
+        self.assertEqual(snap.buying_power, 90_000.0)
+        self.assertEqual(ib.req_summary_calls, 0)
 
 if __name__ == "__main__":
     unittest.main()

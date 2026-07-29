@@ -58,6 +58,7 @@ from entry_execution import (  # noqa: E402
     entry_limit_credit,
     entry_quote_block_reason,
     natural_credit,
+    pending_trade_is_active,
     poll_pending_entry,
     round_spx_premium,
     work_deadline,
@@ -864,7 +865,13 @@ def cancel_pending_entry(
         "reason": reason,
         "limit_credit": round(pending.limit_credit, 2),
     })
-    if reason in {"new_tranche", "flatten", "error", "native_stop_disarm_timeout"}:
+    if reason in {
+        "new_tranche",
+        "flatten",
+        "error",
+        "native_stop_disarm_timeout",
+        "poll_error",
+    }:
         log_event(today, {
             "event": "order_rejected",
             "side": pending.candidate.side,
@@ -877,6 +884,45 @@ def cancel_pending_entry(
             "status": "Cancelled",
             "reason": f"entry_cancelled_{reason}",
         })
+
+
+def repair_session_after_entry_fault(
+    ib: Optional["IB"],
+    pending: Optional[PendingEntry],
+    open_spreads: Sequence[OpenSpread],
+    today: str,
+    *,
+    dry: bool,
+    live: LiveConfig,
+    config: StrategyConfig,
+    error: str,
+) -> None:
+    """Clear a dangling pending entry and re-arm native STPs so the loop can continue."""
+    if pending is None:
+        return
+    log_event(today, {
+        "event": "entry_poll_error",
+        "error": error,
+        "side": pending.candidate.side,
+        "short_strike": pending.candidate.short_strike,
+        "long_strike": pending.candidate.long_strike,
+        "ladder_step": pending.ladder_step,
+        "status": getattr(
+            getattr(pending.trade, "orderStatus", None), "status", None,
+        ),
+    }, live=live)
+    cancel_pending_entry(ib, pending, today, reason="poll_error", dry=dry)
+    if native_stops_enabled(live):
+        place_or_replace_native_stop_for_short(
+            ib,
+            pending.candidate,
+            open_spreads,
+            today,
+            dry=dry,
+            live=live,
+            config=config,
+            reason="post_poll_error",
+        )
 
 
 def submit_spread_entry(
@@ -2173,9 +2219,38 @@ def run(live: LiveConfig = ACTIVE) -> None:
 
                 if pending_entry is not None and ib is not None and not dry:
                     active_pending = pending_entry
-                    pending_entry, resolution = poll_pending_entry(
-                        ib, active_pending, live, today, now, log_event=log_event,
-                    )
+                    resolution = None
+                    try:
+                        pending_entry, resolution = poll_pending_entry(
+                            ib, active_pending, live, today, now, log_event=log_event,
+                        )
+                        # Belt-and-suspenders: never keep a non-active trade as pending.
+                        if (
+                            pending_entry is not None
+                            and resolution is None
+                            and not pending_trade_is_active(pending_entry)
+                        ):
+                            raise RuntimeError(
+                                "pending_entry_inactive "
+                                f"status={pending_entry.trade.orderStatus.status!r}"
+                            )
+                    except Exception as poll_exc:
+                        print(
+                            f"[{now.isoformat()}] ENTRY poll fault recovered: "
+                            f"{poll_exc!r} — clearing pending, re-arming STP"
+                        )
+                        repair_session_after_entry_fault(
+                            ib,
+                            active_pending,
+                            open_spreads,
+                            today,
+                            dry=dry,
+                            live=live,
+                            config=config,
+                            error=repr(poll_exc),
+                        )
+                        pending_entry = None
+                        resolution = None
                     if resolution is not None:
                         log_event(today, resolution)
                         _, credit_added, _, portfolio_margin_used = apply_pending_resolution(

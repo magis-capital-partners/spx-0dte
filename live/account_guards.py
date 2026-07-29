@@ -46,46 +46,37 @@ def snapshot_from_account_values(values: Mapping[str, object]) -> AccountSnapsho
     return AccountSnapshot(net_liquidation=net, buying_power=bp, source="map")
 
 
+def _read_account_tags(rows: Any, tags: dict) -> None:
+    for row in list(rows or []):
+        tag = str(getattr(row, "tag", "") or "")
+        if tag in tags and tags[tag] is None:
+            tags[tag] = getattr(row, "value", None)
+
+
 def fetch_account_snapshot(ib: Any, *, timeout_sec: float = 3.0) -> AccountSnapshot:
     """Pull NetLiquidation and BuyingPower from a connected IB client.
 
-    Cancels the account-summary subscription after reading to avoid IB error
-    322 (maximum number of account summary requests exceeded).
+    Prefer ``accountValues`` / cached ``accountSummary()`` — never call
+    ``reqAccountSummary()`` on each poll (IB error 322: max summary requests).
+    ``ib.accountSummary()`` only requests once when the wrapper cache is empty.
     """
+    del timeout_sec  # retained for call-site compatibility; summary is cached.
     tags = {
         "NetLiquidation": None,
         "BuyingPower": None,
         "AvailableFunds": None,
     }
-    summary_requested = False
     try:
-        # Prefer accountSummary (async subscription); fall back to accountValues.
-        try:
-            ib.reqAccountSummary()
-            summary_requested = True
-            ib.sleep(min(timeout_sec, 1.5))
-            for row in list(getattr(ib, "accountSummary", lambda: [])()):
-                tag = str(getattr(row, "tag", "") or "")
-                if tag in tags:
-                    tags[tag] = getattr(row, "value", None)
-        except Exception:
-            pass
-        finally:
-            if summary_requested:
-                try:
-                    # groupName "All" is the ib_insync default for reqAccountSummary.
-                    cancel = getattr(ib, "cancelAccountSummary", None)
-                    if callable(cancel):
-                        cancel("All")
-                except Exception:
-                    pass
+        values_fn = getattr(ib, "accountValues", None)
+        if callable(values_fn):
+            _read_account_tags(values_fn(), tags)
+
         if tags["NetLiquidation"] is None or (
             tags["BuyingPower"] is None and tags["AvailableFunds"] is None
         ):
-            for row in list(getattr(ib, "accountValues", lambda: [])()):
-                tag = str(getattr(row, "tag", "") or "")
-                if tag in tags and tags[tag] is None:
-                    tags[tag] = getattr(row, "value", None)
+            summary_fn = getattr(ib, "accountSummary", None)
+            if callable(summary_fn):
+                _read_account_tags(summary_fn(), tags)
     except Exception:
         pass
     snap = snapshot_from_account_values(tags)
