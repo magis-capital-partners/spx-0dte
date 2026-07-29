@@ -126,17 +126,46 @@ Also cancels orphan working SPXW/BAG orders from a crashed prior run. Do **not**
 | **Stop confirm** | After synthetic stop fill, verify IB short qty dropped; else `stop_unconfirmed` and keep managing. |
 | **Live mode data** | `mode=live` forces `auto_fallback_delayed=False` (no silent delayed downgrade). |
 
-### Slack + local watchdog (portable across machines)
+### Slack + supervised auto-heal (Magis workspace)
 
-Kill/watchdog stay **local to the host running the executor**. Slack reaches any phone/PC.
+Slack must use the **Magis Capital Partners** workspace (`drew@magiscapitalpartners.com`), not a personal Slack.
 
 ```powershell
-$env:SPX_SLACK_WEBHOOK_URL = "https://hooks.slack.com/services/XXX/YYY/ZZZ"
-python live/ib_executor.py
-# Same machine, second terminal:
-.\scripts\run_live_watchdog.ps1
-# Optional: write session KILL if heartbeat dies with open risk
-.\scripts\run_live_watchdog.ps1 -WriteKill
+# One-time: wire Magis Incoming Webhook (copies Magis org webhook, or paste a dedicated #spx URL)
+.\scripts\set_spx_slack_webhook.ps1 -UseMagisWorkspaceWebhook -SendTest
+# Or: .\scripts\set_spx_slack_webhook.ps1 -SlackWebhookUrl "https://hooks.slack.com/services/..." -SendTest
+
+# Install Task Scheduler jobs (daily 09:15 + at logon): executor, watchdog, status API, cloud publish
+.\scripts\install_live_supervisor_tasks.ps1 -StartNow
+```
+
+Secrets live in `%USERPROFILE%\.magis-spx-0dte-secrets.ps1` (not git). Logs: `data/live/supervisor/`.
+
+### Dashboard Session now (local + cloud)
+
+| Path | What | Where |
+|------|------|--------|
+| **A local** | Heartbeat + stdout console | `http://127.0.0.1:8765` polled by dashboard |
+| **B cloud** | Sanitized alive/halted/open/PnL | `docs/data/live_status.json` on GitHub Pages |
+
+```powershell
+# Status API (also writes live_status.json every 60s)
+.\scripts\run_session_status_server.ps1
+
+# Optional: publish sanitized status to Pages (rate-limited)
+.\scripts\publish_live_status.ps1 -Deploy
+
+# Best local UX (HTTP↔HTTP, full console): 
+.\scripts\serve_dashboard_local.ps1   # http://127.0.0.1:5500/
+```
+
+On the public Pages site you get cloud status (B). Full command-prompt stream needs the trading PC + Status API (A); Chrome often allows `127.0.0.1` from HTTPS Pages, otherwise use the local serve script.
+
+Manual / second terminal (loads the same Magis secrets):
+
+```powershell
+.\scripts\run_ib_executor_supervised.ps1
+.\scripts\run_live_watchdog_supervised.ps1 -WriteKill
 ```
 
 Heartbeat: `data/live/<date>/heartbeat.json` (updated every `heartbeat_seconds`).

@@ -1,8 +1,7 @@
-# Portable local watchdog for the live executor (run on the same machine).
+# Watchdog with Magis Slack secrets loaded.
 # Usage:
 #   .\scripts\run_live_watchdog.ps1
-#   .\scripts\run_live_watchdog.ps1 -WriteKill
-# Requires SPX_SLACK_WEBHOOK_URL for phone/Slack alerts (optional).
+#   .\scripts\run_live_watchdog_supervised.ps1 -WriteKill
 
 param(
     [string]$Date = (Get-Date -Format "yyyy-MM-dd"),
@@ -11,6 +10,7 @@ param(
     [switch]$WriteKill
 )
 
+$ErrorActionPreference = "Stop"
 $Root = Split-Path -Parent $PSScriptRoot
 Set-Location $Root
 
