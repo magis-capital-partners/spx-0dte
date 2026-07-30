@@ -1,16 +1,16 @@
 {
   "schema": 1,
   "source": "cloud",
-  "generated_at": "2026-07-30T12:44:45.631549",
+  "generated_at": "2026-07-30T12:59:33.115841",
   "date": "2026-07-30",
   "pid_alive": true,
-  "heartbeat_ts": "2026-07-30T12:44:44.353411",
+  "heartbeat_ts": "2026-07-30T12:59:31.466721",
   "entries_halted": false,
   "flattened": false,
-  "open_count": 4,
-  "marked_pnl": 725.0,
+  "open_count": 5,
+  "marked_pnl": 1850.0,
   "last_event": {
-    "ts": "2026-07-30T12:32:13.983248",
+    "ts": "2026-07-30T12:47:30.419113",
     "event": "entry"
   },
   "note": "Sanitized status only. Full console is local to the trading host."
