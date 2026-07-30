@@ -24,6 +24,7 @@ from session_recovery import (  # noqa: E402
     fetch_ib_spxw_positions,
     open_entry_events_from_fills,
     recover_governor_state,
+    recovered_halt_is_mark_only,
     recover_session_book,
     release_executor_lock,
     rebuild_open_spreads_from_entries,
@@ -304,10 +305,63 @@ class StrategyIsolationTests(unittest.TestCase):
 
 
 class RecoverGovernorTests(unittest.TestCase):
+    def test_mark_only_halt_can_clear_after_recovered_quotes_warm(self) -> None:
+        events = [
+            {
+                "event": "halt_entries",
+                "reason": "mark_partial",
+                "missing_count": 1,
+            }
+        ]
+        gov = recover_governor_state(events)
+        self.assertTrue(gov.entries_halted)
+        self.assertTrue(recovered_halt_is_mark_only(gov))
+
+    def test_mark_halt_never_masks_a_daily_loss_halt(self) -> None:
+        events = [
+            {"event": "halt_entries", "reason": "mark_partial"},
+            {"event": "halt_entries", "marked_pnl": -12_000},
+        ]
+        gov = recover_governor_state(events)
+        self.assertTrue(gov.entries_halted)
+        self.assertFalse(recovered_halt_is_mark_only(gov))
+
+    def test_governor_clear_removes_only_mark_data_halts(self) -> None:
+        events = [
+            {"event": "halt_entries", "reason": "mark_partial"},
+            {
+                "event": "governor_clear",
+                "reason": "recovery_quotes_ready",
+                "cleared_reasons": ["mark_partial"],
+            },
+        ]
+        gov = recover_governor_state(events)
+        self.assertFalse(gov.entries_halted)
+        self.assertFalse(recovered_halt_is_mark_only(gov))
+
     def test_halt_and_flatten(self) -> None:
         events = [
             {"event": "halt_entries", "marked_pnl": -12000},
             {"event": "flatten", "marked_pnl": -17000},
+        ]
+        gov = recover_governor_state(events)
+        self.assertTrue(gov.entries_halted)
+        self.assertTrue(gov.flattened)
+
+    def test_entry_fault_does_not_sticky_halt(self) -> None:
+        events = [
+            {"event": "entry_submitted", "side": "bull_put"},
+            {"event": "entry_fault", "error": "AssertionError()"},
+            {"event": "entry_cancelled", "reason": "entry_fault"},
+        ]
+        gov = recover_governor_state(events)
+        self.assertFalse(gov.entries_halted)
+        self.assertFalse(gov.flattened)
+
+    def test_error_flatten_still_sticky_halts(self) -> None:
+        events = [
+            {"event": "entry_submitted", "side": "bull_put"},
+            {"event": "error_flatten", "error": "AssertionError()"},
         ]
         gov = recover_governor_state(events)
         self.assertTrue(gov.entries_halted)

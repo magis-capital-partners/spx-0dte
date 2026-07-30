@@ -118,6 +118,9 @@ class IBStreamingMarketData:
         self._expiry_0dte: Optional[str] = None
         self._expiry_next: Optional[str] = None
         self._listed_strikes: List[float] = []
+        # Exact 0DTE legs belonging to open/recovered positions. These always
+        # take priority over candidate-scanning lines and survive rebalances.
+        self._required_0dte_legs: set[Tuple[str, float]] = set()
         self._anchor_spot: float = 0.0
         self._started = False
         self._next_expiry_quotes: List[OptionQuote] = []
@@ -263,6 +266,7 @@ class IBStreamingMarketData:
                 pass
         self._tickers.clear()
         self._contracts.clear()
+        self._cache.clear()
         self._started = False
 
     def spot(self) -> float:
@@ -444,21 +448,149 @@ class IBStreamingMarketData:
             add(strike)
             if len(priority) >= max_strikes:
                 break
-        return sorted(priority[:max_strikes])
+        return priority[:max_strikes]
+
+    def _desired_contract_specs(self, spot: float) -> List[Tuple[str, float]]:
+        """Build a bounded subscription plan with open-risk legs first.
+
+        Required position legs displace candidate-scanning lines. If open risk
+        alone exceeds the configured budget, all risk legs are still retained
+        and the scanning grid is sacrificed.
+        """
+        required = sorted(
+            self._required_0dte_legs,
+            key=lambda item: (item[1], item[0]),
+        )
+        grid_specs = [
+            (right, float(strike))
+            for strike in self._select_strikes(spot)
+            for right in ("P", "C")
+        ]
+        budget = max(int(self.live.max_chain_lines), len(required))
+        desired = list(required)
+        seen = set(required)
+        if len(desired) >= budget:
+            return desired
+        for spec in grid_specs:
+            if spec in seen:
+                continue
+            desired.append(spec)
+            seen.add(spec)
+            if len(desired) >= budget:
+                break
+        return desired
+
+    def set_required_0dte_legs(
+        self,
+        legs: Sequence[Tuple[str, float]],
+    ) -> bool:
+        """Pin exact open-position legs; return True when the set changed."""
+        normalized = {
+            (str(right).strip().upper(), float(strike))
+            for right, strike in legs
+        }
+        bad = [right for right, _ in normalized if right not in {"P", "C"}]
+        if bad:
+            raise ValueError(
+                f"unsupported required option rights: {sorted(set(bad))}"
+            )
+        if normalized == self._required_0dte_legs:
+            return False
+        self._required_0dte_legs = normalized
+        if self._started:
+            spot = self.spot()
+            if spot <= 0:
+                raise RuntimeError(
+                    "cannot refresh required SPXW legs without SPX spot"
+                )
+            self._subscribe_strikes(spot)
+            if self.live.use_streaming_quotes:
+                self.ib.sleep(max(self.live.streaming_warmup_seconds, 0.0))
+        return True
+
+    def missing_required_quotes(self) -> List[Tuple[str, float]]:
+        """Required legs without a fresh markable quote.
+
+        A zero bid is valid for a far-OTM protective long; a positive ask proves
+        the contract has received a market update and also protects short-leg
+        stop monitoring.
+        """
+        expiry = self.expiry_0dte_iso
+        missing: List[Tuple[str, float]] = []
+        for right, strike in sorted(self._required_0dte_legs):
+            opt_type = "CALL" if right == "C" else "PUT"
+            cached = self._cache.get((expiry, opt_type, float(strike)))
+            if (
+                cached is None
+                or cached.updated_at <= 0
+                or cached.ask <= 0
+            ):
+                missing.append((right, float(strike)))
+        return missing
+
+    def wait_for_required_quotes(
+        self,
+        timeout_seconds: float,
+    ) -> List[Tuple[str, float]]:
+        """Wait for all open-risk legs to warm; return any remaining gaps."""
+        deadline = _time.time() + max(float(timeout_seconds), 0.0)
+        missing = self.missing_required_quotes()
+        while missing and _time.time() < deadline:
+            self.ib.sleep(min(0.25, max(deadline - _time.time(), 0.0)))
+            missing = self.missing_required_quotes()
+        return missing
+
+    def _prune_0dte_cache(
+        self,
+        active_specs: set[Tuple[str, float]],
+    ) -> None:
+        """Remove one-off snapshot quotes that are not in the active plan."""
+        expiry = self.expiry_0dte_iso
+        active_keys = {
+            (
+                expiry,
+                "CALL" if right == "C" else "PUT",
+                float(strike),
+            )
+            for right, strike in active_specs
+        }
+        for key in list(self._cache):
+            if key[0] == expiry and key not in active_keys:
+                self._cache.pop(key, None)
 
     def _subscribe_strikes(self, spot: float) -> None:
-        strikes = self._select_strikes(spot)
-        self._listed_strikes = strikes
+        specs = self._desired_contract_specs(spot)
+        self._listed_strikes = sorted({strike for _, strike in specs})
         self._anchor_spot = spot
 
         new_contracts: List[Contract] = []
-        for strike in strikes:
-            for right in ("P", "C"):
-                new_contracts.append(
-                    Option("SPX", self._expiry_0dte, strike, right, "CBOE", tradingClass="SPXW")
+        for right, strike in specs:
+            new_contracts.append(
+                Option(
+                    "SPX",
+                    self._expiry_0dte,
+                    strike,
+                    right,
+                    "CBOE",
+                    tradingClass="SPXW",
                 )
+            )
         self.ib.qualifyContracts(*new_contracts)
         qualified = [c for c in new_contracts if c.conId]
+        qualified_specs = {
+            (str(contract.right), float(contract.strike))
+            for contract in qualified
+        }
+        unqualified_required = self._required_0dte_legs - qualified_specs
+        if unqualified_required:
+            raise RuntimeError(
+                "IB could not qualify required open-position leg(s): "
+                + ", ".join(
+                    f"{right}{strike:g}"
+                    for right, strike in sorted(unqualified_required)
+                )
+            )
+        self._prune_0dte_cache(qualified_specs)
         new_ids = {c.conId for c in qualified}
 
         if self.live.use_streaming_quotes:
@@ -468,6 +600,17 @@ class IBStreamingMarketData:
                         self.ib.cancelMktData(ticker.contract)
                     except Exception:
                         pass
+                    contract = self._contracts.get(con_id)
+                    if contract is not None:
+                        opt_type = "CALL" if contract.right == "C" else "PUT"
+                        self._cache.pop(
+                            (
+                                self.expiry_0dte_iso,
+                                opt_type,
+                                float(contract.strike),
+                            ),
+                            None,
+                        )
                     self._tickers.pop(con_id, None)
                     self._contracts.pop(con_id, None)
 

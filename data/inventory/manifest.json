@@ -1,12 +1,12 @@
 {
-  "updated_at": "2026-07-17T22:32:39.234731+00:00",
+  "updated_at": "2026-07-30T02:16:16.620394+00:00",
   "policy": "SPXW history is cached locally under data/raw and data/processed. Use this cache for backtests. Do NOT call ThetaData or pass --download unless the user explicitly asks to fill manifest gaps.",
   "raw": {
     "path": "data/raw/thetadata/symbol=SPXW",
     "description": "Parquet Greeks from ThetaData (source for rebuilds)",
-    "count": 1587,
+    "count": 1595,
     "first_date": "2019-01-02",
-    "last_date": "2026-07-17",
+    "last_date": "2026-07-29",
     "by_year": {
       "2019": 161,
       "2020": 160,
@@ -15,15 +15,15 @@
       "2023": 250,
       "2024": 252,
       "2025": 250,
-      "2026": 135
+      "2026": 143
     }
   },
   "processed": {
     "path": "data/processed/symbol=SPXW",
     "description": "Simulator inputs: normalized_option_quotes.csv + signals.csv per day",
-    "count": 1586,
+    "count": 1594,
     "first_date": "2019-01-02",
-    "last_date": "2026-07-17",
+    "last_date": "2026-07-29",
     "by_year": {
       "2019": 161,
       "2020": 160,
@@ -32,14 +32,14 @@
       "2023": 250,
       "2024": 252,
       "2025": 250,
-      "2026": 135
+      "2026": 143
     }
   },
   "vix_daily": {
     "path": "data/calendar/vix_daily.csv",
-    "count": 1896,
+    "count": 1904,
     "first_date": "2019-01-02",
-    "last_date": "2026-07-17",
+    "last_date": "2026-07-29",
     "source": "yahoo_finance_^VIX"
   },
   "cache_status": {
@@ -53,8 +53,8 @@
   },
   "agent_commands": {
     "refresh_inventory": "python scripts/update_data_inventory.py",
-    "backtest_no_download": "python simulator/historical_3d_backtest.py --start-date 2019-01-02 --end-date 2026-07-17",
-    "build_from_raw_only": "python simulator/backfill_history.py --build --start-date 2019-01-02 --end-date 2026-07-17",
+    "backtest_no_download": "python simulator/historical_3d_backtest.py --start-date 2019-01-02 --end-date 2026-07-29",
+    "build_from_raw_only": "python simulator/backfill_history.py --build --start-date 2019-01-02 --end-date 2026-07-29",
     "enrich": "python simulator/feature_enricher.py --symbol SPXW",
     "download_vix": "python scripts/download_vix_daily.py --start-date 2019-01-01",
     "enrich_vix": "python scripts/download_vix_daily.py --start-date 2019-01-01 && python simulator/vix_signal_enricher.py --symbol SPXW",

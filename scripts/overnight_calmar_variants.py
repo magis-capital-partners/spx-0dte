@@ -1,4 +1,12 @@
-"""Variant registry for overnight Calmar improvement suite (Wave 2: phases 7–13)."""
+"""Variant registry for overnight Calmar improvement suite (Wave 3).
+
+Wave 3 substrate: production ``p3_poststop_cooldown_120`` with put wing 150
+already baked in. Focus: Calmar / CAGR vs max DD and worst day.
+
+Anti-overfit protocol (enforced in summarize):
+  - Selection period: OOS dates <= SELECTION_END (rank / pick winners here only)
+  - Holdout period: OOS dates >= HOLDOUT_START (sealed; report only after ranking)
+"""
 from __future__ import annotations
 
 from dataclasses import replace
@@ -29,7 +37,11 @@ ACCOUNT = PRODUCTION_ACCOUNT_EQUITY
 TOD = SCHEMES[PRODUCTION_SIZING_SCHEME]
 CAP = PRODUCTION_MAX_CONTRACTS_PER_TRANCHE
 
-# No 9am entries: zero size until 10:00, then production linear decay.
+# Chronological train/test split for Wave 3 ranking (do not peek at holdout).
+SELECTION_END = "2023-12-29"
+HOLDOUT_START = "2024-01-02"
+
+# Milder no-9am schedule retained for a few path-risk combos.
 SCHEDULE_NO_9AM = [
     (time(10, 0), 0.0),
     (time(10, 30), 1.25),
@@ -38,20 +50,6 @@ SCHEDULE_NO_9AM = [
     (time(13, 30), 0.60),
     (time(14, 30), 0.45),
     (time(23, 59), 0.25),
-]
-
-# Extra time-of-day schedules retained for Wave 1 policy keys / Phase 13 combos.
-SCHEDULE_ZERO_LAST_HOUR = [
-    (time(14, 30), 1.0),
-    (time(23, 59), 0.0),
-]
-SCHEDULE_LINEAR_ZERO_LAST = [
-    (time(10, 30), 1.25),
-    (time(11, 30), 1.00),
-    (time(12, 30), 0.85),
-    (time(13, 30), 0.60),
-    (time(14, 30), 0.0),
-    (time(23, 59), 0.0),
 ]
 
 
@@ -67,195 +65,214 @@ def _delta_band(target: float) -> dict:
     }
 
 
-def build_all_variants() -> List[Variant]:
-    """Wave 2 singles (p7–p12) + optional Phase 13 combos.
+def _vix_flat(above: float, flatten_pct: float = 0.030, daily_pct: float = 0.020) -> dict:
+    return {
+        "vix_tight_flatten_above": above,
+        "vix_tight_flatten_loss_pct": flatten_pct,
+        "vix_tight_daily_loss_pct": daily_pct,
+    }
 
-    Wave 1 singles are not re-swept. Reference is current production substrate.
-    """
+
+def build_all_variants() -> List[Variant]:
+    """Wave 3: trend/structure fine grid + tail hunters + pre-specified promos."""
     b = _base()
     variants: List[Variant] = []
 
     def add(phase: str, name: str, cfg: StrategyConfig | None = None, policy_key: str = "vix125"):
         variants.append((phase, name, cfg or b, policy_key))
 
-    # --- Reference (current production) ---
+    # --- Reference (current production: put wing 150) ---
     add("ref", "baseline_vix125", policy_key="vix125")
 
-    # --- Phase 7: Circuit breakers & stop cascades ---
-    add("p7_circuit", "max_stops_2", _base(max_stops_per_side=2), "vix125")
-    add("p7_circuit", "max_stops_3", _base(max_stops_per_side=3), "vix125")
-    add("p7_circuit", "max_stops_4", _base(max_stops_per_side=4), "vix125")
-    add("p7_circuit", "halt_after_stop_2", _base(max_stops_per_day=2), "vix125")
-    add("p7_circuit", "halt_after_stop_3", _base(max_stops_per_day=3), "vix125")
-    add("p7_circuit", "halt_after_stop_4", _base(max_stops_per_day=4), "vix125")
+    # --- Phase 14: Wave 2b winner combos / fine grid around trend_bc_085 ---
+    add("p14_combo", "trend_bc_080", _base(candidate_max_adverse_trend=0.80))
+    add("p14_combo", "trend_bc_085", _base(candidate_max_adverse_trend=0.85))
+    add("p14_combo", "trend_bc_090", _base(candidate_max_adverse_trend=0.90))
+    add("p14_combo", "trend_bc_095", _base(candidate_max_adverse_trend=0.95))
+    add("p14_combo", "put_wing_140", _base(put_wing_width=140.0))
+    add("p14_combo", "put_wing_160", _base(put_wing_width=160.0))
+    add("p14_combo", "put_wing_175", _base(put_wing_width=175.0))
     add(
-        "p7_circuit",
-        "late_reentry_1300",
-        _base(use_late_same_side_reentry=True, same_side_stop_late_reentry_cutoff=time(13, 0)),
-        "vix125",
+        "p14_combo",
+        "pw175_trend085",
+        _base(put_wing_width=175.0, candidate_max_adverse_trend=0.85),
     )
     add(
-        "p7_circuit",
-        "late_reentry_1400",
-        _base(use_late_same_side_reentry=True, same_side_stop_late_reentry_cutoff=time(14, 0)),
-        "vix125",
-    )
-    add("p7_circuit", "cooldown_90", _base(same_side_stop_cooldown_minutes=90), "vix125")
-
-    # --- Phase 8: Bear-call / trend asymmetry ---
-    add("p8_bc", "trend_bc_050", _base(candidate_max_adverse_trend=0.50), "vix125")
-    add("p8_bc", "trend_bc_075", _base(candidate_max_adverse_trend=0.75), "vix125")
-    add("p8_bc", "trend_bc_085", _base(candidate_max_adverse_trend=0.85), "vix125")
-    add("p8_bc", "chase_trend_100", _base(candidate_max_chase_trend=1.0), "vix125")
-    add("p8_bc", "chase_trend_125", _base(candidate_max_chase_trend=1.25), "vix125")
-    add("p8_bc", "hard_trend_skip_150", _base(hard_trend_skip_threshold=1.50), "vix125")
-    add("p8_bc", "hard_trend_skip_175", _base(hard_trend_skip_threshold=1.75), "vix125")
-    add("p8_bc", "bc_size_050", _base(bear_call_size_scale=0.50), "vix125")
-    add("p8_bc", "bc_size_075", _base(bear_call_size_scale=0.75), "vix125")
-    add("p8_bc", "skew_055", _base(candidate_max_adverse_skew=0.55), "vix125")
-    add("p8_bc", "skew_060", _base(candidate_max_adverse_skew=0.60), "vix125")
-
-    # --- Phase 9: Structure & delta ---
-    add("p9_struct", "delta_15", _base(**_delta_band(0.15)), "vix125")
-    add("p9_struct", "delta_18", _base(**_delta_band(0.18)), "vix125")
-    add("p9_struct", "delta_22", _base(**_delta_band(0.22)), "vix125")
-    add("p9_struct", "put_wing_150", _base(put_wing_width=150.0), "vix125")
-    add("p9_struct", "put_wing_175", _base(put_wing_width=175.0), "vix125")
-    add("p9_struct", "put_wing_225", _base(put_wing_width=225.0), "vix125")
-    add("p9_struct", "call_wing_50", _base(call_wing_width=50.0), "vix125")
-    add("p9_struct", "call_wing_100", _base(call_wing_width=100.0), "vix125")
-
-    # --- Phase 10: Calendar & session (gap-Q4 skip pruned — Q4 is best PnL) ---
-    add("p10_cal", "entry_1000", _base(entry_start=time(10, 0)), "vix125")
-    add("p10_cal", "entry_1030", _base(entry_start=time(10, 30)), "vix125")
-    add("p10_cal", "no_9am_tod", policy_key="no_9am")
-    add("p10_cal", "skip_tue", policy_key="skip_tue")
-    add("p10_cal", "skip_mon_tue", policy_key="skip_mon_tue")
-    add("p10_cal", "interval_30", _base(entry_interval_minutes=30), "vix125")
-
-    # --- Phase 11: Dynamic / path-dependent risk ---
-    add("p11_dyn", "regime_thr_22", policy_key="regime_thr_22")
-    add("p11_dyn", "regime_thr_25", policy_key="regime_thr_25")
-    add("p11_dyn", "regime_thr_30", policy_key="regime_thr_30")
-    add("p11_dyn", "regime_scale_033", policy_key="regime_scale_033")
-    add("p11_dyn", "regime_scale_066", policy_key="regime_scale_066")
-    add("p11_dyn", "prior_loss_10", policy_key="prior_loss_10")
-    add("p11_dyn", "prior_loss_20", policy_key="prior_loss_20")
-    add("p11_dyn", "prior_loss_25", policy_key="prior_loss_25")
-    add(
-        "p11_dyn",
-        "intraday_cut_15",
-        _base(intraday_size_cut_pct=0.015, intraday_size_cut_scale=0.5),
-        "vix125",
+        "p14_combo",
+        "trend085_vixflat28",
+        _base(candidate_max_adverse_trend=0.85, **_vix_flat(28.0)),
     )
     add(
-        "p11_dyn",
-        "intraday_cut_20",
-        _base(intraday_size_cut_pct=0.020, intraday_size_cut_scale=0.5),
-        "vix125",
-    )
-    add(
-        "p11_dyn",
-        "vix_flatten_tight",
+        "p14_combo",
+        "trend085_icut20",
         _base(
-            vix_tight_flatten_above=28.0,
-            vix_tight_flatten_loss_pct=0.030,
-            vix_tight_daily_loss_pct=0.020,
-        ),
-        "vix125",
-    )
-
-    # --- Phase 12: Quality / TOD score gates ---
-    add("p12_qual", "min_score_10", _base(candidate_min_score=1.0), "vix125")
-    add("p12_qual", "min_score_15", _base(candidate_min_score=1.5), "vix125")
-    add("p12_qual", "min_score_20", _base(candidate_min_score=2.0), "vix125")
-    add("p12_qual", "sl_to_credit_35", _base(candidate_max_stop_loss_to_credit=3.5), "vix125")
-    add("p12_qual", "sl_to_credit_40", _base(candidate_max_stop_loss_to_credit=4.0), "vix125")
-    add("p12_qual", "realized_z_100", _base(candidate_max_abs_realized_z=1.0), "vix125")
-    add("p12_qual", "realized_z_125", _base(candidate_max_abs_realized_z=1.25), "vix125")
-    add("p12_qual", "tod_score_on", _base(use_time_of_day_controls=True), "vix125")
-    add("p12_qual", "ctw_0150", _base(candidate_min_credit_to_width=0.0150), "vix125")
-    add("p12_qual", "two_sided", _base(candidate_max_sides=2), "vix125")
-
-    # Phase 13 combos (hypothesis-driven; refined after singles if needed).
-    variants.extend(build_phase13_combos())
-
-    return variants
-
-
-def build_phase13_combos() -> List[Variant]:
-    """Hypothesis-driven combos from Phase 0 what-ifs."""
-    variants: List[Variant] = []
-
-    def add(name: str, cfg: StrategyConfig | None = None, policy_key: str = "vix125"):
-        variants.append(("p13_combo", name, cfg or _base(), policy_key))
-
-    add(
-        "combo_trend075_halt3",
-        _base(candidate_max_adverse_trend=0.75, max_stops_per_day=3),
-    )
-    add(
-        "combo_trend075_maxstops3",
-        _base(candidate_max_adverse_trend=0.75, max_stops_per_side=3),
-    )
-    add(
-        "combo_bc075_entry1000",
-        _base(bear_call_size_scale=0.75, entry_start=time(10, 0)),
-    )
-    add(
-        "combo_trend075_entry1000_halt3",
-        _base(
-            candidate_max_adverse_trend=0.75,
-            entry_start=time(10, 0),
-            max_stops_per_day=3,
-        ),
-    )
-    add("combo_no9am_trend075", _base(candidate_max_adverse_trend=0.75), "no_9am")
-    add(
-        "combo_dd_hunter",
-        _base(
-            intraday_size_cut_pct=0.015,
+            candidate_max_adverse_trend=0.85,
+            intraday_size_cut_pct=0.020,
             intraday_size_cut_scale=0.5,
-            max_stops_per_day=3,
         ),
-        "no_9am",
     )
     add(
-        "combo_bc075_regime25",
-        _base(bear_call_size_scale=0.75),
+        "p14_combo",
+        "trend085_halt3",
+        _base(candidate_max_adverse_trend=0.85, max_stops_per_day=3),
+    )
+    add(
+        "p14_combo",
+        "trend085_maxstops3",
+        _base(candidate_max_adverse_trend=0.85, max_stops_per_side=3),
+    )
+    add(
+        "p14_combo",
+        "trend085_vixflat_halt3",
+        _base(candidate_max_adverse_trend=0.85, max_stops_per_day=3, **_vix_flat(28.0)),
+    )
+    add(
+        "p14_combo",
+        "trend085_icut_vixflat",
+        _base(
+            candidate_max_adverse_trend=0.85,
+            intraday_size_cut_pct=0.020,
+            intraday_size_cut_scale=0.5,
+            **_vix_flat(28.0),
+        ),
+    )
+
+    # --- Phase 15: Tail / DD / worst-day hunters ---
+    add(
+        "p15_tail",
+        "flatten_300_200",
+        _base(flatten_loss_limit_pct=0.030, daily_loss_limit_pct=0.020),
+    )
+    add(
+        "p15_tail",
+        "flatten_275_175",
+        _base(flatten_loss_limit_pct=0.0275, daily_loss_limit_pct=0.0175),
+    )
+    add(
+        "p15_tail",
+        "flatten_350_250",
+        _base(flatten_loss_limit_pct=0.035, daily_loss_limit_pct=0.025),
+    )
+    add("p15_tail", "stop_mult_175", _base(stop_multiple=1.75))
+    add("p15_tail", "stop_mult_225", _base(stop_multiple=2.25))
+    add("p15_tail", "max_open_1", _base(max_open_trades_per_side=1))
+    add("p15_tail", "block_same_strike", _base(block_same_strike_after_stop=True))
+    add("p15_tail", "cooldown_60", _base(same_side_stop_cooldown_minutes=60))
+    add("p15_tail", "cooldown_90", _base(same_side_stop_cooldown_minutes=90))
+    add("p15_tail", "cooldown_150", _base(same_side_stop_cooldown_minutes=150))
+    add("p15_tail", "bc_size_090", _base(bear_call_size_scale=0.90))
+    add("p15_tail", "bc_size_085", _base(bear_call_size_scale=0.85))
+    add(
+        "p15_tail",
+        "trend085_flatten300",
+        _base(
+            candidate_max_adverse_trend=0.85,
+            flatten_loss_limit_pct=0.030,
+            daily_loss_limit_pct=0.020,
+        ),
+    )
+    add(
+        "p15_tail",
+        "trend085_bc090",
+        _base(candidate_max_adverse_trend=0.85, bear_call_size_scale=0.90),
+    )
+    add(
+        "p15_tail",
+        "trend085_maxopen1",
+        _base(candidate_max_adverse_trend=0.85, max_open_trades_per_side=1),
+    )
+
+    # --- Phase 16: CAGR hunters (must still clear DD / worst-day floors) ---
+    add("p16_cagr", "elev_130", policy_key="elev_130")
+    add("p16_cagr", "elev_135", policy_key="elev_135")
+    add("p16_cagr", "credit_cap_175", _base(daily_credit_cap_pct=0.0175))
+    add("p16_cagr", "credit_cap_200", _base(daily_credit_cap_pct=0.0200))
+    add("p16_cagr", "contracts_34", _base(baseline_contracts=34))
+    add("p16_cagr", "contracts_36", _base(baseline_contracts=36))
+    add("p16_cagr", "delta_21", _base(**_delta_band(0.21)))
+    add("p16_cagr", "call_wing_60", _base(call_wing_width=60.0))
+    add("p16_cagr", "call_wing_90", _base(call_wing_width=90.0))
+    add("p16_cagr", "ctw_0135", _base(candidate_min_credit_to_width=0.0135))
+    add(
+        "p16_cagr",
+        "trend085_elev130",
+        _base(candidate_max_adverse_trend=0.85),
+        "elev_130",
+    )
+    add(
+        "p16_cagr",
+        "trend085_credit175",
+        _base(candidate_max_adverse_trend=0.85, daily_credit_cap_pct=0.0175),
+    )
+
+    # --- Phase 17: Path-dependent / VIX risk shaping ---
+    add("p17_path", "vix_flat_25", _base(**_vix_flat(25.0)))
+    add("p17_path", "vix_flat_28", _base(**_vix_flat(28.0)))
+    add("p17_path", "vix_flat_30", _base(**_vix_flat(30.0)))
+    add(
+        "p17_path",
+        "intraday_cut_10",
+        _base(intraday_size_cut_pct=0.010, intraday_size_cut_scale=0.5),
+    )
+    add(
+        "p17_path",
+        "intraday_cut_25",
+        _base(intraday_size_cut_pct=0.025, intraday_size_cut_scale=0.5),
+    )
+    add("p17_path", "late_off", policy_key="late_off")
+    add("p17_path", "ddq", policy_key="ddq")
+    add(
+        "p17_path",
+        "trend085_late_off",
+        _base(candidate_max_adverse_trend=0.85),
+        "late_off",
+    )
+    add(
+        "p17_path",
+        "trend085_prior15",
+        _base(candidate_max_adverse_trend=0.85),
+        "prior_loss_15",
+    )
+    add(
+        "p17_path",
+        "trend085_regime25",
+        _base(candidate_max_adverse_trend=0.85),
         "regime_thr_25",
     )
     add(
-        "combo_skip_tue_trend075",
-        _base(candidate_max_adverse_trend=0.75),
-        "skip_tue",
+        "p17_path",
+        "trend085_no9am",
+        _base(candidate_max_adverse_trend=0.85),
+        "no_9am",
     )
+
+    # --- Phase 18: unique pre-specified promo not already covered in p14/p15 ---
     add(
-        "combo_delta18_halt3",
-        _base(**_delta_band(0.18), max_stops_per_day=3),
-    )
-    add(
-        "combo_skew060_halt3_entry1000",
+        "p18_promo",
+        "promo_dd_hunter",
         _base(
-            candidate_max_adverse_skew=0.60,
-            max_stops_per_day=3,
-            entry_start=time(10, 0),
+            candidate_max_adverse_trend=0.85,
+            bear_call_size_scale=0.90,
+            flatten_loss_limit_pct=0.030,
+            daily_loss_limit_pct=0.020,
         ),
-    )
-    add(
-        "combo_late1400_trend075",
-        _base(
-            candidate_max_adverse_trend=0.75,
-            use_late_same_side_reentry=True,
-            same_side_stop_late_reentry_cutoff=time(14, 0),
-        ),
-    )
-    add(
-        "combo_cagr_hunter",
-        _base(**_delta_band(0.18), candidate_min_credit_to_width=0.0150),
     )
 
     return variants
+
+
+# Frozen before any holdout peek. Rank on selection; promote only if holdout passes.
+PROMO_CANDIDATE_NAMES = frozenset(
+    {
+        "trend_bc_085",
+        "trend085_vixflat28",
+        "pw175_trend085",
+        "trend085_icut_vixflat",
+        "promo_dd_hunter",
+        "trend085_flatten300",
+        "trend085_halt3",
+    }
+)
 
 
 def _elev_scale_from_key(policy_key: str) -> Optional[float]:
@@ -285,18 +302,6 @@ def make_policy(
 
     if policy_key == "elev_120":
         return VixElevatedSkipPolicy(TOD, elevated_scale=1.20, max_contracts=CAP)
-    if policy_key == "elev_25_30":
-        return VixElevatedSkipPolicy(
-            TOD, elevated_min=25.0, elevated_max=30.0, elevated_scale=1.25, max_contracts=CAP
-        )
-    if policy_key == "downsize_17_25":
-        return VixElevatedSkipPolicyExt(
-            TOD,
-            low_vix_downsize_min=17.0,
-            low_vix_downsize_max=25.0,
-            low_vix_scale=0.85,
-            max_contracts=CAP,
-        )
     if policy_key == "late_off":
         return VixElevatedSkipPolicyExt(
             TOD,
@@ -307,59 +312,17 @@ def make_policy(
         )
     if policy_key == "ddq":
         return DdqVixTodPolicy(TOD, max_contracts=CAP)
-    if policy_key == "tod_front_load":
-        return build_production_vix_policy(SCHEMES["front_load_morning"], max_contracts=CAP)
-    if policy_key == "tod_half_noon":
-        return build_production_vix_policy(SCHEMES["half_after_noon"], max_contracts=CAP)
-    if policy_key == "tod_morning_heavy_off":
-        return build_production_vix_policy(SCHEMES["morning_heavy_afternoon_off"], max_contracts=CAP)
-    if policy_key == "tod_zero_last":
-        return build_production_vix_policy(SCHEDULE_LINEAR_ZERO_LAST, max_contracts=CAP)
-    if policy_key == "elev_morning":
-        return VixElevatedSkipPolicyExt(
-            TOD,
-            elevated_scale=VIX_ELEVATED_SCALE,
-            elevated_morning_end=time(12, 30),
-            max_contracts=CAP,
-        )
-    if policy_key == "cap_40":
-        return build_production_vix_policy(TOD, max_contracts=40)
-    if policy_key == "cap_none":
-        return build_production_vix_policy(TOD, max_contracts=None)
-    if policy_key == "regime_half":
-        return RegimeDownsizePolicy(TOD, trailing_stop, max_contracts=CAP)
-    if policy_key == "prior_day_loss":
-        inner = build_production_vix_policy(TOD, max_contracts=CAP)
-        return PriorDayLossSkipPolicy(
-            inner, prior_day_pnl=prior_day_pnl, account_equity=ACCOUNT, loss_pct=0.015
-        )
-    if policy_key == "tod_zero_elev125":
-        return VixElevatedSkipPolicy(
-            SCHEDULE_LINEAR_ZERO_LAST, elevated_scale=VIX_ELEVATED_SCALE, max_contracts=CAP
-        )
-
-    # --- Wave 2 policy keys ---
     if policy_key == "no_9am":
         return build_production_vix_policy(SCHEDULE_NO_9AM, max_contracts=CAP)
     if policy_key == "skip_tue":
         inner = build_production_vix_policy(TOD, max_contracts=CAP)
-        return WeekdaySkipPolicy(inner, skip_weekdays=(1,))  # Tuesday
-    if policy_key == "skip_mon_tue":
-        inner = build_production_vix_policy(TOD, max_contracts=CAP)
-        return WeekdaySkipPolicy(inner, skip_weekdays=(0, 1))
-    if policy_key == "regime_thr_22":
-        return RegimeDownsizePolicy(TOD, trailing_stop, threshold=0.22, max_contracts=CAP)
+        return WeekdaySkipPolicy(inner, skip_weekdays=(1,))
     if policy_key == "regime_thr_25":
         return RegimeDownsizePolicy(TOD, trailing_stop, threshold=0.25, max_contracts=CAP)
-    if policy_key == "regime_thr_30":
-        return RegimeDownsizePolicy(TOD, trailing_stop, threshold=0.30, max_contracts=CAP)
-    if policy_key == "regime_scale_033":
-        return RegimeDownsizePolicy(
-            TOD, trailing_stop, threshold=0.25, scale=1.0 / 3.0, max_contracts=CAP
-        )
-    if policy_key == "regime_scale_066":
-        return RegimeDownsizePolicy(
-            TOD, trailing_stop, threshold=0.25, scale=2.0 / 3.0, max_contracts=CAP
+    if policy_key == "prior_loss_15":
+        inner = build_production_vix_policy(TOD, max_contracts=CAP)
+        return PriorDayLossSkipPolicy(
+            inner, prior_day_pnl=prior_day_pnl, account_equity=ACCOUNT, loss_pct=0.015
         )
     if policy_key == "prior_loss_10":
         inner = build_production_vix_policy(TOD, max_contracts=CAP)
@@ -371,10 +334,5 @@ def make_policy(
         return PriorDayLossSkipPolicy(
             inner, prior_day_pnl=prior_day_pnl, account_equity=ACCOUNT, loss_pct=0.020
         )
-    if policy_key == "prior_loss_25":
-        inner = build_production_vix_policy(TOD, max_contracts=CAP)
-        return PriorDayLossSkipPolicy(
-            inner, prior_day_pnl=prior_day_pnl, account_equity=ACCOUNT, loss_pct=0.025
-        )
 
-    return build_production_vix_policy(TOD, max_contracts=CAP)
+    return build_production_vix_policy(TOD, elevated_scale=VIX_ELEVATED_SCALE, max_contracts=CAP)

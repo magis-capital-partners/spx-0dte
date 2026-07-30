@@ -33,6 +33,39 @@ from typing import Dict, List, Optional, Protocol, Sequence, Tuple
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "simulator"))
 
+
+class _ConsoleTee:
+    """Mirror an interactive executor's console output into its session folder."""
+
+    def __init__(self, console, log_path: Path):
+        self._console = console
+        self._log = log_path.open("a", encoding="utf-8", buffering=1)
+
+    def write(self, text: str) -> int:
+        self._console.write(text)
+        self._log.write(text)
+        return len(text)
+
+    def flush(self) -> None:
+        self._console.flush()
+        self._log.flush()
+
+    def isatty(self) -> bool:
+        return bool(getattr(self._console, "isatty", lambda: False)())
+
+    @property
+    def encoding(self) -> str:
+        return getattr(self._console, "encoding", "utf-8") or "utf-8"
+
+
+def _mirror_console_to_session_log() -> None:
+    """Capture direct/manual launches as well as supervised launches for the UI."""
+    today = date.today().isoformat()
+    log_path = ROOT / "data" / "live" / today / "executor-console.log"
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    sys.stdout = _ConsoleTee(sys.stdout, log_path)
+    sys.stderr = _ConsoleTee(sys.stderr, log_path)
+
 from mbh_simulator import (  # noqa: E402  (path injection above)
     CandidateRecord,
     OptionQuote,
@@ -87,6 +120,7 @@ from session_recovery import (  # noqa: E402
     fetch_ib_spxw_positions,
     load_fills_events,
     recover_governor_state,
+    recovered_halt_is_mark_only,
     recover_session_book,
     release_executor_lock,
 )
@@ -277,6 +311,27 @@ class IBSignalProvider:
 
     def shutdown(self) -> None:
         self._stream.shutdown()
+
+    def set_open_spread_legs(
+        self,
+        open_spreads: Sequence[OpenSpread],
+    ) -> bool:
+        """Pin every leg needed to monitor the current live/recovered book."""
+        legs = set()
+        for spread in open_spreads:
+            if spread.closed:
+                continue
+            candidate = spread.candidate
+            right = "P" if candidate.short_type.upper() in {"P", "PUT"} else "C"
+            legs.add((right, float(candidate.short_strike)))
+            legs.add((right, float(candidate.long_strike)))
+        return self._stream.set_required_0dte_legs(sorted(legs))
+
+    def wait_for_open_spread_quotes(
+        self,
+        timeout_seconds: float,
+    ) -> List[Tuple[str, float]]:
+        return self._stream.wait_for_required_quotes(timeout_seconds)
 
     def fetch(
         self, now: datetime, *, at_tranche: bool = False
@@ -869,6 +924,7 @@ def cancel_pending_entry(
         "new_tranche",
         "flatten",
         "error",
+        "entry_fault",
         "native_stop_disarm_timeout",
         "poll_error",
     }:
@@ -1977,7 +2033,6 @@ def run(live: LiveConfig = ACTIVE) -> None:
             provider = IBSignalProvider(
                 ib, live, config, baselines_core=baselines_core, session_vix=vix_open, today=today
             )
-            provider.start()
 
         # Rebuild open book from today's fills and verify against IB positions.
         recovered = recover_session_book(
@@ -2021,6 +2076,32 @@ def run(live: LiveConfig = ACTIVE) -> None:
                     f"{armed} short leg(s) after recovery"
                 )
 
+        # Build the initial stream only after recovery so every open-position
+        # leg is reserved inside the market-data budget before the first mark.
+        missing_recovery_quotes: Optional[List[Tuple[str, float]]] = None
+        if isinstance(provider, IBSignalProvider):
+            provider.set_open_spread_legs(open_spreads)
+            provider.start()
+            missing_recovery_quotes = []
+            if open_spreads:
+                missing_recovery_quotes = provider.wait_for_open_spread_quotes(
+                    live.recovery_quote_warmup_seconds
+                )
+                if missing_recovery_quotes:
+                    print(
+                        f"[{datetime.now().isoformat()}] RECOVERY QUOTE WARN: "
+                        "no fresh markable quote after warmup for "
+                        + ", ".join(
+                            f"{right}{strike:g}"
+                            for right, strike in missing_recovery_quotes
+                        )
+                    )
+                else:
+                    print(
+                        f"[{datetime.now().isoformat()}] recovered-position "
+                        "quotes ready for all open legs"
+                    )
+
         # Restore halt/flatten/cooldown so a restart cannot re-arm selling after a halt.
         fills_events = load_fills_events(today)
         governor = recover_governor_state(
@@ -2030,6 +2111,21 @@ def run(live: LiveConfig = ACTIVE) -> None:
         )
         entries_halted = governor.entries_halted
         flattened = governor.flattened
+        if (
+            recovered_halt_is_mark_only(governor)
+            and missing_recovery_quotes == []
+        ):
+            cleared_reasons = list(governor.halt_reasons)
+            entries_halted = False
+            print(
+                f"[{datetime.now().isoformat()}] governor clear â€” "
+                "recovered mark-only halt after all open legs warmed"
+            )
+            log_event(today, {
+                "event": "governor_clear",
+                "reason": "recovery_quotes_ready",
+                "cleared_reasons": cleared_reasons,
+            }, live=live)
         side_stop_cooldown_until: Dict[str, datetime] = dict(governor.side_stop_cooldown_until)
         side_stop_counts: Dict[str, int] = recover_side_stop_counts(fills_events)
         for warn in governor.warnings:
@@ -2045,6 +2141,7 @@ def run(live: LiveConfig = ACTIVE) -> None:
                 "event": "governor_recovered",
                 "entries_halted": entries_halted,
                 "flattened": flattened,
+                "halt_reasons": governor.halt_reasons,
                 "cooldowns": {k: v.isoformat() for k, v in side_stop_cooldown_until.items()},
                 "side_stop_counts": side_stop_counts,
             }, live=live)
@@ -2178,9 +2275,6 @@ def run(live: LiveConfig = ACTIVE) -> None:
                             _trigger_flatten("reconnect_failed", last_marked_pnl)
                         raise SystemExit("IB reconnect failed — exiting")
                     register_ib_error_handler(ib, today)
-                    if ib_provider is not None:
-                        ib_provider.ib = ib
-                        ib_provider.start()
                     # Re-check book vs IB after reconnect (fail loud on residual).
                     recovered_chk = recover_session_book(
                         today=today,
@@ -2197,12 +2291,45 @@ def run(live: LiveConfig = ACTIVE) -> None:
                             ib, open_spreads, today, dry=dry, live=live, config=config,
                             reason="post_reconnect",
                         )
+                    if ib_provider is not None:
+                        ib_provider.ib = ib
+                        ib_provider.set_open_spread_legs(open_spreads)
+                        ib_provider.start()
+                        reconnect_quote_gaps = (
+                            ib_provider.wait_for_open_spread_quotes(
+                                live.recovery_quote_warmup_seconds
+                            )
+                        )
+                        if reconnect_quote_gaps:
+                            print(
+                                f"[{datetime.now().isoformat()}] RECONNECT QUOTE WARN: "
+                                "no fresh markable quote for "
+                                + ", ".join(
+                                    f"{right}{strike:g}"
+                                    for right, strike in reconnect_quote_gaps
+                                )
+                            )
                     # Clear only the disconnect-induced halt; keep PnL/account/mark halts.
                     disconnect_halt = False
                     entries_halted = halted_before_disconnect or flattened
                     continue
 
                 at_tranche = should_fire_tranche(now, config, traded_tranches)
+                if ib_provider is not None:
+                    required_changed = ib_provider.set_open_spread_legs(open_spreads)
+                    if required_changed:
+                        new_leg_gaps = ib_provider.wait_for_open_spread_quotes(
+                            live.recovery_quote_warmup_seconds
+                        )
+                        if new_leg_gaps:
+                            print(
+                                f"[{now.isoformat()}] OPEN-LEG QUOTE WARN: "
+                                "no fresh markable quote for "
+                                + ", ".join(
+                                    f"{right}{strike:g}"
+                                    for right, strike in new_leg_gaps
+                                )
+                            )
                 quotes, signal = provider.fetch(now, at_tranche=at_tranche)
                 last_quotes = list(quotes)
 
@@ -2500,16 +2627,38 @@ def run(live: LiveConfig = ACTIVE) -> None:
         except SystemExit:
             raise
         except Exception as exc:
-            print(f"[{datetime.now().isoformat()}] ERROR: {exc!r} -- flattening and exiting.")
-            log_event(today, {"event": "error_flatten", "error": repr(exc)}, live=live)
-            cancel_pending_entry(ib, pending_entry, today, reason="error", dry=dry)
-            pending_entry = None
-            if not dry:
-                flatten_all(
-                    ib, [s for s in open_spreads if not s.closed], today, dry, live=live,
+            open_risk = [s for s in open_spreads if not s.closed]
+            if not open_risk:
+                # Pending-entry / loop faults with a flat book must not sticky-halt
+                # the session via error_flatten (today's AssertionError path).
+                print(
+                    f"[{datetime.now().isoformat()}] ENTRY FAULT (book flat): "
+                    f"{exc!r} — clearing pending, continuing session end."
                 )
-                run_flatten_audit(ib, today, dry=dry, live=live)
-            raise
+                log_event(today, {
+                    "event": "entry_fault",
+                    "error": repr(exc),
+                    "had_pending": pending_entry is not None,
+                }, live=live)
+                cancel_pending_entry(
+                    ib, pending_entry, today, reason="entry_fault", dry=dry,
+                )
+                pending_entry = None
+                # Fall through to session_end / finally — do not re-raise.
+            else:
+                print(
+                    f"[{datetime.now().isoformat()}] ERROR: {exc!r} "
+                    f"-- flattening and exiting."
+                )
+                log_event(
+                    today, {"event": "error_flatten", "error": repr(exc)}, live=live,
+                )
+                cancel_pending_entry(ib, pending_entry, today, reason="error", dry=dry)
+                pending_entry = None
+                if not dry:
+                    flatten_all(ib, open_risk, today, dry, live=live)
+                    run_flatten_audit(ib, today, dry=dry, live=live)
+                raise
 
         # End of day: SPXW 0DTE is cash-settled on the close, so open defined-risk
         # spreads are left to settle (matches the backtest's settle-at-close). Only
@@ -2636,4 +2785,5 @@ class _NeutralProvider:
 
 
 if __name__ == "__main__":
+    _mirror_console_to_session_log()
     run(ACTIVE)

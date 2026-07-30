@@ -9,6 +9,8 @@ from typing import Dict, Iterable, List, Optional, Tuple
 
 import polars as pl
 
+from rv_feature import atm_iv_from_pair, realized_vs_implied_raw
+
 
 ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_RAW = ROOT / "data" / "raw" / "thetadata"
@@ -102,6 +104,7 @@ def build_for_day(raw_dir: Path, processed_dir: Path, symbol: str, trade_date: s
     first_straddle: Optional[float] = None
     first_minutes: Optional[float] = None
     previous_spot: Optional[float] = None
+    spot_history: List[float] = []
 
     for ts_key in sorted(zero_by_ts):
         rows = zero_by_ts[ts_key]
@@ -109,6 +112,7 @@ def build_for_day(raw_dir: Path, processed_dir: Path, symbol: str, trade_date: s
         if not spot_values:
             continue
         spot = spot_values[0]
+        spot_history.append(spot)
         ts = datetime.fromisoformat(ts_key)
 
         for row in rows:
@@ -187,6 +191,14 @@ def build_for_day(raw_dir: Path, processed_dir: Path, symbol: str, trade_date: s
             trend_score = (spot - previous_spot) / straddle
         previous_spot = spot
 
+        atm_iv = atm_iv_from_pair(
+            float(call.get("implied_vol") or 0.0) or None,
+            float(put.get("implied_vol") or 0.0) or None,
+        )
+        realized = realized_vs_implied_raw(
+            spot_history, spot=spot, straddle=straddle, atm_iv=atm_iv
+        )
+
         feature_rows.append(
             {
                 "timestamp": ts_key,
@@ -196,7 +208,7 @@ def build_for_day(raw_dir: Path, processed_dir: Path, symbol: str, trade_date: s
                 "skew_z": skew_z,
                 "term_ratio_z": term_ratio_z,
                 "trend_score": trend_score,
-                "realized_vs_implied_z": 0.0,
+                "realized_vs_implied_z": realized,
                 "vix": "",
                 "underlying_price": spot,
                 "atm_call_strike": float(call["strike"]),

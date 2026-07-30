@@ -1,0 +1,11 @@
+---
+description: Memory Mesh node spx-0dte — isolated hub, no cross-repo memory
+alwaysApply: true
+---
+
+# Node: `spx-0dte` (isolated)
+
+- Hub (RW): `.agent-memory/` → `Projects/.agent-memory/hubs/spx-0dte` only
+- **No edges.** Do not read or write borrow-etf, research-equity, or diamond-creek hubs.
+- Protocol: local `CONTEXT.md` / `daily/` only. Keep ETF/equity research out of this memory.
+- Skills: `SKILL_POLICY.md`. Granola slash-only.

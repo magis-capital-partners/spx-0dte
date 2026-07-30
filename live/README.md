@@ -108,6 +108,12 @@ The executor now:
 2. **Book recovery** — rebuilds `open_spreads` from today's `fills.jsonl` (entries minus stops/flatten) and resumes stop/flatten management.
 3. **Governor recovery** — restores `entries_halted`, `flattened`, and same-side cooldowns from `fills.jsonl` so a restart cannot resume selling after a halt/flatten.
 4. **Fail loud** — if IB shows SPXW option risk that does not match the recovered book, startup exits with the residual legs printed. Flatten/reconcile in TWS, then restart.
+5. **Recovered-leg quote reservation** — every short and long leg in the recovered
+   book is pinned inside the streaming line budget before the first mark. These
+   subscriptions survive spot-grid rebalances and reconnects. Startup waits up
+   to 10 seconds for fresh markable quotes; a prior mark-only restart halt is
+   cleared only after all recovered legs validate. P&L, account, stop-count,
+   stale-data, flatten, and operator halts are never auto-cleared.
 
 Also cancels orphan working SPXW/BAG orders from a crashed prior run. Do **not** start a second executor mid-session; if you must restart, use one process only and let recovery reload the book.
 
@@ -120,7 +126,7 @@ Also cancels orphan working SPXW/BAG orders from a crashed prior run. Do **not**
 | **Disconnect breaker** | On IB disconnect: halt entries, reconnect with backoff (default 120s budget), re-arm native STPs, re-verify book. Failure with open risk → confirmed flatten then exit. |
 | **Mark integrity** | Missing quotes on open risk → halt entries (never treat as $0 PnL). Unavailable marks for 60s → flatten. |
 | **Stale quotes** | 3 consecutive polls with short-leg age >20s (10s near stop) → **halt entries only** (never flatten on stale alone). |
-| **Open-risk caps** | Max 6 open contracts / 3 per side / 2 same strike (live overlay). |
+| **Open-risk caps** | Paper-fidelity backstop: max 40 open contracts / 40 per side / 25 at one short strike. Calibrated just above reconstructed pilot-scale historical maxima; per-entry size remains capped at 3. |
 | **Live stop caps** | Max 2 stops/side and 4/day via `entry_risk_block_reason` (profile 999 overridden). |
 | **Flatten confirm + audit** | MKT close waits for fill; `flatten_audit` checks IB flat afterward. |
 | **Stop confirm** | After synthetic stop fill, verify IB short qty dropped; else `stop_unconfirmed` and keep managing. |
@@ -169,6 +175,18 @@ Manual / second terminal (loads the same Magis secrets):
 ```
 
 Heartbeat: `data/live/<date>/heartbeat.json` (updated every `heartbeat_seconds`).
+
+The watchdog resolves the current session date on every poll, so a long-running
+process rolls forward automatically at midnight. Passing `--date YYYY-MM-DD`
+still pins a date for an intentional soak drill.
+
+The local status API exits with a rollover signal when the date changes; its
+PowerShell wrapper relaunches it on the new trading day. The scheduled task also
+starts a fresh instance each morning.
+
+Completed `data/live/<date>/ib.log` files are gzip-compressed automatically by
+the scheduled morning preflight. The current day's active log is never touched;
+archives remain beside the session as `ib.log.gz`.
 
 **KILL one-liners**
 

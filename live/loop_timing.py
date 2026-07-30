@@ -5,12 +5,12 @@ from datetime import datetime, timedelta
 from typing import List, Optional, Sequence
 
 from live_config import LiveConfig
-from mbh_simulator import OptionQuote, StrategyConfig, is_entry_time
+from mbh_simulator import OptionQuote, StrategyConfig, effective_entry_end, is_entry_time
 
 
-def _entry_minutes(config: StrategyConfig) -> List[int]:
+def _entry_minutes(config: StrategyConfig, *, entry_end) -> List[int]:
     start = config.entry_start.hour * 60 + config.entry_start.minute
-    end = config.entry_end.hour * 60 + config.entry_end.minute
+    end = entry_end.hour * 60 + entry_end.minute
     interval = config.entry_interval_minutes
     return list(range(start, end + 1, interval))
 
@@ -18,11 +18,12 @@ def _entry_minutes(config: StrategyConfig) -> List[int]:
 def next_entry_datetime(now: datetime, config: StrategyConfig) -> Optional[datetime]:
     """Next tranche entry clock time on today's calendar (may be now if on boundary)."""
     today = now.date()
-    for minute in _entry_minutes(config):
+    entry_end = effective_entry_end(now, config)
+    for minute in _entry_minutes(config, entry_end=entry_end):
         hour, minute_of_hour = divmod(minute, 60)
         candidate = datetime(today.year, today.month, today.day, hour, minute_of_hour)
         if candidate >= now.replace(second=0, microsecond=0):
-            if candidate.time() <= config.entry_end:
+            if candidate.time() <= entry_end:
                 return candidate
     return None
 

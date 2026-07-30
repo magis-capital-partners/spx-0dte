@@ -16,7 +16,24 @@ $Root = Split-Path -Parent $PSScriptRoot
 Set-Location $Root
 . (Join-Path $PSScriptRoot "load_spx_live_env.ps1")
 
-python live/session_status_server.py `
-    --host $HostAddress `
-    --port $Port `
-    --write-interval $WriteInterval
+& python (Join-Path $PSScriptRoot "is_spx_trading_day.py")
+if ($LASTEXITCODE -ne 0) {
+    Write-Host "Skipping session status API: SPX is closed today."
+    exit 0
+}
+
+while ($true) {
+    python live/session_status_server.py `
+        --host $HostAddress `
+        --port $Port `
+        --write-interval $WriteInterval
+    $code = $LASTEXITCODE
+    if ($code -ne 75) { exit $code }
+
+    Write-Host "Status service rolled to a new date; checking the trading calendar."
+    & python (Join-Path $PSScriptRoot "is_spx_trading_day.py")
+    if ($LASTEXITCODE -ne 0) {
+        Write-Host "New date is not an SPX trading day; status service will resume at the next scheduled start."
+        exit 0
+    }
+}

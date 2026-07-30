@@ -20,6 +20,12 @@ if (-not (Test-Path $Python)) { $Python = "python" }
 $Git = "C:\Program Files\Git\bin\git.exe"
 if (-not (Test-Path $Git)) { $Git = "git" }
 
+& $Python (Join-Path $PSScriptRoot "is_spx_trading_day.py")
+if ($LASTEXITCODE -ne 0) {
+    Write-Host "Skipping cloud status publish: SPX is closed today."
+    exit 0
+}
+
 & $Python live/session_status_server.py --write-status
 if ($LASTEXITCODE -ne 0) { throw "write-status failed" }
 

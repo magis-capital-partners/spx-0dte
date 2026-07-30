@@ -51,6 +51,9 @@ class LiveConfig:
     use_streaming_quotes: bool = True
     streaming_generic_ticks: str = "106"
     streaming_warmup_seconds: float = 2.0
+    # Restart/reconnect: wait for every recovered position leg to have a fresh
+    # markable quote before the mark-integrity governor begins.
+    recovery_quote_warmup_seconds: float = 10.0
     spot_rebalance_points: float = 50.0
     fetch_next_expiry_at_tranche: bool = True
 
@@ -149,10 +152,14 @@ class LiveConfig:
     stale_quote_confirm_polls: int = 3
     stale_quote_halt_seconds: float = 20.0
     stale_quote_near_stop_seconds: float = 10.0
-    # Open-risk caps (live overlay; independent of backtest credit cap).
-    max_open_contracts: int = 6
-    max_open_per_side: int = 3
-    max_open_same_strike: int = 2
+    # Paper-fidelity open-risk backstops (independent of backtest credit cap).
+    # Calibrated just above the reconstructed two-contract pilot maxima from
+    # 1,469 active production-backtest days: 38 total / 37 per side /
+    # 23 at one short strike. These catch runaway accumulation without
+    # routinely overriding the strategy path in paper testing.
+    max_open_contracts: int = 40
+    max_open_per_side: int = 40
+    max_open_same_strike: int = 25
     # Live stop-count caps (production profile uses 999; tighten here).
     live_max_stops_per_side: int = 2
     live_max_stops_per_day: int = 4

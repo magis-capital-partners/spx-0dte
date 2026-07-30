@@ -47,10 +47,13 @@ class RecoveredGovernor:
 
     entries_halted: bool = False
     flattened: bool = False
+    halt_reasons: List[str] = None  # type: ignore[assignment]
     side_stop_cooldown_until: Dict[str, datetime] = None  # type: ignore[assignment]
     warnings: List[str] = None  # type: ignore[assignment]
 
     def __post_init__(self) -> None:
+        if self.halt_reasons is None:
+            self.halt_reasons = []
         if self.side_stop_cooldown_until is None:
             self.side_stop_cooldown_until = {}
         if self.warnings is None:
@@ -206,26 +209,39 @@ def recover_governor_state(
 ) -> RecoveredGovernor:
     """Rebuild halt/flatten/cooldown flags from persisted fill events.
 
+    Mark-data exception: a validated ``governor_clear`` can remove recovered
+    mark-only halt reasons after every open leg has a fresh quote. It never
+    clears P&L, account, stop-count, stale-data, flatten, or operator state.
+
     - Any ``halt_entries`` → entries halted for the rest of the session.
     - Any ``flatten`` / ``error_flatten`` / ``kill_switch`` → flattened + halted.
+    - ``entry_fault`` / ``entry_poll_error`` / ``entry_ladder_failed`` do **not**
+      sticky-halt (flat-book recoveries).
     - ``side_stop_cooldown_start`` restores ``until`` when still in the future.
     - Bare ``stop`` events derive cooldown as ``ts + cooldown_minutes`` when no
       explicit cooldown event was logged (older sessions).
     """
     clock = now or datetime.now()
-    entries_halted = False
     flattened = False
+    halt_reasons: set[str] = set()
     cooldowns: Dict[str, datetime] = {}
     warnings: List[str] = []
 
     for event in events:
         name = event.get("event")
         if name == "halt_entries":
-            entries_halted = True
+            reason = str(event.get("reason") or "").strip()
+            if not reason:
+                reason = "daily_loss" if event.get("marked_pnl") is not None else "unspecified"
+            halt_reasons.add(reason)
             continue
         if name in {"flatten", "error_flatten", "kill_switch", "flatten_incomplete"}:
             flattened = True
-            entries_halted = True
+            halt_reasons.add(str(name))
+            continue
+        if name == "governor_clear" and event.get("reason") == "recovery_quotes_ready":
+            for reason in event.get("cleared_reasons") or []:
+                halt_reasons.discard(str(reason))
             continue
         if name == "side_stop_cooldown_start":
             side = str(event.get("side") or "")
@@ -248,15 +264,26 @@ def recover_governor_state(
                 if prev is None or until > prev:
                     cooldowns[side] = until
 
-    if flattened and not entries_halted:
-        entries_halted = True
+    entries_halted = flattened or bool(halt_reasons)
+    if flattened and not halt_reasons:
         warnings.append("flattened implies entries_halted")
 
     return RecoveredGovernor(
         entries_halted=entries_halted,
         flattened=flattened,
+        halt_reasons=sorted(halt_reasons),
         side_stop_cooldown_until=cooldowns,
         warnings=warnings,
+    )
+
+
+def recovered_halt_is_mark_only(governor: RecoveredGovernor) -> bool:
+    """True only when every recovered halt came from degraded mark data."""
+    if governor.flattened or not governor.entries_halted or not governor.halt_reasons:
+        return False
+    return all(
+        reason.startswith("mark_") or reason == "partial_mark"
+        for reason in governor.halt_reasons
     )
 
 

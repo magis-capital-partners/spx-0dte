@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 import sys
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -15,6 +16,20 @@ import session_status_server as sss  # noqa: E402
 
 
 class LiveStatusTests(unittest.TestCase):
+    def test_rollover_loop_requests_restart_after_date_change(self) -> None:
+        stopped = threading.Event()
+        shutdown_called = threading.Event()
+
+        sss._status_rollover_loop(
+            "2026-07-30",
+            stopped,
+            shutdown_called.set,
+            poll_seconds=0,
+            today_fn=lambda: "2026-07-31",
+        )
+
+        self.assertTrue(shutdown_called.is_set())
+
     def test_sanitized_omits_stdout_and_strikes(self) -> None:
         full = {
             "schema": 1,

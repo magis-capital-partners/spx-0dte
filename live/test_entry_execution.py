@@ -176,6 +176,87 @@ class PollPendingEntryTests(unittest.TestCase):
         self.assertIn("Cancelled", resolution["reason"])
         self.assertEqual(ib.place_calls, 0)
 
+    def test_tape_replay_cancelled_ladder_no_place_no_assert(self) -> None:
+        """2026-07-29 tape: Cancelled at 09:48:49, ladder due at 09:49 with AssertionError if place attempted."""
+        now = datetime(2026, 7, 29, 9, 49, 0)
+        ib = _FakeIB(place_raises=AssertionError())
+        pending = _pending(
+            _FakeTrade("Cancelled"),
+            now=now,
+            next_ladder_in=-1.0,
+            ladder_step=1,
+            limit_credit=9.20,
+            natural=9.35,
+        )
+        live = LiveConfig(
+            entry_ladder_step=0.05,
+            entry_limit_concession=0.05,
+            entry_max_ladder_steps=3,
+        )
+
+        remaining, resolution = poll_pending_entry(
+            ib, pending, live, "2026-07-29", now, log_event=lambda *_a, **_k: None,
+        )
+
+        self.assertIsNone(remaining)
+        assert resolution is not None
+        self.assertEqual(resolution["event"], "order_rejected")
+        self.assertEqual(ib.place_calls, 0)
+        self.assertEqual(pending.ladder_step, 1)
+        self.assertAlmostEqual(pending.limit_credit, 9.20, places=2)
+
+    def test_pending_cancel_terminal_no_place(self) -> None:
+        now = datetime(2026, 7, 29, 9, 49, 0)
+        ib = _FakeIB(place_raises=AssertionError())
+        pending = _pending(
+            _FakeTrade("PendingCancel"),
+            now=now,
+            next_ladder_in=-1.0,
+            ladder_step=1,
+            limit_credit=9.20,
+            natural=9.35,
+        )
+        live = LiveConfig(entry_ladder_step=0.05, entry_limit_concession=0.05)
+
+        remaining, resolution = poll_pending_entry(
+            ib, pending, live, "2026-07-29", now, log_event=lambda *_a, **_k: None,
+        )
+
+        self.assertIsNone(remaining)
+        assert resolution is not None
+        self.assertEqual(resolution["event"], "order_rejected")
+        self.assertEqual(ib.place_calls, 0)
+
+    def test_hard_reject_on_ib_error_202(self) -> None:
+        now = datetime(2026, 7, 29, 9, 49, 0)
+        ib = _FakeIB(place_raises=AssertionError())
+        trade = _FakeTrade("Submitted")
+        trade.log.append(
+            SimpleNamespace(
+                message="Order Canceled - limit too aggressive",
+                errorCode=202,
+            )
+        )
+        pending = _pending(
+            trade,
+            now=now,
+            next_ladder_in=-1.0,
+            ladder_step=1,
+            limit_credit=9.20,
+            natural=9.35,
+        )
+        live = LiveConfig(entry_ladder_step=0.05, entry_limit_concession=0.05)
+
+        remaining, resolution = poll_pending_entry(
+            ib, pending, live, "2026-07-29", now, log_event=lambda *_a, **_k: None,
+        )
+
+        self.assertIsNone(remaining)
+        assert resolution is not None
+        self.assertEqual(resolution["event"], "order_rejected")
+        self.assertIn("aggressive", resolution["reason"].lower())
+        self.assertEqual(ib.place_calls, 0)
+
     def test_done_at_ladder_time_rejects_no_assert(self) -> None:
         now = datetime(2026, 7, 29, 9, 49, 0)
         ib = _FakeIB(place_raises=AssertionError())

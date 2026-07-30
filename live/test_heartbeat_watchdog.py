@@ -17,10 +17,29 @@ from heartbeat import (  # noqa: E402
     read_heartbeat,
     write_heartbeat,
 )
-from watchdog import evaluate_watchdog  # noqa: E402
+from watchdog import evaluate_watchdog, watchdog_target_date  # noqa: E402
 
 
 class HeartbeatWatchdogTests(unittest.TestCase):
+    def test_unpinned_watchdog_rolls_to_current_date(self) -> None:
+        self.assertEqual(
+            watchdog_target_date(None, now=datetime(2026, 7, 30, 23, 59)),
+            "2026-07-30",
+        )
+        self.assertEqual(
+            watchdog_target_date(None, now=datetime(2026, 7, 31, 0, 1)),
+            "2026-07-31",
+        )
+
+    def test_explicit_watchdog_date_remains_pinned_for_drills(self) -> None:
+        self.assertEqual(
+            watchdog_target_date(
+                "2026-07-30",
+                now=datetime(2026, 7, 31, 0, 1),
+            ),
+            "2026-07-30",
+        )
+
     def test_write_read_age(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             live_dir = Path(tmp)

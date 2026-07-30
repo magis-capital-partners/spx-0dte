@@ -10,7 +10,7 @@ import argparse
 import json
 import sys
 import time
-from datetime import date, datetime
+from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
@@ -23,6 +23,17 @@ from session_recovery import _pid_alive, lock_path_for  # noqa: E402
 from slack_notify import notify_slack  # noqa: E402
 
 LIVE_DIR = ROOT / "data" / "live"
+
+
+def watchdog_target_date(
+    pinned_date: Optional[str],
+    *,
+    now: Optional[datetime] = None,
+) -> str:
+    """Resolve the session date, rolling automatically unless explicitly pinned."""
+    if pinned_date:
+        return pinned_date
+    return (now or datetime.now()).date().isoformat()
 
 
 def evaluate_watchdog(
@@ -66,30 +77,46 @@ def evaluate_watchdog(
 
 def run_watchdog_loop(
     *,
-    today: str,
+    today: Optional[str] = None,
     poll_seconds: float = 10.0,
     max_heartbeat_age: float = 30.0,
     write_kill: bool = False,
     live_dir: Path = LIVE_DIR,
 ) -> None:
+    watched_day = watchdog_target_date(today)
     print(
-        f"[{datetime.now().isoformat()}] watchdog watching {today} "
+        f"[{datetime.now().isoformat()}] watchdog watching {watched_day} "
         f"(max_age={max_heartbeat_age}s, write_kill={write_kill})"
     )
     alerted = False
     while True:
+        target_day = watchdog_target_date(today)
+        if target_day != watched_day:
+            print(
+                f"[{datetime.now().isoformat()}] watchdog date rollover "
+                f"{watched_day} -> {target_day}",
+                flush=True,
+            )
+            watched_day = target_day
+            alerted = False
+
         reason = evaluate_watchdog(
-            today, max_heartbeat_age=max_heartbeat_age, live_dir=live_dir
+            watched_day,
+            max_heartbeat_age=max_heartbeat_age,
+            live_dir=live_dir,
         )
         if reason and not alerted:
-            msg = f"[spx-0dte] watchdog_alert — {reason} date={today}"
+            msg = f"[spx-0dte] watchdog_alert — {reason} date={watched_day}"
             print(f"[{datetime.now().isoformat()}] {msg}")
             notify_slack(msg, enabled=True)
             if write_kill:
-                global_kill, session_kill = kill_paths(today, live_dir=live_dir)
+                _global_kill, session_kill = kill_paths(
+                    watched_day,
+                    live_dir=live_dir,
+                )
                 session_kill.parent.mkdir(parents=True, exist_ok=True)
                 session_kill.write_text(f"watchdog: {reason}\n", encoding="utf-8")
-                print(f"[{datetime.now().isoformat()}] wrote KILL → {session_kill}")
+                print(f"[{datetime.now().isoformat()}] wrote KILL -> {session_kill}")
             alerted = True
         elif not reason:
             alerted = False
@@ -98,7 +125,11 @@ def run_watchdog_loop(
 
 def main(argv: Optional[list] = None) -> int:
     parser = argparse.ArgumentParser(description="Local live executor watchdog")
-    parser.add_argument("--date", default=date.today().isoformat())
+    parser.add_argument(
+        "--date",
+        default=None,
+        help="Pin a session date for drills; omit for automatic daily rollover",
+    )
     parser.add_argument("--poll-seconds", type=float, default=10.0)
     parser.add_argument("--max-heartbeat-age", type=float, default=30.0)
     parser.add_argument(
@@ -110,12 +141,17 @@ def main(argv: Optional[list] = None) -> int:
     args = parser.parse_args(argv)
 
     if args.once:
+        target_day = watchdog_target_date(args.date)
         reason = evaluate_watchdog(
-            args.date, max_heartbeat_age=args.max_heartbeat_age
+            target_day,
+            max_heartbeat_age=args.max_heartbeat_age,
         )
         if reason:
             print(reason)
-            notify_slack(f"[spx-0dte] watchdog_alert — {reason}", enabled=True)
+            notify_slack(
+                f"[spx-0dte] watchdog_alert — {reason}",
+                enabled=True,
+            )
             return 1
         print("ok")
         return 0

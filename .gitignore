@@ -33,3 +33,7 @@ Thumbs.db
 .vscode/
 .idea/
 installers/
+
+# Local Agent Memory Mesh junctions (see Projects/.agent-memory)
+.agent-memory/
+.agent-memory-upstream/

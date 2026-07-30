@@ -239,3 +239,16 @@ def regime_bucket(vix: float) -> str:
     if vix <= 35.0:
         return "elevated_25_35"
     return "extreme_gt35"
+
+
+def regime_bucket_5(vix: float) -> str:
+    """Five-regime scheme with top bucket VIX > 30 (research plan)."""
+    if vix < 12.0:
+        return "vl_lt12"
+    if vix < 15.0:
+        return "low_12_15"
+    if vix < 20.0:
+        return "mid_15_20"
+    if vix <= 30.0:
+        return "high_20_30"
+    return "extreme_gt30"

@@ -1,8 +1,8 @@
-# Install Windows Scheduled Tasks for SPX 0DTE paper auto-heal + dashboard status:
-#   - Magis SPX 0DTE Executor (supervised)
-#   - Magis SPX 0DTE Watchdog (WriteKill)
-#   - Magis SPX 0DTE Status API (local :8765 + write live_status.json)
-#   - Magis SPX 0DTE Status Publish (sanitized cloud status every 5 min while logged on)
+# Install Windows Scheduled Tasks for SPX 0DTE session support:
+#   - Morning preflight (baselines + VIX only)
+#   - Watchdog, local status API, and cloud-status publishing
+#
+# The IB executor remains deliberately manual: no scheduled task can start it.
 #
 # Usage:
 #   .\scripts\install_live_supervisor_tasks.ps1
@@ -12,7 +12,7 @@
 param(
     [switch]$StartNow,
     [switch]$Uninstall,
-    [string]$DailyAt = "09:15"
+    [string]$DailyAt = "09:00"
 )
 
 $ErrorActionPreference = "Stop"
@@ -20,11 +20,11 @@ $Root = Split-Path -Parent $PSScriptRoot
 
 $tasks = @(
     @{
-        Name = "Magis SPX 0DTE Executor"
-        Script = "run_ib_executor_supervised.ps1"
+        Name = "Magis SPX 0DTE Daily Preflight"
+        Script = "run_live_preflight.ps1"
         ExtraArgs = @()
-        Description = "Supervised SPX 0DTE IB paper executor (Magis Slack, auto-restart on crash)."
-        LimitHours = 14
+        Description = "Refresh SPX 0DTE live baselines and VIX calendar; never starts the IB executor."
+        LimitHours = 1
     },
     @{
         Name = "Magis SPX 0DTE Watchdog"
@@ -50,12 +50,25 @@ $tasks = @(
     }
 )
 
+$legacyTaskNames = @(
+    "Magis SPX 0DTE Executor"
+)
+
 if ($Uninstall) {
     foreach ($t in $tasks) {
         Unregister-ScheduledTask -TaskName $t.Name -Confirm:$false -ErrorAction SilentlyContinue
         Write-Host "Removed task: $($t.Name)"
     }
+    foreach ($name in $legacyTaskNames) {
+        Unregister-ScheduledTask -TaskName $name -Confirm:$false -ErrorAction SilentlyContinue
+        Write-Host "Removed legacy task: $name"
+    }
     return
+}
+
+foreach ($name in $legacyTaskNames) {
+    Unregister-ScheduledTask -TaskName $name -Confirm:$false -ErrorAction SilentlyContinue
+    Write-Host "Removed legacy automatic task: $name"
 }
 
 function Register-SpxTask($spec) {
@@ -77,7 +90,6 @@ function Register-SpxTask($spec) {
             -RepetitionDuration (New-TimeSpan -Days 3650)
         $triggers = @($rep) + $triggers
     }
-
     $settings = New-ScheduledTaskSettingsSet `
         -AllowStartIfOnBatteries `
         -DontStopIfGoingOnBatteries `
@@ -102,6 +114,7 @@ foreach ($t in $tasks) { Register-SpxTask $t }
 
 if ($StartNow) {
     foreach ($name in @(
+        "Magis SPX 0DTE Daily Preflight",
         "Magis SPX 0DTE Status API",
         "Magis SPX 0DTE Status Publish",
         "Magis SPX 0DTE Watchdog"
@@ -110,21 +123,10 @@ if ($StartNow) {
         if ($st -and $st.State -ne "Running") {
             Start-ScheduledTask -TaskName $name
             Write-Host "Started: $name"
-        } elseif ($st) {
-            Write-Host "Already running: $name"
         }
-    }
-    $exec = Get-ScheduledTask -TaskName "Magis SPX 0DTE Executor" -ErrorAction SilentlyContinue
-    if ($exec -and $exec.State -ne "Running") {
-        Start-ScheduledTask -TaskName "Magis SPX 0DTE Executor"
-        Write-Host "Started: Magis SPX 0DTE Executor"
-    } else {
-        Write-Host "Executor task left as-is (State=$($exec.State)) - not restarted."
     }
 }
 
 Get-ScheduledTask -TaskName ($tasks.Name) | Format-Table TaskName, State -AutoSize
 Write-Host ""
-Write-Host "Local API:  http://127.0.0.1:8765/status"
-Write-Host "Cloud file: docs/data/live_status.json (published by Status Publish task)"
-Write-Host "Local UI:   .\scripts\serve_dashboard_local.ps1  -> http://127.0.0.1:5500/"
+Write-Host "Executor remains manual: python live/ib_executor.py"

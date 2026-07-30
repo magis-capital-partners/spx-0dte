@@ -26,6 +26,7 @@ ROOT = Path(__file__).resolve().parents[1]
 LIVE_DIR = ROOT / "data" / "live"
 SUPERVISOR_DIR = LIVE_DIR / "supervisor"
 DOCS_STATUS = ROOT / "docs" / "data" / "live_status.json"
+STATUS_ROLLOVER_EXIT_CODE = 75
 
 sys.path.insert(0, str(ROOT / "live"))
 from session_recovery import _pid_alive, load_fills_events  # noqa: E402
@@ -59,6 +60,17 @@ def _tail_lines(path: Path, n: int) -> List[str]:
         return lines[-n:]
     except Exception:
         return []
+
+
+def _executor_console_path(today: str) -> Path:
+    """Use today's executor output; the supervisor file is a legacy fallback."""
+    session_log = LIVE_DIR / today / "executor-console.log"
+    if session_log.is_file():
+        return session_log
+    legacy_log = SUPERVISOR_DIR / "executor-stdout.log"
+    if legacy_log.is_file() and datetime.fromtimestamp(legacy_log.stat().st_mtime).date().isoformat() == today:
+        return legacy_log
+    return session_log
 
 
 def _recent_events(today: str, limit: int = 12) -> List[dict]:
@@ -130,7 +142,7 @@ def build_status(*, today: Optional[str] = None) -> Dict[str, Any]:
         "open_count": int(hb.get("open_count") or 0),
         "marked_pnl": float(hb.get("marked_pnl") or 0.0),
         "recent_events": _recent_events(day),
-        "stdout_path": str(SUPERVISOR_DIR / "executor-stdout.log"),
+        "stdout_path": str(_executor_console_path(day)),
     }
 
 
@@ -223,9 +235,12 @@ class _Handler(BaseHTTPRequestHandler):
                     tail = max(1, min(int((qs.get("tail") or ["200"])[0]), 2000))
                 except ValueError:
                     tail = 200
-                lines = _tail_lines(SUPERVISOR_DIR / "executor-stdout.log", tail)
+                log_path = _executor_console_path(_today())
+                lines = _tail_lines(log_path, tail)
+                if not lines and not log_path.is_file():
+                    lines = ["No console capture for this session yet. Restart the executor after the logging update to populate this panel."]
                 payload = {
-                    "path": str(SUPERVISOR_DIR / "executor-stdout.log"),
+                    "path": str(log_path),
                     "tail": tail,
                     "lines": lines,
                     "generated_at": datetime.now().isoformat(),
@@ -246,7 +261,29 @@ def _status_writer_loop(interval_sec: float, stop: threading.Event) -> None:
         stop.wait(interval_sec)
 
 
-def main() -> None:
+def _status_rollover_loop(
+    started_day: str,
+    stop: threading.Event,
+    shutdown,
+    *,
+    poll_seconds: float = 30.0,
+    today_fn=_today,
+) -> None:
+    """Request a clean service relaunch when the local calendar day changes."""
+    while not stop.wait(poll_seconds):
+        current_day = today_fn()
+        if current_day == started_day:
+            continue
+        print(
+            f"[{datetime.now().isoformat()}] session status date rollover "
+            f"{started_day} -> {current_day}; restarting",
+            flush=True,
+        )
+        shutdown()
+        return
+
+
+def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8765)
@@ -266,9 +303,10 @@ def main() -> None:
     if args.write_status:
         path = write_cloud_status()
         print(f"wrote {path}")
-        return
+        return 0
 
     stop = threading.Event()
+    rollover_requested = threading.Event()
     writer: Optional[threading.Thread] = None
     if args.write_interval and args.write_interval > 0:
         write_cloud_status()
@@ -280,6 +318,18 @@ def main() -> None:
         writer.start()
 
     httpd = ThreadingHTTPServer((args.host, args.port), _Handler)
+    started_day = _today()
+
+    def _request_rollover() -> None:
+        rollover_requested.set()
+        httpd.shutdown()
+
+    rollover = threading.Thread(
+        target=_status_rollover_loop,
+        args=(started_day, stop, _request_rollover),
+        daemon=True,
+    )
+    rollover.start()
     print(
         f"[{datetime.now().isoformat()}] session status on "
         f"http://{args.host}:{args.port}/status (logs=/logs)",
@@ -292,7 +342,8 @@ def main() -> None:
     finally:
         stop.set()
         httpd.server_close()
+    return STATUS_ROLLOVER_EXIT_CODE if rollover_requested.is_set() else 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

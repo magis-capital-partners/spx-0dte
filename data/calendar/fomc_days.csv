@@ -1,0 +1,67 @@
+date,meeting_end,kind,notes
+2019-01-30,2019-01-30,scheduled,Jan 29-30
+2019-03-20,2019-03-20,scheduled,Mar 19-20
+2019-05-01,2019-05-01,scheduled,Apr 30-May 1
+2019-06-19,2019-06-19,scheduled,Jun 18-19
+2019-07-31,2019-07-31,scheduled,Jul 30-31
+2019-09-18,2019-09-18,scheduled,Sep 17-18
+2019-10-04,2019-10-04,unscheduled,Oct 4
+2019-10-30,2019-10-30,scheduled,Oct 29-30
+2019-12-11,2019-12-11,scheduled,Dec 10-11
+2020-01-29,2020-01-29,scheduled,Jan 28-29
+2020-03-03,2020-03-03,unscheduled,Mar 2 (statement next day; use Mar 3 for session)
+2020-03-15,2020-03-15,unscheduled,Mar 15
+2020-04-29,2020-04-29,scheduled,Apr 28-29
+2020-06-10,2020-06-10,scheduled,Jun 9-10
+2020-07-29,2020-07-29,scheduled,Jul 28-29
+2020-09-16,2020-09-16,scheduled,Sep 15-16
+2020-11-05,2020-11-05,scheduled,Nov 4-5
+2020-12-16,2020-12-16,scheduled,Dec 15-16
+2021-01-27,2021-01-27,scheduled,Jan 26-27
+2021-03-17,2021-03-17,scheduled,Mar 16-17
+2021-04-28,2021-04-28,scheduled,Apr 27-28
+2021-06-16,2021-06-16,scheduled,Jun 15-16
+2021-07-28,2021-07-28,scheduled,Jul 27-28
+2021-09-22,2021-09-22,scheduled,Sep 21-22
+2021-11-03,2021-11-03,scheduled,Nov 2-3
+2021-12-15,2021-12-15,scheduled,Dec 14-15
+2022-01-26,2022-01-26,scheduled,Jan 25-26
+2022-03-16,2022-03-16,scheduled,Mar 15-16
+2022-05-04,2022-05-04,scheduled,May 3-4
+2022-06-15,2022-06-15,scheduled,Jun 14-15
+2022-07-27,2022-07-27,scheduled,Jul 26-27
+2022-09-21,2022-09-21,scheduled,Sep 20-21
+2022-11-02,2022-11-02,scheduled,Nov 1-2
+2022-12-14,2022-12-14,scheduled,Dec 13-14
+2023-02-01,2023-02-01,scheduled,Jan 31-Feb 1
+2023-03-22,2023-03-22,scheduled,Mar 21-22
+2023-05-03,2023-05-03,scheduled,May 2-3
+2023-06-14,2023-06-14,scheduled,Jun 13-14
+2023-07-26,2023-07-26,scheduled,Jul 25-26
+2023-09-20,2023-09-20,scheduled,Sep 19-20
+2023-11-01,2023-11-01,scheduled,Oct 31-Nov 1
+2023-12-13,2023-12-13,scheduled,Dec 12-13
+2024-01-31,2024-01-31,scheduled,Jan 30-31
+2024-03-20,2024-03-20,scheduled,Mar 19-20
+2024-05-01,2024-05-01,scheduled,Apr 30-May 1
+2024-06-12,2024-06-12,scheduled,Jun 11-12
+2024-07-31,2024-07-31,scheduled,Jul 30-31
+2024-09-18,2024-09-18,scheduled,Sep 17-18
+2024-11-07,2024-11-07,scheduled,Nov 6-7
+2024-12-18,2024-12-18,scheduled,Dec 17-18
+2025-01-29,2025-01-29,scheduled,Jan 28-29
+2025-03-19,2025-03-19,scheduled,Mar 18-19
+2025-05-07,2025-05-07,scheduled,May 6-7
+2025-06-18,2025-06-18,scheduled,Jun 17-18
+2025-07-30,2025-07-30,scheduled,Jul 29-30
+2025-09-17,2025-09-17,scheduled,Sep 16-17
+2025-10-29,2025-10-29,scheduled,Oct 28-29
+2025-12-10,2025-12-10,scheduled,Dec 9-10
+2026-01-28,2026-01-28,scheduled,Jan 27-28
+2026-03-18,2026-03-18,scheduled,Mar 17-18
+2026-04-29,2026-04-29,scheduled,Apr 28-29
+2026-06-17,2026-06-17,scheduled,Jun 16-17
+2026-07-29,2026-07-29,scheduled,Jul 28-29
+2026-09-16,2026-09-16,scheduled,Sep 15-16
+2026-10-28,2026-10-28,scheduled,Oct 27-28
+2026-12-09,2026-12-09,scheduled,Dec 8-9

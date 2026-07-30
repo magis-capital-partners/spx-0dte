@@ -27,12 +27,18 @@ from mbh_simulator import read_quotes_csv, simulate_day, trades_to_rows  # noqa:
 from portfolio_metrics import portfolio_stats  # noqa: E402
 from profiles import PRODUCTION_TRAIN_COUNT  # noqa: E402
 from regime_validation import discover_dates  # noqa: E402
-from overnight_calmar_variants import ACCOUNT, build_all_variants, make_policy  # noqa: E402
+from overnight_calmar_variants import (  # noqa: E402
+    ACCOUNT,
+    HOLDOUT_START,
+    SELECTION_END,
+    build_all_variants,
+    make_policy,
+)
 
 PROCESSED = ROOT / "data" / "processed"
 OUT = ROOT / "data" / "overnight_calmar_suite"
 TRAIN = PRODUCTION_TRAIN_COUNT
-CHECKPOINT_VERSION = 2  # Wave 2 variants (p7–p13); invalidates Wave 1 checkpoints
+CHECKPOINT_VERSION = 3  # Wave 3 + selection/holdout split; invalidates Wave 2 checkpoints
 DEFAULT_SIGNALS = "signals_unconditional.csv"
 
 
@@ -113,35 +119,74 @@ def load_checkpoint(path: Path) -> Optional[dict]:
         return None
 
 
+def filter_daily(daily: List[dict], *, end: Optional[str] = None, start: Optional[str] = None) -> List[dict]:
+    out: List[dict] = []
+    for row in daily:
+        d = str(row.get("date") or "")
+        if end is not None and d > end:
+            continue
+        if start is not None and d < start:
+            continue
+        out.append(row)
+    return out
+
+
 def build_summaries(
     variants: list,
     daily_by: Dict[str, List[dict]],
     trade_agg: Dict[str, dict],
+    *,
+    period: str = "full",
+    end: Optional[str] = None,
+    start: Optional[str] = None,
 ) -> List[dict]:
     ref_name = variants[0][1]
-    ref_stats = portfolio_stats(daily_by[ref_name], ACCOUNT, metrics_mode="eligible_only")
+    ref_daily = filter_daily(daily_by[ref_name], end=end, start=start)
+    ref_stats = portfolio_stats(ref_daily, ACCOUNT, metrics_mode="eligible_only")
+    ref_calmar = (
+        float(ref_stats.get("cagr_pct") or 0) / max(float(ref_stats.get("max_drawdown_pct") or 1), 0.01)
+    )
     rows: List[dict] = []
     for phase, name, _, _ in variants:
-        port = portfolio_stats(daily_by[name], ACCOUNT, metrics_mode="eligible_only")
-        agg = trade_agg[name]
+        daily = filter_daily(daily_by[name], end=end, start=start)
+        port = portfolio_stats(daily, ACCOUNT, metrics_mode="eligible_only")
+        agg = trade_agg.get(name, empty_trade_agg())
         max_dd = float(port.get("max_drawdown_pct") or 0)
         cagr = float(port.get("cagr_pct") or 0)
         calmar = round(cagr / max_dd, 4) if max_dd > 0 else 0.0
-        rows.append(
-            {
-                "phase": phase,
-                "variant": name,
-                **port,
-                "calmar": calmar,
+        # Trade aggs are full-run only; omit misleading period trade stats.
+        trade_fields = {}
+        if period == "full":
+            trade_fields = {
                 "spread_win_rate": agg_win_rate(agg),
                 "spread_expectancy": agg_expectancy(agg),
                 "total_trades": agg.get("trades", 0),
+                "stop_rate": agg_stop_rate(agg),
+            }
+        else:
+            trade_fields = {
+                "spread_win_rate": None,
+                "spread_expectancy": None,
+                "total_trades": sum(int(r.get("trades") or 0) for r in daily),
+                "stop_rate": None,
+            }
+        rows.append(
+            {
+                "period": period,
+                "selection_end": SELECTION_END,
+                "holdout_start": HOLDOUT_START,
+                "phase": phase,
+                "variant": name,
+                "n_days": len(daily),
+                **port,
+                "calmar": calmar,
+                **trade_fields,
                 "cagr_delta_vs_ref": round(cagr - float(ref_stats.get("cagr_pct") or 0), 2),
                 "worst_day_delta_vs_ref": round(
                     float(port.get("worst_day_pct") or 0) - float(ref_stats.get("worst_day_pct") or 0), 2
                 ),
                 "max_dd_delta_vs_ref": round(max_dd - float(ref_stats.get("max_drawdown_pct") or 0), 2),
-                "calmar_delta_vs_ref": round(calmar - (float(ref_stats.get("cagr_pct") or 0) / max(float(ref_stats.get("max_drawdown_pct") or 1), 0.01)), 4),
+                "calmar_delta_vs_ref": round(calmar - ref_calmar, 4),
             }
         )
     return rows

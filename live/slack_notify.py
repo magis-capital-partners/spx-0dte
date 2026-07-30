@@ -21,6 +21,7 @@ SAFETY_EVENTS = frozenset({
     "kill_switch",
     "native_stop_rejected",
     "error_flatten",
+    "entry_fault",
     "entry_poll_error",
     "stop_unconfirmed",
     "watchdog_alert",

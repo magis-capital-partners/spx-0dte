@@ -10,7 +10,8 @@ from live_config import LiveConfig
 from mbh_simulator import CandidateRecord, OptionQuote
 
 # Match ib_insync.OrderStatus DoneStates / ActiveStates (lowercase).
-_DONE_STATUSES = frozenset({"filled", "cancelled", "apicancelled"})
+# PendingCancel is terminal for ladder purposes — never amend while IB is cancelling.
+_DONE_STATUSES = frozenset({"filled", "cancelled", "apicancelled", "pendingcancel"})
 _ACTIVE_STATUSES = frozenset({"apipending", "presubmitted", "submitted", "pendingsubmit"})
 
 
@@ -98,12 +99,13 @@ def _hard_rejection_reason(trade) -> str:
     for entry in reversed(trade.log):
         msg = entry.message or ""
         code = getattr(entry, "errorCode", 0) or 0
-        if code in {201, 203, 110} or "reject" in msg.lower() or "not allowed" in msg.lower():
+        # 202 = IB price-collar / "Order Canceled" (align with ib_executor._trade_rejection_reason).
+        if code in {201, 202, 203, 110} or "reject" in msg.lower() or "not allowed" in msg.lower():
             return msg or f"error {code}"
         if msg and "permission" in msg.lower():
             return msg
     status = _order_status(trade)
-    if status in {"inactive", "apicancelled", "cancelled"} or "reject" in status:
+    if status in {"inactive", "apicancelled", "cancelled", "pendingcancel"} or "reject" in status:
         return trade.orderStatus.status or "rejected"
     return ""
 
@@ -243,9 +245,25 @@ def poll_pending_entry(
             pending.natural_credit, live, ladder_step=next_step,
         )
         if new_limit < pending.limit_credit:
+            # Re-check immediately before any IB call — race: Cancelled between
+            # the active check above and placeOrder. ib_insync wires the modify
+            # then asserts DoneStates → bare AssertionError().
+            if not _is_active_status(trade):
+                raw = trade.orderStatus.status or status or "unknown"
+                return _resolve_terminal_or_reject(
+                    pending, reason=f"entry_terminal_{raw}",
+                )
             old_price = trade.order.lmtPrice
             trade.order.lmtPrice = -new_limit
             try:
+                # Never amend a Done/PendingCancel trade. If status flipped under
+                # us, placeOrder raises; catch and clear without crashing the day.
+                if not _is_active_status(trade):
+                    trade.order.lmtPrice = old_price
+                    raw = trade.orderStatus.status or status or "unknown"
+                    return _resolve_terminal_or_reject(
+                        pending, reason=f"entry_terminal_{raw}",
+                    )
                 ib.placeOrder(trade.contract, trade.order)
             except Exception:
                 trade.order.lmtPrice = old_price

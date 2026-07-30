@@ -43,6 +43,10 @@ before entry-slip P&L fix, 120s stop clock, $0.25 stop slip, and $1.25 fees).
    python scripts/download_vix_daily.py
    ```
 
+   These refreshes are scheduled automatically at 9:00 AM on SPX trading days.
+   The watchdog and dashboard-status services also start automatically; the executor
+   itself is never scheduled.
+
 2. **Log into paper TWS or IB Gateway** (port **7497**). Requires SPX index + **OPRA**
    subscriptions for real-time quotes.
 
@@ -54,6 +58,10 @@ before entry-slip P&L fix, 120s stop clock, $0.25 stop slip, and $1.25 fees).
 
    Confirm startup log includes `wings=put150/call75` and
    `profile=p3_poststop_cooldown_120`.
+
+   The executor automatically mirrors this manual command's console output to
+   `data/live/<YYYY-MM-DD>/executor-console.log`, which is the stream shown in
+   the local dashboard's **Executor stdout** panel.
 
 4. **Session logs:** `data/live/<YYYY-MM-DD>/` (`fills.jsonl`, `tranches.jsonl`,
    `config.json`, `ib.log`).
