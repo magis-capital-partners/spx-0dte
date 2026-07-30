@@ -1,10 +1,10 @@
 {
   "schema": 1,
   "source": "cloud",
-  "generated_at": "2026-07-30T09:04:35.773340",
+  "generated_at": "2026-07-30T09:14:33.777217",
   "date": "2026-07-30",
-  "pid_alive": true,
-  "heartbeat_ts": "2026-07-30T09:04:17.547214",
+  "pid_alive": false,
+  "heartbeat_ts": "2026-07-30T09:13:47.629671",
   "entries_halted": false,
   "flattened": false,
   "open_count": 0,
