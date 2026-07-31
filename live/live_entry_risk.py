@@ -20,6 +20,11 @@ def apply_live_risk_overlays(config: StrategyConfig, live: Any) -> StrategyConfi
     )
     if bool(getattr(live, "use_portfolio_allocator_live", False)):
         cfg = replace(cfg, use_portfolio_allocator=True)
+    # The simulator's condor sleeve yields two vertical candidates.  In live
+    # execution that representation is unsafe unless they are submitted as one
+    # four-leg order, so fail closed while the paired path is disabled.
+    if not bool(getattr(live, "enable_paired_condor_live", False)):
+        cfg = replace(cfg, use_condor_sleeve=False)
     return cfg
 
 

@@ -113,6 +113,11 @@ class LiveConfig:
     # True with OPRA (market_data_type=1); rejects crossed/stale NBBO on entry.
     entry_require_live_nbbo: bool = True
     refresh_legs_before_entry: bool = True
+    # A condor must be routed as one four-leg BAG, never as two independent
+    # vertical orders.  Leave this off until the paired-order path has passed
+    # replay and paper-soak validation; the live overlay then removes the
+    # backtest's condor sleeve before candidates are generated.
+    enable_paired_condor_live: bool = False
 
     # --- VIX session controls (validated in data/vix_regime_tests) ------------ #
     # Skip the entire session when same-day VIX open exceeds the threshold

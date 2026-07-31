@@ -35,6 +35,15 @@ class LiveEntryRiskTests(unittest.TestCase):
         out = apply_live_risk_overlays(cfg, live)
         self.assertTrue(out.use_portfolio_allocator)
 
+    def test_condor_is_disabled_unless_paired_execution_is_enabled(self) -> None:
+        cfg = StrategyConfig(use_condor_sleeve=True)
+        self.assertFalse(apply_live_risk_overlays(cfg, LiveConfig()).use_condor_sleeve)
+        self.assertTrue(
+            apply_live_risk_overlays(
+                cfg, LiveConfig(enable_paired_condor_live=True)
+            ).use_condor_sleeve
+        )
+
     def test_side_stop_limit(self) -> None:
         cfg = StrategyConfig(max_stops_per_side=2, max_stops_per_day=4, same_side_stop_cooldown_minutes=0)
         cand = SimpleNamespace(

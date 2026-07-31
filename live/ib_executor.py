@@ -25,6 +25,7 @@ import json
 import logging
 import sys
 import time as _time
+import uuid
 from dataclasses import asdict, dataclass
 from datetime import date, datetime, timedelta
 from pathlib import Path
@@ -204,6 +205,9 @@ class OpenSpread:
     closed: bool = False
     stop_fill_price: Optional[float] = None
     fill_credit: Optional[float] = None
+    # Both verticals opened by one four-leg BAG share this immutable parent ID.
+    # Stops remain per vertical to preserve the backtest's exit semantics.
+    condor_id: Optional[str] = None
 
     @property
     def entry_credit(self) -> float:
@@ -466,6 +470,33 @@ def build_combo(ib: "IB", candidate: CandidateRecord, today: str) -> "Contract":
     long_leg = ComboLeg(conId=long_leg_opt.conId, ratio=1, action="BUY", exchange="SMART")
     bag.comboLegs = [short_leg, long_leg]
     return bag, short_leg_opt
+
+
+def build_paired_condor_combo(
+    ib: "IB", put_candidate: CandidateRecord, call_candidate: CandidateRecord, today: str,
+) -> "Contract":
+    """Build one atomic four-leg SPXW iron-condor BAG.
+
+    The order is deliberately a single combo: submitting its two verticals
+    independently can leave an unintended naked/one-sided position.
+    """
+    if put_candidate.short_type != "PUT" or call_candidate.short_type != "CALL":
+        raise ValueError("paired condor requires a put vertical and a call vertical")
+    expiry = today.replace("-", "")
+    contracts = []
+    for candidate, right in ((put_candidate, "P"), (call_candidate, "C")):
+        short_opt = Option("SPX", expiry, candidate.short_strike, right, "CBOE", tradingClass="SPXW")
+        long_opt = Option("SPX", expiry, candidate.long_strike, right, "CBOE", tradingClass="SPXW")
+        contracts.extend((short_opt, long_opt))
+    ib.qualifyContracts(*contracts)
+    bag = Contract(symbol="SPX", secType="BAG", currency="USD", exchange="SMART")
+    bag.comboLegs = [
+        ComboLeg(conId=contracts[0].conId, ratio=1, action="SELL", exchange="SMART"),
+        ComboLeg(conId=contracts[1].conId, ratio=1, action="BUY", exchange="SMART"),
+        ComboLeg(conId=contracts[2].conId, ratio=1, action="SELL", exchange="SMART"),
+        ComboLeg(conId=contracts[3].conId, ratio=1, action="BUY", exchange="SMART"),
+    ]
+    return bag
 
 
 def _short_option(ib: "IB", candidate: CandidateRecord, today: str) -> "Option":
@@ -1073,6 +1104,101 @@ def submit_spread_entry(
     return None, pending, ""
 
 
+def submit_paired_condor_entry(
+    ib: "IB",
+    put_candidate: CandidateRecord,
+    call_candidate: CandidateRecord,
+    contracts: int,
+    config: StrategyConfig,
+    today: str,
+    live: LiveConfig,
+    open_spreads: Sequence[OpenSpread],
+    *,
+    now: datetime,
+    provider: Optional["IBSignalProvider"] = None,
+) -> Tuple[List[OpenSpread], str]:
+    """Submit an all-or-none four-leg condor entry and return its two children.
+
+    This intentionally has no ladder: repricing a four-leg structure after a
+    partial/uncertain fill is not safe.  At the one-lot pilot size, IB's BAG is
+    either fully filled or cancelled; a timeout cancels it and records no
+    structure.  The parent order's combined credit is persisted on both child
+    events through ``condor_id`` for audit and restart reconciliation.
+    """
+    candidates = (put_candidate, call_candidate)
+    for candidate in candidates:
+        if provider is not None:
+            provider.refresh_candidate_legs(candidate, now)
+        ages = provider.leg_quote_ages(candidate) if provider is not None else None
+        block = entry_quote_block_reason(candidate, live, leg_ages=ages)
+        if block:
+            return [], f"paired_condor_{candidate.side}_{block}"
+    naturals = [natural_credit(candidate) for candidate in candidates]
+    total_natural = sum(naturals)
+    total_limit = entry_limit_credit(total_natural, live)
+    if total_limit <= 0:
+        return [], "paired_condor_insufficient_credit"
+
+    # Disarm only the two shorts the BAG will add to, then re-arm each side
+    # immediately after a fill or cancellation.
+    for candidate in candidates:
+        clear_short_leg_backstops(ib, candidate, open_spreads, today, dry=False, reason="paired_condor_pre_entry")
+    bag = build_paired_condor_combo(ib, put_candidate, call_candidate, today)
+    order = LimitOrder("BUY", contracts, -total_limit)
+    order.tif = "DAY"
+    order.account = live.ib_account
+    trade = ib.placeOrder(bag, order)
+    state, reason = _wait_for_combo_order(ib, trade, timeout_sec=8.0)
+    if state != "filled":
+        if state == "pending":
+            ib.cancelOrder(trade.order)
+            ib.sleep(0.25)
+            reason = "paired_condor_unfilled"
+        for candidate in candidates:
+            place_or_replace_native_stop_for_short(
+                ib, candidate, open_spreads, today, dry=False, live=live,
+                config=config, reason="paired_condor_cancelled",
+            )
+        return [], reason or "paired_condor_rejected"
+
+    condor_id = f"ic-{today}-{uuid.uuid4().hex[:10]}"
+    total_fill = abs(float(trade.orderStatus.avgFillPrice or total_limit))
+    # Preserve the actual combined fill while assigning a deterministic,
+    # non-negative share to each child for the existing per-spread accounting.
+    put_fill = round(total_fill * naturals[0] / total_natural, 2) if total_natural else 0.0
+    call_fill = round(total_fill - put_fill, 2)
+    fills = (put_fill, call_fill)
+    spreads: List[OpenSpread] = []
+    for candidate, fill in zip(candidates, fills):
+        short_sell = candidate.short_quote.bid if candidate.short_quote else 0.0
+        long_buy = candidate.long_quote.ask if candidate.long_quote else 0.0
+        spread = OpenSpread(
+            candidate=candidate, contracts=contracts,
+            short_entry_sell=short_sell, long_entry_buy=long_buy,
+            stop_price=_round_spx_premium(short_sell * config.stop_multiple),
+            combo_order_id=trade.order.orderId, fill_credit=fill, condor_id=condor_id,
+        )
+        spreads.append(spread)
+        log_event(today, {
+            "event": "entry", "side": candidate.side, "sleeve": "condor",
+            "condor_id": condor_id, "paired_condor": True,
+            "short_strike": candidate.short_strike, "long_strike": candidate.long_strike,
+            "contracts": contracts, "natural_credit": round(natural_credit(candidate), 2),
+            "combined_natural_credit": round(total_natural, 2),
+            "combined_limit_credit": round(total_limit, 2),
+            "combined_fill_credit": round(total_fill, 2), "credit": fill,
+            "short_entry_sell": round(short_sell, 4), "long_entry_buy": round(long_buy, 4),
+            "score": round(candidate.score, 3),
+        }, live=live)
+        place_or_replace_native_stop_for_short(
+            ib, candidate, [*open_spreads, *spreads], today, dry=False,
+            live=live, config=config, reason="paired_condor_fill",
+        )
+    print(f"[{now.isoformat()}] PAIRED CONDOR filled {put_candidate.short_strike}/{put_candidate.long_strike} + "
+          f"{call_candidate.short_strike}/{call_candidate.long_strike} x{contracts} credit={total_fill:.2f} id={condor_id}")
+    return spreads, ""
+
+
 def apply_pending_resolution(
     event: dict,
     pending: PendingEntry,
@@ -1299,6 +1425,7 @@ def manage_stops(
                         "net_before": net_before,
                         "net_after": net_after,
                         "fill": round(fill_px, 2),
+                        "condor_id": spread.condor_id,
                     }, live=live)
                     print(
                         f"[{datetime.now().isoformat()}] STOP UNCONFIRMED "
@@ -1321,6 +1448,7 @@ def manage_stops(
                 "stop_fill": round(fill_px, 2),
                 "contracts": spread.contracts,
                 "confirm_seconds": live.stop_confirm_seconds,
+                "condor_id": spread.condor_id,
                 "dry": dry,
             },
             live=live,
@@ -1420,6 +1548,7 @@ def flatten_all(
                 "long_strike": spread.candidate.long_strike,
                 "contracts": spread.contracts,
                 "fill_price": round(fill_px, 4),
+                "condor_id": spread.condor_id,
             })
         else:
             result.failed += 1
@@ -1432,6 +1561,7 @@ def flatten_all(
                 "contracts": spread.contracts,
                 "state": state,
                 "reason": reason,
+                "condor_id": spread.condor_id,
             })
             print(
                 f"[{datetime.now().isoformat()}] FLATTEN UNFILLED "
@@ -1676,6 +1806,7 @@ def _process_tranche(
 
     records: List[CandidateRecord] = []
     selected: List[CandidateRecord] = []
+    paired_condor_candidates: List[CandidateRecord] = []
     if not skip_reason:
         records = build_scored_candidates(quotes, signal, config)
         selected, records = select_candidate_entries(
@@ -1697,7 +1828,9 @@ def _process_tranche(
             condor_selected, condor_records = select_condor_entries(
                 quotes, signal, base_contracts, config, trades=condor_marks
             )
-            selected.extend(condor_selected)
+            # Live condors are a single four-leg structure.  Keep the two
+            # simulator records together until paired routing below.
+            paired_condor_candidates = condor_selected
             records.extend(condor_records)
 
     executed = 0
@@ -1857,6 +1990,78 @@ def _process_tranche(
             entry_working = True
             cand.status = "selected"
             break
+
+    # The simulator represents an IC as two candidate verticals.  Never send
+    # those through the serial vertical loop: route a complete pair as one BAG.
+    # This branch is unreachable unless the explicit live feature gate is on.
+    if (
+        bool(getattr(live, "enable_paired_condor_live", False))
+        and not dry
+        and not entry_working
+        and len(paired_condor_candidates) == 2
+    ):
+        put_cand = next((c for c in paired_condor_candidates if c.short_type == "PUT"), None)
+        call_cand = next((c for c in paired_condor_candidates if c.short_type == "CALL"), None)
+        if put_cand is not None and call_cand is not None:
+            pair_contracts = min(
+                _size_with_caps(put_cand, config, gross_credit_sold + credit_added, daily_credit_cap,
+                                sleeve_margin_used, portfolio_margin_used + margin_added),
+                _size_with_caps(call_cand, config, gross_credit_sold + credit_added, daily_credit_cap,
+                                sleeve_margin_used, portfolio_margin_used + margin_added),
+                live.max_contracts_per_tranche,
+            )
+            pair_reason = ""
+            for candidate in (put_cand, call_cand):
+                if pair_reason:
+                    break
+                pair_reason = side_stop_cooldown_block_reason(candidate.side, now, config, cooldown_map)
+                if not pair_reason:
+                    pair_reason = live_entry_risk_block(
+                        candidate, open_spreads, now=now, config=config,
+                        side_stop_cooldown_until=cooldown_map, side_stop_counts=stop_counts,
+                    )
+                if not pair_reason:
+                    pair_reason = open_risk_block_reason(
+                        candidate, open_spreads, contracts=pair_contracts,
+                        max_open_contracts=live.max_open_contracts,
+                        max_open_per_side=live.max_open_per_side,
+                        max_open_same_strike=live.max_open_same_strike,
+                    )
+            if pair_contracts <= 0:
+                pair_reason = pair_reason or "risk_blocked_size_cap"
+            if not pair_reason and live.use_pre_entry_buying_power and ib is not None and HAS_IB:
+                required = sum(candidate_margin_per_contract(c, config) * pair_contracts
+                               for c in (put_cand, call_cand))
+                acct = fetch_account_snapshot(ib, account=live.ib_account)
+                if acct.buying_power is None or acct.buying_power < required:
+                    pair_reason = "buying_power"
+            if pair_reason:
+                for candidate in (put_cand, call_cand):
+                    candidate.status = "blocked"
+                    candidate.reason = f"paired_condor_{pair_reason}"
+                log_event(today, {"event": "entry_blocked", "sleeve": "condor",
+                                  "reason": f"paired_condor_{pair_reason}"}, live=live)
+            else:
+                pair_spreads, pair_reason = submit_paired_condor_entry(
+                    ib, put_cand, call_cand, pair_contracts, config, today, live,
+                    open_spreads, now=now, provider=provider,
+                )
+                if pair_spreads:
+                    open_spreads.extend(pair_spreads)
+                    executed += 2
+                    credit_added += sum((s.fill_credit or 0.0) * s.contracts * config.multiplier
+                                        for s in pair_spreads)
+                    for spread in pair_spreads:
+                        margin = candidate_margin_per_contract(spread.candidate, config) * spread.contracts
+                        sleeve_margin_used["condor"] = sleeve_margin_used.get("condor", 0.0) + margin
+                        margin_added += margin
+                else:
+                    order_rejected = True
+                    for candidate in (put_cand, call_cand):
+                        candidate.status = "blocked"
+                        candidate.reason = f"paired_condor_{pair_reason}"
+                    log_event(today, {"event": "order_rejected", "sleeve": "condor",
+                                      "reason": f"paired_condor_{pair_reason}"}, live=live)
 
     if not skip_reason and executed == 0 and not entry_working and selected:
         if any(r.status == "blocked" for r in selected):
