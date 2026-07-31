@@ -42,6 +42,21 @@ def write_heartbeat(
     return path
 
 
+def append_risk_snapshot(
+    today: str,
+    snapshot: dict,
+    *,
+    live_dir: Path = LIVE_DIR,
+) -> Path:
+    """Append an intraday risk observation for return-on-margin history."""
+    path = live_dir / today / "risk_snapshots.jsonl"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    row = {"ts": datetime.now().isoformat(), **snapshot}
+    with path.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(row, separators=(",", ":")) + "\n")
+    return path
+
+
 def read_heartbeat(today: str, *, live_dir: Path = LIVE_DIR) -> Optional[dict]:
     path = heartbeat_path(today, live_dir=live_dir)
     if not path.is_file():

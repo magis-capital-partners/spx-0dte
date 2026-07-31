@@ -185,6 +185,8 @@ class LiveConfig:
     slack_notify_enabled: bool = True
     # Heartbeat for local watchdog (same machine as executor).
     heartbeat_seconds: float = 5.0
+    # Persist a compact risk/return-on-margin point at this cadence.
+    risk_snapshot_seconds: float = 60.0
     # Enable portfolio margin allocator when sizing up past pilot.
     use_portfolio_allocator_live: bool = False
     # Confirm synthetic stop against IB short-leg qty after fill.

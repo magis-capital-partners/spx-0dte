@@ -139,7 +139,8 @@ from ib_connection import (  # noqa: E402
 )
 from stale_quotes import StaleQuoteTracker, evaluate_stale_quotes  # noqa: E402
 from slack_notify import maybe_notify_safety_event  # noqa: E402
-from heartbeat import write_heartbeat  # noqa: E402
+from heartbeat import append_risk_snapshot, write_heartbeat  # noqa: E402
+from risk_ledger import build_risk_snapshot  # noqa: E402
 from open_risk_caps import open_risk_block_reason  # noqa: E402
 from live_entry_risk import (  # noqa: E402
     apply_live_risk_overlays,
@@ -2444,6 +2445,7 @@ def run(live: LiveConfig = ACTIVE) -> None:
         disconnect_halt = False
         stale_tracker = StaleQuoteTracker()
         last_heartbeat_at = datetime.now() - timedelta(seconds=live.heartbeat_seconds)
+        last_risk_snapshot_at = datetime.now() - timedelta(seconds=live.risk_snapshot_seconds)
         ib_port = live.port or (7497 if live.mode == "paper" else 7496)
         ib_provider: Optional[IBSignalProvider] = None
         if isinstance(provider, IBSignalProvider):
@@ -2738,13 +2740,20 @@ def run(live: LiveConfig = ACTIVE) -> None:
                 if (now - last_heartbeat_at).total_seconds() >= live.heartbeat_seconds:
                     last_heartbeat_at = now
                     open_n = sum(1 for s in open_spreads if not s.closed)
+                    risk = build_risk_snapshot(
+                        open_spreads, quotes, multiplier=config.multiplier,
+                    )
                     write_heartbeat(
                         today,
                         open_count=open_n,
                         marked_pnl=last_marked_pnl,
                         entries_halted=entries_halted,
                         flattened=flattened,
+                        extra={"risk": risk},
                     )
+                    if (now - last_risk_snapshot_at).total_seconds() >= live.risk_snapshot_seconds:
+                        last_risk_snapshot_at = now
+                        append_risk_snapshot(today, risk)
 
                 # --- Phase B: periodic NetLiq overlay -----------------------------
                 if (

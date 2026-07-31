@@ -30,6 +30,11 @@ STATUS_ROLLOVER_EXIT_CODE = 75
 
 sys.path.insert(0, str(ROOT / "live"))
 from session_recovery import _pid_alive, load_fills_events  # noqa: E402
+from session_hours import (  # noqa: E402
+    MONITOR_STOP_TIME,
+    monitor_stop_reached,
+    parse_monitor_stop_time,
+)
 
 
 def _today() -> str:
@@ -122,6 +127,32 @@ def _recent_events(today: str, limit: int = 12) -> List[dict]:
     return out
 
 
+def _risk_history(limit: int = 30) -> List[dict]:
+    """Latest compact return-on-margin point from each recorded session."""
+    rows: List[dict] = []
+    if not LIVE_DIR.is_dir():
+        return rows
+    for day_dir in sorted((p for p in LIVE_DIR.iterdir() if p.is_dir()), reverse=True):
+        lines = _tail_lines(day_dir / "risk_snapshots.jsonl", 1)
+        if not lines:
+            continue
+        try:
+            raw = json.loads(lines[-1])
+        except json.JSONDecodeError:
+            continue
+        rows.append({
+            "date": day_dir.name,
+            "ts": raw.get("ts"),
+            "marked_pnl": raw.get("marked_pnl"),
+            "defined_risk_margin": raw.get("defined_risk_margin"),
+            "marked_return_on_margin_pct": raw.get("marked_return_on_margin_pct"),
+            "max_loss_no_stop": raw.get("max_loss_no_stop"),
+        })
+        if len(rows) >= limit:
+            break
+    return list(reversed(rows))
+
+
 def build_status(*, today: Optional[str] = None) -> Dict[str, Any]:
     day = today or _today()
     day_dir = LIVE_DIR / day
@@ -130,7 +161,7 @@ def build_status(*, today: Optional[str] = None) -> Dict[str, Any]:
     pid = int(hb.get("pid") or lock.get("pid") or 0)
     alive = _pid_alive(pid) if pid else False
     return {
-        "schema": 1,
+        "schema": 2,
         "source": "local",
         "generated_at": datetime.now().isoformat(),
         "date": day,
@@ -141,6 +172,8 @@ def build_status(*, today: Optional[str] = None) -> Dict[str, Any]:
         "flattened": bool(hb.get("flattened", False)),
         "open_count": int(hb.get("open_count") or 0),
         "marked_pnl": float(hb.get("marked_pnl") or 0.0),
+        "risk": hb.get("risk") or {},
+        "risk_history": _risk_history(),
         "recent_events": _recent_events(day),
         "stdout_path": str(_executor_console_path(day)),
     }
@@ -151,7 +184,7 @@ def build_sanitized_cloud_status(*, today: Optional[str] = None) -> Dict[str, An
     full = build_status(today=today)
     last_ev = full["recent_events"][-1] if full["recent_events"] else None
     return {
-        "schema": 1,
+        "schema": 2,
         "source": "cloud",
         "generated_at": full["generated_at"],
         "date": full["date"],
@@ -161,6 +194,11 @@ def build_sanitized_cloud_status(*, today: Optional[str] = None) -> Dict[str, An
         "flattened": full["flattened"],
         "open_count": full["open_count"],
         "marked_pnl": round(full["marked_pnl"], 2),
+        "risk": {
+            key: value for key, value in (full.get("risk") or {}).items()
+            if key != "positions"
+        },
+        "risk_history": full.get("risk_history") or [],
         "last_event": (
             {"ts": last_ev.get("ts"), "event": last_ev.get("event")}
             if last_ev
@@ -283,6 +321,29 @@ def _status_rollover_loop(
         return
 
 
+def _status_close_loop(
+    stop: threading.Event,
+    shutdown,
+    *,
+    stop_at=MONITOR_STOP_TIME,
+    poll_seconds: float = 15.0,
+) -> None:
+    """Stop the local dashboard service shortly after the regular close."""
+    if stop_at is None:
+        return
+    while not stop.is_set():
+        now = datetime.now()
+        if monitor_stop_reached(now=now, stop_at=stop_at):
+            print(
+                f"[{now.isoformat()}] session status stopping at local session cutoff "
+                f"{stop_at.strftime('%H:%M')}",
+                flush=True,
+            )
+            shutdown()
+            return
+        stop.wait(poll_seconds)
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--host", default="127.0.0.1")
@@ -298,12 +359,22 @@ def main() -> int:
         default=60.0,
         help="While serving, rewrite cloud status every N seconds (0=off)",
     )
+    parser.add_argument(
+        "--stop-at",
+        default="16:01",
+        help="Local monitor cutoff HH:MM (default 16:01; use 'off' for drills)",
+    )
     args = parser.parse_args()
 
     if args.write_status:
         path = write_cloud_status()
         print(f"wrote {path}")
         return 0
+
+    try:
+        stop_at = parse_monitor_stop_time(args.stop_at)
+    except ValueError as exc:
+        parser.error(str(exc))
 
     stop = threading.Event()
     rollover_requested = threading.Event()
@@ -330,6 +401,13 @@ def main() -> int:
         daemon=True,
     )
     rollover.start()
+    close_monitor = threading.Thread(
+        target=_status_close_loop,
+        args=(stop, httpd.shutdown),
+        kwargs={"stop_at": stop_at},
+        daemon=True,
+    )
+    close_monitor.start()
     print(
         f"[{datetime.now().isoformat()}] session status on "
         f"http://{args.host}:{args.port}/status (logs=/logs)",
