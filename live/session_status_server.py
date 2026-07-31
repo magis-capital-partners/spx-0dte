@@ -30,11 +30,6 @@ STATUS_ROLLOVER_EXIT_CODE = 75
 
 sys.path.insert(0, str(ROOT / "live"))
 from session_recovery import _pid_alive, load_fills_events  # noqa: E402
-from session_hours import (  # noqa: E402
-    MONITOR_STOP_TIME,
-    monitor_stop_reached,
-    parse_monitor_stop_time,
-)
 
 
 def _today() -> str:
@@ -321,29 +316,6 @@ def _status_rollover_loop(
         return
 
 
-def _status_close_loop(
-    stop: threading.Event,
-    shutdown,
-    *,
-    stop_at=MONITOR_STOP_TIME,
-    poll_seconds: float = 15.0,
-) -> None:
-    """Stop the local dashboard service shortly after the regular close."""
-    if stop_at is None:
-        return
-    while not stop.is_set():
-        now = datetime.now()
-        if monitor_stop_reached(now=now, stop_at=stop_at):
-            print(
-                f"[{now.isoformat()}] session status stopping at local session cutoff "
-                f"{stop_at.strftime('%H:%M')}",
-                flush=True,
-            )
-            shutdown()
-            return
-        stop.wait(poll_seconds)
-
-
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--host", default="127.0.0.1")
@@ -359,22 +331,12 @@ def main() -> int:
         default=60.0,
         help="While serving, rewrite cloud status every N seconds (0=off)",
     )
-    parser.add_argument(
-        "--stop-at",
-        default="16:01",
-        help="Local monitor cutoff HH:MM (default 16:01; use 'off' for drills)",
-    )
     args = parser.parse_args()
 
     if args.write_status:
         path = write_cloud_status()
         print(f"wrote {path}")
         return 0
-
-    try:
-        stop_at = parse_monitor_stop_time(args.stop_at)
-    except ValueError as exc:
-        parser.error(str(exc))
 
     stop = threading.Event()
     rollover_requested = threading.Event()
@@ -401,13 +363,6 @@ def main() -> int:
         daemon=True,
     )
     rollover.start()
-    close_monitor = threading.Thread(
-        target=_status_close_loop,
-        args=(stop, httpd.shutdown),
-        kwargs={"stop_at": stop_at},
-        daemon=True,
-    )
-    close_monitor.start()
     print(
         f"[{datetime.now().isoformat()}] session status on "
         f"http://{args.host}:{args.port}/status (logs=/logs)",
