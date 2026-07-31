@@ -4,7 +4,7 @@ from __future__ import annotations
 import math
 from dataclasses import dataclass
 from datetime import datetime, timedelta
-from typing import Any, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 from live_config import LiveConfig
 from mbh_simulator import CandidateRecord, OptionQuote
@@ -80,6 +80,7 @@ class PendingEntry:
     tranche_time: Optional[datetime] = None
     sleeve: str = "core"
     score: float = 0.0
+    entry_diagnostics: Optional[Dict[str, Any]] = None
 
 
 def _order_status(trade) -> str:
@@ -153,6 +154,8 @@ def _entry_fill_event(pending: PendingEntry, *, contracts: int, partial: bool = 
         "ladder_steps": pending.ladder_step,
         **_entry_leg_fields(pending),
     }
+    if pending.entry_diagnostics:
+        event.update(pending.entry_diagnostics)
     if partial:
         event["partial"] = True
         event["requested_contracts"] = pending.contracts
@@ -173,6 +176,7 @@ def _entry_reject_event(pending: PendingEntry, *, reason: str, status: Optional[
         "status": status if status is not None else (trade.orderStatus.status or "unknown"),
         "reason": reason,
         **_entry_leg_fields(pending),
+        **(pending.entry_diagnostics or {}),
     }
 
 

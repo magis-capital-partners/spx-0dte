@@ -113,6 +113,9 @@ class LiveConfig:
     # True with OPRA (market_data_type=1); rejects crossed/stale NBBO on entry.
     entry_require_live_nbbo: bool = True
     refresh_legs_before_entry: bool = True
+    # Record the SMART-combo NBBO alongside the two leg quotes.  The guard
+    # remains off until paper validation confirms IB's BAG quote convention.
+    combo_quote_guard_enabled: bool = False
     # A condor must be routed as one four-leg BAG, never as two independent
     # vertical orders.  Leave this off until the paired-order path has passed
     # replay and paper-soak validation; the live overlay then removes the

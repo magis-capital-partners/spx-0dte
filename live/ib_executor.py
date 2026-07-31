@@ -87,6 +87,7 @@ except Exception:  # pragma: no cover - import guard
     HAS_IB = False
 
 from live_config import ACTIVE, LiveConfig  # noqa: E402
+from combo_pricing import ComboQuote, protect_credit_limit  # noqa: E402
 from entry_execution import (  # noqa: E402
     PendingEntry,
     entry_limit_credit,
@@ -470,6 +471,31 @@ def build_combo(ib: "IB", candidate: CandidateRecord, today: str) -> "Contract":
     long_leg = ComboLeg(conId=long_leg_opt.conId, ratio=1, action="BUY", exchange="SMART")
     bag.comboLegs = [short_leg, long_leg]
     return bag, short_leg_opt
+
+
+def fetch_combo_execution_quote(ib: "IB", bag: "Contract") -> ComboQuote:
+    """Request the immediate SMART BAG NBBO used by IB's price collar.
+
+    A failed/malformed snapshot intentionally returns an unavailable quote;
+    the optional guard can then fail closed instead of guessing from leg prices.
+    """
+    try:
+        tickers = ib.reqTickers(bag)
+        if not tickers:
+            return ComboQuote(None, None)
+        ticker = tickers[0]
+        bid = float(ticker.bid) if ticker.bid is not None and ticker.bid > 0 else None
+        ask = float(ticker.ask) if ticker.ask is not None and ticker.ask > 0 else None
+        # Negative credit BAG quotes may be exposed by ib_insync as negative
+        # values, so retain them rather than applying the usual positive-NBBO
+        # filter used for single option legs.
+        if ticker.bid is not None and float(ticker.bid) < 0:
+            bid = float(ticker.bid)
+        if ticker.ask is not None and float(ticker.ask) < 0:
+            ask = float(ticker.ask)
+        return ComboQuote(bid, ask)
+    except Exception:
+        return ComboQuote(None, None)
 
 
 def build_paired_condor_combo(
@@ -1038,6 +1064,12 @@ def submit_spread_entry(
     limit = entry_limit_credit(nat, live)
     short_sell = candidate.short_quote.bid if candidate.short_quote else 0.0
     long_buy = candidate.long_quote.ask if candidate.long_quote else 0.0
+    entry_diagnostics = {
+        "short_bid": round(float(short_sell), 4),
+        "short_ask": round(float(candidate.short_quote.ask), 4) if candidate.short_quote else None,
+        "long_bid": round(float(candidate.long_quote.bid), 4) if candidate.long_quote else None,
+        "long_ask": round(float(long_buy), 4),
+    }
     spread = OpenSpread(
         candidate=candidate,
         contracts=contracts,
@@ -1054,6 +1086,30 @@ def submit_spread_entry(
         ib, candidate, open_spreads, today, dry=dry, reason="pre_entry",
     )
     bag, _short_leg_opt = build_combo(ib, candidate, today)
+    combo_quote = fetch_combo_execution_quote(ib, bag)
+    combo_decision = protect_credit_limit(limit, combo_quote)
+    entry_diagnostics.update({
+        "combo_bid": combo_quote.bid,
+        "combo_ask": combo_quote.ask,
+        "combo_requested_credit": round(limit, 2),
+        "combo_collar_credit": combo_decision.collar_credit,
+        "combo_quote_reason": combo_decision.reason,
+    })
+    if live.combo_quote_guard_enabled:
+        if not combo_decision.ok or combo_decision.allowed_credit is None:
+            # Re-arm any same-strike backstop that was disarmed before quote
+            # validation.  Do not route an order without a usable BAG NBBO.
+            place_or_replace_native_stop_for_short(
+                ib, candidate, open_spreads, today, dry=dry, live=live,
+                config=config, reason="combo_quote_blocked",
+            )
+            return None, None, combo_decision.reason or "combo_quote_blocked"
+        if combo_decision.allowed_credit != limit:
+            limit = combo_decision.allowed_credit
+            entry_diagnostics["combo_guard_repriced"] = True
+            entry_diagnostics["combo_allowed_credit"] = round(limit, 2)
+        else:
+            entry_diagnostics["combo_guard_repriced"] = False
     combo_order = LimitOrder("BUY", contracts, -limit)
     combo_order.tif = "DAY"
     combo_order.account = live.ib_account
@@ -1085,6 +1141,7 @@ def submit_spread_entry(
         tranche_time=now,
         sleeve=candidate.sleeve or "core",
         score=candidate.score,
+        entry_diagnostics=entry_diagnostics,
     )
     log_event(today, {
         "event": "entry_submitted",
@@ -1095,6 +1152,7 @@ def submit_spread_entry(
         "natural_credit": round(nat, 2),
         "limit_credit": round(limit, 2),
         "score": round(candidate.score, 3),
+        **entry_diagnostics,
     })
     print(
         f"[{now.isoformat()}] ENTRY working {candidate.side} "
