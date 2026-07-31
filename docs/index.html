@@ -85,6 +85,7 @@ const COLORS = ["#58a6ff","#3fb950","#bc8cff","#d29922","#f85149","#56d4dd"];
 const fmt$ = (n) => (n<0?"-$":"$") + Math.abs(n).toLocaleString(undefined,{maximumFractionDigits:0});
 const fmtPct = (n,d=2) => (n==null||isNaN(n)?"–":n.toFixed(d)+"%");
 const cls = (n) => n>0?"pos":n<0?"neg":"";
+const MISSING = "\u2014";
 
 const LOCAL_STATUS = "http://127.0.0.1:8765";
 
@@ -140,6 +141,7 @@ function SessionNow() {
   const flat = !!(src && src.flattened);
   const risk = (src && src.risk) || {};
   const riskHistory = (src && src.risk_history) || [];
+  const riskAvailable = risk.defined_risk_margin != null;
   let dot = "off";
   if (src && alive && !halted) dot = "on";
   else if (src && alive && halted) dot = "warn";
@@ -168,17 +170,20 @@ function SessionNow() {
             <div className="card"><div className="k">Executor</div><div className="v" style={{fontSize:16}}>{alive ? "alive" : "down"}</div></div>
             <div className="card"><div className="k">Open</div><div className="v">{src.open_count ?? "–"}</div></div>
             <div className="card"><div className="k">Marked P&amp;L</div><div className={"v " + cls(src.marked_pnl)}>{fmt$(src.marked_pnl || 0)}</div></div>
-            <div className="card"><div className="k">Max loss (no stop)</div><div className="v neg">{risk.max_loss_no_stop==null?"â€“":fmt$(risk.max_loss_no_stop)}</div></div>
-            <div className="card"><div className="k">Planned stop loss*</div><div className="v neg">{risk.planned_stop_loss==null?"â€“":fmt$(risk.planned_stop_loss)}</div></div>
-            <div className="card"><div className="k">Defined-risk margin</div><div className="v">{risk.defined_risk_margin==null?"â€“":fmt$(risk.defined_risk_margin)}</div></div>
-            <div className="card"><div className="k">Marked return / margin</div><div className={"v "+cls(risk.marked_return_on_margin_pct)}>{risk.marked_return_on_margin_pct==null?"â€“":fmtPct(risk.marked_return_on_margin_pct)}</div></div>
+            <div className="card"><div className="k">Max loss (no stop)</div><div className="v neg">{risk.max_loss_no_stop==null?MISSING:fmt$(risk.max_loss_no_stop)}</div></div>
+            <div className="card"><div className="k">Planned stop loss*</div><div className="v neg">{risk.planned_stop_loss==null?MISSING:fmt$(risk.planned_stop_loss)}</div></div>
+            <div className="card"><div className="k">Defined-risk margin</div><div className="v">{risk.defined_risk_margin==null?MISSING:fmt$(risk.defined_risk_margin)}</div></div>
+            <div className="card"><div className="k">Marked return / margin</div><div className={"v "+cls(risk.marked_return_on_margin_pct)}>{risk.marked_return_on_margin_pct==null?MISSING:fmtPct(risk.marked_return_on_margin_pct)}</div></div>
             <div className="card"><div className="k">Halted</div><div className="v">{halted ? <span className="pill halt">Yes</span> : "No"}</div></div>
             <div className="card"><div className="k">Flattened</div><div className="v">{flat ? <span className="pill halt">Yes</span> : "No"}</div></div>
             <div className="card"><div className="k">Heartbeat</div><div className="v" style={{fontSize:15}}>{ageLabel(src.heartbeat_ts)}</div></div>
             <div className="card"><div className="k">Status as of</div><div className="v" style={{fontSize:15}}>{ageLabel(src.generated_at || src.heartbeat_ts)}</div></div>
           </div>
+          {!riskAvailable && <p className="sub" style={{margin:"0 0 10px"}}>
+            Risk metrics will appear after the executor and local status service restart on the risk-ledger version.
+          </p>}
           {risk.defined_risk_margin != null && <p className="sub" style={{margin:"0 0 10px"}}>
-            *Stop-loss estimate assumes the short cover fills at its trigger and the retained long wing expires worthless; it is not a guaranteed loss cap. Mark quality: <code>{risk.mark_quality||"â€“"}</code>.
+            *Stop-loss estimate assumes the short cover fills at its trigger and the retained long wing expires worthless; it is not a guaranteed loss cap. Mark quality: <code>{risk.mark_quality||MISSING}</code>.
           </p>}
           {riskHistory.length > 1 && <div style={{marginBottom:12}}>
             <div className="muted" style={{marginBottom:6, fontSize:11, textTransform:"uppercase"}}>Daily marked return on margin</div>
