@@ -482,7 +482,9 @@ def mark_stopped_wings_from_ib(
     return warnings
 
 
-def fetch_ib_spxw_positions(ib: Any, today: str) -> Dict[LegKey, int]:
+def fetch_ib_spxw_positions(
+    ib: Any, today: str, *, account: Optional[str] = None
+) -> Dict[LegKey, int]:
     """Net SPXW option positions from IB (signed: short < 0, long > 0)."""
     expiry_today = today.replace("-", "")
     try:
@@ -493,6 +495,8 @@ def fetch_ib_spxw_positions(ib: Any, today: str) -> Dict[LegKey, int]:
     nets: Dict[LegKey, int] = {}
     positions = list(getattr(ib, "positions", lambda: [])())
     for item in positions:
+        if account and str(getattr(item, "account", "") or "") != account:
+            continue
         contract = getattr(item, "contract", None)
         if contract is None:
             continue
@@ -548,7 +552,9 @@ def format_leg_nets(nets: Dict[LegKey, int]) -> str:
     return ", ".join(parts)
 
 
-def cancel_orphan_open_orders(ib: Any, today: str) -> int:
+def cancel_orphan_open_orders(
+    ib: Any, today: str, *, account: Optional[str] = None
+) -> int:
     """Cancel working non-filled orders left from a prior crashed session.
 
     Cancel hygiene (strategy isolation): scope is strictly this engine's own
@@ -572,6 +578,8 @@ def cancel_orphan_open_orders(ib: Any, today: str) -> int:
         contract = getattr(trade, "contract", None)
         order = getattr(trade, "order", None)
         if contract is None or order is None:
+            continue
+        if account and str(getattr(order, "account", "") or "") != account:
             continue
         status = str(getattr(getattr(trade, "orderStatus", None), "status", "") or "")
         if status.upper() in {"FILLED", "CANCELLED", "APICANCELLED", "INACTIVE"}:
@@ -616,6 +624,7 @@ def recover_session_book(
     OpenSpread,
     CandidateRecord,
     ib: Any = None,
+    account: Optional[str] = None,
     live_dir: Path = LIVE_DIR,
     cancel_orphans: bool = True,
     fail_on_unmatched: bool = True,
@@ -640,12 +649,12 @@ def recover_session_book(
     ib_matched = 0
 
     if ib is not None and cancel_orphans:
-        n_cancelled = cancel_orphan_open_orders(ib, today)
+        n_cancelled = cancel_orphan_open_orders(ib, today, account=account)
         if n_cancelled:
             warnings.append(f"cancelled {n_cancelled} orphan open order(s) from prior run")
 
     if ib is not None:
-        ib_nets = fetch_ib_spxw_positions(ib, today)
+        ib_nets = fetch_ib_spxw_positions(ib, today, account=account)
         if manage_only_on_stopped_wings and spreads:
             wing_warns = mark_stopped_wings_from_ib(spreads, ib_nets, today)
             warnings.extend(wing_warns)

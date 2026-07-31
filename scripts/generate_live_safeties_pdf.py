@@ -197,7 +197,7 @@ def build() -> Path:
             ],
             [
                 "Mark integrity",
-                "Missing quotes: halt (never treat as $0). Unavailable 60s with open risk: flatten.",
+                "Missing quotes: halt (never treat as $0). Unavailable 5 minutes with open risk: flatten.",
             ],
             [
                 "Stale quotes",

@@ -23,18 +23,25 @@ class LiveConfig:
 
     # --- Deployment sizing -------------------------------------------------- #
     account_equity: float = 500_000.0
-    contracts_per_tranche: int = 2
+    # Live pilot: one contract per submitted spread.  The per-entry cap also
+    # prevents time-of-day or elevated-VIX sizing from increasing this.
+    contracts_per_tranche: int = 1
     contract_scale: float = 1.0
-    max_contracts_per_tranche: int = 3  # round(2 × 1.25 tod × 1.25 vix) on elevated morning tranche
+    max_contracts_per_tranche: int = 1
 
     # --- Execution mode ----------------------------------------------------- #
-    mode: str = "paper"
-    dry_with_ib: bool = True
-    allow_live: bool = False
+    mode: str = "live"
+    dry_with_ib: bool = False
+    allow_live: bool = True
 
     # --- IB connection ------------------------------------------------------ #
     host: str = "127.0.0.1"
-    port: int = 0
+    # Explicitly use the user-configured IB Gateway API endpoint.  Do not rely
+    # on the paper/live default-port convention for this live session.
+    port: int = 7497
+    # Explicit account binding. This Gateway exposes multiple accounts; every
+    # account guard and submitted order must use this account only.
+    ib_account: str = "U805366"
     client_id: int = 17
     # Legacy fixed sleep when use_adaptive_polling=False.
     poll_seconds: float = 15.0
@@ -137,7 +144,10 @@ class LiveConfig:
     # Mark integrity: halt/flatten when open risk cannot be marked.
     mark_degraded_halt: bool = True
     mark_unavailable_halt_seconds: float = 15.0
-    mark_unavailable_flatten_seconds: float = 60.0
+    # Quote outages halt new entries immediately.  Keep the bounded-risk spread
+    # open long enough for a transient OPRA/streaming gap to recover before a
+    # market flatten is allowed.
+    mark_unavailable_flatten_seconds: float = 300.0
     # Flatten confirmation
     flatten_fill_timeout_seconds: float = 12.0
     flatten_retry_mkt: bool = True

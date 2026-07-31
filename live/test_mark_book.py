@@ -13,6 +13,7 @@ sys.path.insert(0, str(ROOT / "live"))
 
 from mbh_simulator import CandidateRecord, OptionQuote  # noqa: E402
 from ib_executor import OpenSpread, _mark_book  # noqa: E402
+from live_config import LiveConfig  # noqa: E402
 
 
 def _quote(option_type: str, strike: float, bid: float, ask: float) -> OptionQuote:
@@ -63,6 +64,9 @@ def _spread(short: float = 7500, long: float = 7550, contracts: int = 1) -> Open
 
 
 class MarkBookTests(unittest.TestCase):
+    def test_mark_outage_flatten_delay_is_five_minutes(self) -> None:
+        self.assertEqual(LiveConfig().mark_unavailable_flatten_seconds, 300.0)
+
     def test_empty_quotes_unavailable(self) -> None:
         cfg = SimpleNamespace(multiplier=100.0)
         mark = _mark_book([_spread()], [], cfg)  # type: ignore[arg-type]

@@ -715,6 +715,7 @@ def place_or_replace_native_stop_for_short(
     short_opt = _short_option(ib, candidate, today)
     stop_order = StopOrder("BUY", total_qty, stop_px)
     stop_order.tif = "DAY"
+    stop_order.account = live.ib_account
     trade = ib.placeOrder(short_opt, stop_order)
     order_id = trade.order.orderId
     reject = _trade_rejection_reason(trade)
@@ -1024,6 +1025,7 @@ def submit_spread_entry(
     bag, _short_leg_opt = build_combo(ib, candidate, today)
     combo_order = LimitOrder("BUY", contracts, -limit)
     combo_order.tif = "DAY"
+    combo_order.account = live.ib_account
     trade = ib.placeOrder(bag, combo_order)
     spread.combo_order_id = trade.order.orderId
 
@@ -1201,6 +1203,7 @@ def _buy_short_leg_stop(
     limit_px = _stop_limit_price(short_ask, live)
     limit_order = LimitOrder("BUY", spread.contracts, limit_px)
     limit_order.tif = "DAY"
+    limit_order.account = live.ib_account
     trade = ib.placeOrder(short_opt, limit_order)
     state, reason = _wait_for_order(ib, trade, timeout_sec=live.stop_limit_timeout_seconds)
     if state == "filled":
@@ -1210,10 +1213,9 @@ def _buy_short_leg_stop(
         ib.cancelOrder(trade.order)
         ib.sleep(0.25)
     print(f"[{datetime.now().isoformat()}] STOP limit unfilled @ {limit_px:.2f} ({reason}) — MKT fallback")
-    mkt = ib.placeOrder(
-        short_opt,
-        Order(action="BUY", totalQuantity=spread.contracts, orderType="MKT"),
-    )
+    stop_market_order = Order(action="BUY", totalQuantity=spread.contracts, orderType="MKT")
+    stop_market_order.account = live.ib_account
+    mkt = ib.placeOrder(short_opt, stop_market_order)
     mkt_state, _ = _wait_for_order(ib, mkt, timeout_sec=5.0)
     if mkt_state == "filled":
         fill = float(mkt.orderStatus.avgFillPrice or short_ask)
@@ -1270,7 +1272,7 @@ def manage_stops(
         fill_px = sq.ask
         if not dry and HAS_IB and ib is not None:
             net_before = (
-                _short_leg_ib_net(ib, spread.candidate, today)
+                _short_leg_ib_net(ib, spread.candidate, today, live)
                 if live.confirm_stop_against_ib
                 else None
             )
@@ -1283,7 +1285,7 @@ def manage_stops(
                 spread.stop_breach_since = None
                 continue
             if live.confirm_stop_against_ib and net_before is not None:
-                net_after = _short_leg_ib_net(ib, spread.candidate, today)
+                net_after = _short_leg_ib_net(ib, spread.candidate, today, live)
                 # Short nets are negative; covering should raise net by ~contracts.
                 if net_after is None or net_after < net_before + int(spread.contracts):
                     spread.stopped = False
@@ -1391,10 +1393,9 @@ def flatten_all(
             ib, spread.candidate, [spread], today, dry=dry, reason="flatten",
         )
         bag, _short_leg_opt = build_combo(ib, spread.candidate, today)
-        trade = ib.placeOrder(
-            bag,
-            Order(action="SELL", totalQuantity=spread.contracts, orderType="MKT"),
-        )
+        flatten_order = Order(action="SELL", totalQuantity=spread.contracts, orderType="MKT")
+        flatten_order.account = cfg.ib_account
+        trade = ib.placeOrder(bag, flatten_order)
         state, reason = _wait_for_order(ib, trade, timeout_sec=wait_sec)
         if state != "filled" and retry_mkt:
             if state == "pending":
@@ -1403,10 +1404,9 @@ def flatten_all(
                     ib.sleep(0.25)
                 except Exception:
                     pass
-            trade = ib.placeOrder(
-                bag,
-                Order(action="SELL", totalQuantity=spread.contracts, orderType="MKT"),
-            )
+            retry_order = Order(action="SELL", totalQuantity=spread.contracts, orderType="MKT")
+            retry_order.account = cfg.ib_account
+            trade = ib.placeOrder(bag, retry_order)
             state, reason = _wait_for_order(ib, trade, timeout_sec=wait_sec)
 
         if state == "filled":
@@ -1444,7 +1444,7 @@ def flatten_all(
     still_open = [s for s in open_spreads if not s.closed]
     if not dry and HAS_IB and ib is not None:
         try:
-            ib_nets = fetch_ib_spxw_positions(ib, today)
+            ib_nets = fetch_ib_spxw_positions(ib, today, account=cfg.ib_account)
         except Exception:
             ib_nets = {}
         residual_lots = sum(abs(v) for v in ib_nets.values())
@@ -1500,10 +1500,12 @@ def log_event(today: str, event: dict, *, live: Optional[LiveConfig] = None) -> 
         )
 
 
-def _short_leg_ib_net(ib: "IB", candidate: CandidateRecord, today: str) -> Optional[int]:
+def _short_leg_ib_net(
+    ib: "IB", candidate: CandidateRecord, today: str, live: LiveConfig
+) -> Optional[int]:
     """Signed IB net for the short leg (short < 0). None if IB unavailable."""
     try:
-        nets = fetch_ib_spxw_positions(ib, today)
+        nets = fetch_ib_spxw_positions(ib, today, account=live.ib_account)
     except Exception:
         return None
     right = "P" if candidate.short_type == "PUT" else "C"
@@ -1525,7 +1527,7 @@ def run_flatten_audit(
         log_event(today, payload, live=live)
         return payload
     try:
-        nets = fetch_ib_spxw_positions(ib, today)
+        nets = fetch_ib_spxw_positions(ib, today, account=live.ib_account)
     except Exception as exc:
         payload = {
             "event": "flatten_audit",
@@ -1771,7 +1773,7 @@ def _process_tranche(
             }, live=live)
             continue
         if live.use_pre_entry_buying_power and ib is not None and not dry and HAS_IB:
-            acct = fetch_account_snapshot(ib)
+            acct = fetch_account_snapshot(ib, account=live.ib_account)
             need = candidate_margin_per_contract(cand, config) * contracts
             bp = acct.buying_power
             if bp is None or bp < need:
@@ -1887,6 +1889,8 @@ def run(live: LiveConfig = ACTIVE) -> None:
         raise SystemExit(f"invalid mode {live.mode!r}; choose dry|paper|live")
     if live.mode == "live" and not live.allow_live:
         raise SystemExit("live mode requires allow_live=True in LiveConfig (safety interlock).")
+    if live.mode == "live" and not str(live.ib_account or "").strip():
+        raise SystemExit("live mode requires an explicit ib_account in LiveConfig.")
 
     config, sizing_schedule = resolve_strategy_config(live)
     config = apply_live_risk_overlays(config, live)
@@ -2004,7 +2008,7 @@ def run(live: LiveConfig = ACTIVE) -> None:
             if baselines_core is not None:
                 print(f"Signal baselines -> {live.baselines_path}")
             if live.use_account_guards and not dry:
-                acct = fetch_account_snapshot(ib)
+                acct = fetch_account_snapshot(ib, account=live.ib_account)
                 guard = check_startup_account_guard(
                     acct,
                     account_equity=live.account_equity,
@@ -2041,6 +2045,7 @@ def run(live: LiveConfig = ACTIVE) -> None:
             OpenSpread=OpenSpread,
             CandidateRecord=CandidateRecord,
             ib=ib if (ib is not None and not dry) else None,
+            account=live.ib_account,
             fail_on_unmatched=True,
         )
         open_spreads = list(recovered.spreads)
@@ -2282,6 +2287,7 @@ def run(live: LiveConfig = ACTIVE) -> None:
                         OpenSpread=OpenSpread,
                         CandidateRecord=CandidateRecord,
                         ib=ib,
+                        account=live.ib_account,
                         fail_on_unmatched=True,
                         cancel_orphans=False,
                     )
@@ -2486,7 +2492,7 @@ def run(live: LiveConfig = ACTIVE) -> None:
                     >= live.account_guard_poll_seconds
                 ):
                     last_account_guard_at = now
-                    acct = fetch_account_snapshot(ib)
+                    acct = fetch_account_snapshot(ib, account=live.ib_account)
                     loop_guard = check_loop_account_guard(
                         acct,
                         account_equity=live.account_equity,

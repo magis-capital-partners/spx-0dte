@@ -97,8 +97,8 @@ class AccountGuardTests(unittest.TestCase):
                 self.req_summary_calls = 0
                 self.summary_calls = 0
                 self._values = [
-                    SimpleNamespace(tag="NetLiquidation", value="500000"),
-                    SimpleNamespace(tag="BuyingPower", value="100000"),
+                    SimpleNamespace(account="U1", tag="NetLiquidation", value="500000"),
+                    SimpleNamespace(account="U1", tag="BuyingPower", value="100000"),
                 ]
 
             def reqAccountSummary(self):
@@ -117,6 +117,42 @@ class AccountGuardTests(unittest.TestCase):
         self.assertEqual(snap.buying_power, 100_000.0)
         self.assertEqual(ib.req_summary_calls, 0)
         self.assertEqual(ib.summary_calls, 0)
+
+    def test_fetch_selects_explicit_account(self) -> None:
+        from account_guards import fetch_account_snapshot
+        from types import SimpleNamespace
+
+        class FakeIB:
+            def accountValues(self):
+                return [
+                    SimpleNamespace(account="SMALL", tag="NetLiquidation", value="7209.98"),
+                    SimpleNamespace(account="SMALL", tag="BuyingPower", value="28.98"),
+                    SimpleNamespace(account="TARGET", tag="NetLiquidation", value="12786301.88"),
+                    SimpleNamespace(account="TARGET", tag="BuyingPower", value="50984689.90"),
+                ]
+
+            def accountSummary(self):
+                return []
+
+        snap = fetch_account_snapshot(FakeIB(), account="TARGET")
+        self.assertEqual(snap.account, "TARGET")
+        self.assertEqual(snap.net_liquidation, 12_786_301.88)
+        self.assertEqual(snap.buying_power, 50_984_689.90)
+
+    def test_fetch_missing_explicit_account_fails_closed(self) -> None:
+        from account_guards import fetch_account_snapshot
+        from types import SimpleNamespace
+
+        class FakeIB:
+            def accountValues(self):
+                return [SimpleNamespace(account="OTHER", tag="NetLiquidation", value="500000")]
+
+            def accountSummary(self):
+                return []
+
+        snap = fetch_account_snapshot(FakeIB(), account="TARGET")
+        self.assertIsNone(snap.net_liquidation)
+        self.assertIsNone(snap.buying_power)
 
     def test_fetch_falls_back_to_cached_account_summary(self) -> None:
         from account_guards import fetch_account_snapshot

@@ -14,6 +14,7 @@ class AccountSnapshot:
     net_liquidation: Optional[float]
     buying_power: Optional[float]
     source: str = "ib"
+    account: Optional[str] = None
 
 
 @dataclass(frozen=True)
@@ -46,14 +47,19 @@ def snapshot_from_account_values(values: Mapping[str, object]) -> AccountSnapsho
     return AccountSnapshot(net_liquidation=net, buying_power=bp, source="map")
 
 
-def _read_account_tags(rows: Any, tags: dict) -> None:
+def _read_account_tags(rows: Any, tags: dict, *, account: Optional[str] = None) -> None:
     for row in list(rows or []):
+        row_account = str(getattr(row, "account", "") or "")
+        if account and row_account != account:
+            continue
         tag = str(getattr(row, "tag", "") or "")
         if tag in tags and tags[tag] is None:
             tags[tag] = getattr(row, "value", None)
 
 
-def fetch_account_snapshot(ib: Any, *, timeout_sec: float = 3.0) -> AccountSnapshot:
+def fetch_account_snapshot(
+    ib: Any, *, timeout_sec: float = 3.0, account: Optional[str] = None
+) -> AccountSnapshot:
     """Pull NetLiquidation and BuyingPower from a connected IB client.
 
     Prefer ``accountValues`` / cached ``accountSummary()`` — never call
@@ -69,14 +75,14 @@ def fetch_account_snapshot(ib: Any, *, timeout_sec: float = 3.0) -> AccountSnaps
     try:
         values_fn = getattr(ib, "accountValues", None)
         if callable(values_fn):
-            _read_account_tags(values_fn(), tags)
+            _read_account_tags(values_fn(), tags, account=account)
 
         if tags["NetLiquidation"] is None or (
             tags["BuyingPower"] is None and tags["AvailableFunds"] is None
         ):
             summary_fn = getattr(ib, "accountSummary", None)
             if callable(summary_fn):
-                _read_account_tags(summary_fn(), tags)
+                _read_account_tags(summary_fn(), tags, account=account)
     except Exception:
         pass
     snap = snapshot_from_account_values(tags)
@@ -84,6 +90,7 @@ def fetch_account_snapshot(ib: Any, *, timeout_sec: float = 3.0) -> AccountSnaps
         net_liquidation=snap.net_liquidation,
         buying_power=snap.buying_power,
         source="ib",
+        account=account,
     )
 
 
