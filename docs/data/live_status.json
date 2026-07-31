@@ -1,14 +1,14 @@
 {
   "schema": 1,
   "source": "cloud",
-  "generated_at": "2026-07-31T11:19:44.020111",
+  "generated_at": "2026-07-31T11:29:43.185462",
   "date": "2026-07-31",
   "pid_alive": true,
-  "heartbeat_ts": "2026-07-31T11:19:41.945433",
+  "heartbeat_ts": "2026-07-31T11:29:39.067763",
   "entries_halted": false,
   "flattened": false,
   "open_count": 5,
-  "marked_pnl": 950.0,
+  "marked_pnl": 500.0,
   "last_event": {
     "ts": "2026-07-31T11:18:22.150024",
     "event": "entry"
