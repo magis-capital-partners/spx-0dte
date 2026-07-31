@@ -1,16 +1,16 @@
 {
   "schema": 1,
   "source": "cloud",
-  "generated_at": "2026-07-31T09:29:43.083003",
+  "generated_at": "2026-07-31T09:34:44.305085",
   "date": "2026-07-31",
-  "pid_alive": false,
-  "heartbeat_ts": null,
+  "pid_alive": true,
+  "heartbeat_ts": "2026-07-31T09:34:30.149725",
   "entries_halted": false,
   "flattened": false,
   "open_count": 0,
   "marked_pnl": 0.0,
   "last_event": {
-    "ts": "2026-07-31T09:25:02.582447",
+    "ts": "2026-07-31T09:31:38.085107",
     "event": "account_guard_startup"
   },
   "note": "Sanitized status only. Full console is local to the trading host."
