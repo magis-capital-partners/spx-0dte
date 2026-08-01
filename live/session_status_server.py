@@ -30,6 +30,7 @@ STATUS_ROLLOVER_EXIT_CODE = 75
 
 sys.path.insert(0, str(ROOT / "live"))
 from session_recovery import _pid_alive, load_fills_events  # noqa: E402
+from execution_type import execution_type  # noqa: E402
 
 
 def _today() -> str:
@@ -122,6 +123,18 @@ def _recent_events(today: str, limit: int = 12) -> List[dict]:
     return out
 
 
+def _execution_type_for_day(day: str) -> str:
+    """Read the persisted session label, with a mode-derived legacy fallback."""
+    starts = [
+        event for event in load_fills_events(day)
+        if event.get("event") == "session_start"
+    ]
+    if not starts:
+        return "unknown"
+    latest = starts[-1]
+    return execution_type(latest.get("mode"), latest.get("execution_type"))
+
+
 def _risk_history(limit: int = 30) -> List[dict]:
     """Latest compact return-on-margin point from each recorded session."""
     rows: List[dict] = []
@@ -137,6 +150,9 @@ def _risk_history(limit: int = 30) -> List[dict]:
             continue
         rows.append({
             "date": day_dir.name,
+            "execution_type": execution_type(
+                None, raw.get("execution_type") or _execution_type_for_day(day_dir.name),
+            ),
             "ts": raw.get("ts"),
             "marked_pnl": raw.get("marked_pnl"),
             "defined_risk_margin": raw.get("defined_risk_margin"),
@@ -155,6 +171,9 @@ def build_status(*, today: Optional[str] = None) -> Dict[str, Any]:
     lock = _read_json(day_dir / "executor.lock") or {}
     pid = int(hb.get("pid") or lock.get("pid") or 0)
     alive = _pid_alive(pid) if pid else False
+    session_execution_type = execution_type(
+        None, hb.get("execution_type") or _execution_type_for_day(day),
+    )
     return {
         "schema": 2,
         "source": "local",
@@ -167,6 +186,7 @@ def build_status(*, today: Optional[str] = None) -> Dict[str, Any]:
         "flattened": bool(hb.get("flattened", False)),
         "open_count": int(hb.get("open_count") or 0),
         "marked_pnl": float(hb.get("marked_pnl") or 0.0),
+        "execution_type": session_execution_type,
         "risk": hb.get("risk") or {},
         "risk_history": _risk_history(),
         "recent_events": _recent_events(day),
@@ -189,6 +209,7 @@ def build_sanitized_cloud_status(*, today: Optional[str] = None) -> Dict[str, An
         "flattened": full["flattened"],
         "open_count": full["open_count"],
         "marked_pnl": round(full["marked_pnl"], 2),
+        "execution_type": full.get("execution_type", "unknown"),
         "risk": {
             key: value for key, value in (full.get("risk") or {}).items()
             if key != "positions"

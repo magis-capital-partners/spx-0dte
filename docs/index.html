@@ -86,6 +86,7 @@ const fmt$ = (n) => (n<0?"-$":"$") + Math.abs(n).toLocaleString(undefined,{maxim
 const fmtPct = (n,d=2) => (n==null||isNaN(n)?"–":n.toFixed(d)+"%");
 const cls = (n) => n>0?"pos":n<0?"neg":"";
 const MISSING = "\u2014";
+const executionLabel = (value) => ({paper:"Paper trading",dry_run:"Dry run",production_live:"Production live"}[value] || "Unknown");
 
 const LOCAL_STATUS = "http://127.0.0.1:8765";
 
@@ -168,6 +169,7 @@ function SessionNow() {
           <div className="cards" style={{marginBottom:12}}>
             <div className="card"><div className="k">Date</div><div className="v" style={{fontSize:16}}>{src.date || "–"}</div></div>
             <div className="card"><div className="k">Executor</div><div className="v" style={{fontSize:16}}>{alive ? "alive" : "down"}</div></div>
+            <div className="card"><div className="k">Execution</div><div className="v" style={{fontSize:16}}>{executionLabel(src.execution_type)}</div></div>
             <div className="card"><div className="k">Open</div><div className="v">{src.open_count ?? "–"}</div></div>
             <div className="card"><div className="k">Marked P&amp;L</div><div className={"v " + cls(src.marked_pnl)}>{fmt$(src.marked_pnl || 0)}</div></div>
             <div className="card"><div className="k">Max loss (no stop)</div><div className="v neg">{risk.max_loss_no_stop==null?MISSING:fmt$(risk.max_loss_no_stop)}</div></div>
@@ -185,14 +187,15 @@ function SessionNow() {
           {risk.defined_risk_margin != null && <p className="sub" style={{margin:"0 0 10px"}}>
             *Stop-loss estimate assumes the short cover fills at its trigger and the retained long wing expires worthless; it is not a guaranteed loss cap. Mark quality: <code>{risk.mark_quality||MISSING}</code>.
           </p>}
-          {riskHistory.length > 1 && <div style={{marginBottom:12}}>
+          {riskHistory.length > 0 && <div style={{marginBottom:12}}>
             <div className="muted" style={{marginBottom:6, fontSize:11, textTransform:"uppercase"}}>Daily marked return on margin</div>
-            <table><thead><tr><th>Date</th><th>Marked P&amp;L</th><th>Margin</th><th>ROM</th><th>Max loss</th></tr></thead>
+            <table><thead><tr><th>Date</th><th>Execution</th><th>Marked P&amp;L</th><th>Margin</th><th>ROM</th><th>Max loss</th></tr></thead>
               <tbody>{riskHistory.slice(-10).reverse().map((row,i)=><tr key={i}>
-                <td>{row.date}</td><td className={cls(row.marked_pnl)}>{fmt$(row.marked_pnl)}</td><td>{fmt$(row.defined_risk_margin)}</td>
+                <td>{row.date}</td><td><span className="pill">{executionLabel(row.execution_type)}</span></td><td className={cls(row.marked_pnl)}>{fmt$(row.marked_pnl)}</td><td>{fmt$(row.defined_risk_margin)}</td>
                 <td className={cls(row.marked_return_on_margin_pct)}>{fmtPct(row.marked_return_on_margin_pct)}</td><td className="neg">{fmt$(row.max_loss_no_stop)}</td>
               </tr>)}</tbody>
             </table>
+            <p className="sub" style={{margin:"8px 0 0"}}>Historical values are the final available mark and risk at that session's last snapshot; 0DTE positions settle after the session.</p>
           </div>}
           {usingLocal && local?.recent_events?.length ? (
             <p className="sub" style={{margin:"0 0 10px"}}>
@@ -574,6 +577,8 @@ function Daily({data}) {
   const liveEnabled = data.live_enabled !== false && Object.keys(data.live?.days || {}).length > 0;
   const recon = liveDay?.reconcile;
   const diffPaper = recon?.diff_paper_scale;
+  const executionHistory = data.live?.history || [];
+  const executionTotals = data.live?.totals || {};
   return (
     <div>
       {multi && (
@@ -587,7 +592,7 @@ function Daily({data}) {
       <div className="row">
         <label className="muted">Trading day</label>
         <select value={day||""} onChange={e=>setSel(e.target.value)}>
-          {dayOptions.map(d=><option key={d} value={d}>{d}{liveDays.includes(d)?" · live":""}</option>)}
+          {dayOptions.map(d=><option key={d} value={d}>{d}{liveDays.includes(d)?` · ${executionLabel(data.live.days[d]?.execution_type)}`:""}</option>)}
         </select>
       </div>
       {dayRow && <div className="cards">
@@ -623,9 +628,10 @@ function Daily({data}) {
       </div>
       {liveEnabled ? (
         <div className="panel">
-          <h2>Live / paper fills — {day}{liveDay?.mode ? ` (${liveDay.mode})` : ""}</h2>
+          <h2>Recorded execution fills — {day}{liveDay ? <> <span className="pill">{liveDay.execution_label || executionLabel(liveDay.execution_type)}</span></> : ""}</h2>
           {liveDay ? (
             <>
+              <p className="sub" style={{marginTop:0}}>Classification: <code>{liveDay.execution_type}</code>{liveDay.execution_type_source==="backfilled_from_mode" ? " (backfilled from the session's recorded mode)" : " (recorded at session start)"}.</p>
               <div className="cards" style={{marginBottom:12}}>
                 <div className="card"><div className="k">Entries</div><div className="v">{liveDay.entries?.length||0}</div></div>
                 <div className="card"><div className="k">Stops</div><div className="v">{liveDay.stops||0}</div></div>
@@ -672,7 +678,7 @@ function Daily({data}) {
               {!(liveDay.entries||[]).length && <p className="sub">Session logged but no fills.</p>}
             </>
           ) : (
-            <p className="sub" style={{margin:0}}>No live/paper session folder for this day under data/live/.</p>
+            <p className="sub" style={{margin:0}}>No recorded execution session folder for this day under data/live/.</p>
           )}
         </div>
       ) : (
@@ -684,6 +690,20 @@ function Daily({data}) {
           </p>
         </div>
       )}
+      {executionHistory.length > 0 && <div className="panel">
+        <h2>Recorded execution P&amp;L ledger</h2>
+        <div className="cards" style={{marginBottom:12}}>
+          {["production_live","paper","dry_run"].filter(k=>executionTotals[k]).map(k=><div className="card" key={k}>
+            <div className="k">{executionLabel(k)}</div><div className={"v "+cls(executionTotals[k].marked_pnl)}>{fmt$(executionTotals[k].marked_pnl)}</div>
+            <div className="sub">{executionTotals[k].sessions} settled session{executionTotals[k].sessions===1?"":"s"}</div>
+          </div>)}
+        </div>
+        <table><thead><tr><th>Date</th><th>Execution</th><th>Entries</th><th>Stops</th><th>Marked P&amp;L</th></tr></thead>
+          <tbody>{executionHistory.slice().reverse().map((row,i)=><tr key={i}>
+            <td>{row.date}</td><td><span className="pill">{row.execution_label || executionLabel(row.execution_type)}</span></td><td>{row.entries}</td><td>{row.stops}</td><td className={cls(row.marked_pnl)}>{fmt$(row.marked_pnl)}</td>
+          </tr>)}</tbody>
+        </table>
+      </div>}
     </div>
   );
 }

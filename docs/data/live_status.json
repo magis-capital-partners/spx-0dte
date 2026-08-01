@@ -1,17 +1,27 @@
 {
-  "schema": 1,
+  "schema": 2,
   "source": "cloud",
-  "generated_at": "2026-07-31T16:00:17.795537",
-  "date": "2026-07-31",
+  "generated_at": "2026-08-01T16:29:11.886074",
+  "date": "2026-08-01",
   "pid_alive": false,
-  "heartbeat_ts": "2026-07-31T15:59:58.908487",
+  "heartbeat_ts": null,
   "entries_halted": false,
   "flattened": false,
-  "open_count": 10,
-  "marked_pnl": -1200.0,
-  "last_event": {
-    "ts": "2026-07-31T13:26:45.490454",
-    "event": "stop"
-  },
+  "open_count": 0,
+  "marked_pnl": 0.0,
+  "execution_type": "unknown",
+  "risk": {},
+  "risk_history": [
+    {
+      "date": "2026-07-31",
+      "execution_type": "production_live",
+      "ts": "2026-07-31T16:00:00.436159",
+      "marked_pnl": -1200.0,
+      "defined_risk_margin": 98000.0,
+      "marked_return_on_margin_pct": -1.22,
+      "max_loss_no_stop": 94860.0
+    }
+  ],
+  "last_event": null,
   "note": "Sanitized status only. Full console is local to the trading host."
 }

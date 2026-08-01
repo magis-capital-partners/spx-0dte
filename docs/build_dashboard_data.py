@@ -21,6 +21,9 @@ from typing import Dict, List, Optional, Tuple
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "simulator"))
+sys.path.insert(0, str(ROOT / "live"))
+
+from execution_type import execution_type, execution_type_label
 
 MONTHS = ["January", "February", "March", "April", "May", "June",
           "July", "August", "September", "October", "November", "December"]
@@ -599,6 +602,7 @@ def build_live(live_dir: Path, account_equity: float) -> dict:
     """Embed paper/live session fills for Daily drill-down comparison."""
     del account_equity  # reserved for future live return_pct scaling
     days: Dict[str, dict] = {}
+    history: List[dict] = []
     if not live_dir.exists():
         return {"days": {}}
     for day_path in sorted(live_dir.iterdir()):
@@ -654,6 +658,12 @@ def build_live(live_dir: Path, account_equity: float) -> dict:
                 gross = float(session_ends[-1]["gross_credit_sold"])
             if session_ends[-1].get("marked_pnl") is not None:
                 marked = float(session_ends[-1]["marked_pnl"])
+        starts = [event for event in events if event.get("event") == "session_start"]
+        latest_start = starts[-1] if starts else {}
+        execution = execution_type(
+            latest_start.get("mode"), latest_start.get("execution_type"),
+        )
+        execution_source = "recorded" if latest_start.get("execution_type") else "backfilled_from_mode"
 
         reconcile = None
         recon_path = day_path / "reconcile.json"
@@ -677,7 +687,10 @@ def build_live(live_dir: Path, account_equity: float) -> dict:
 
         days[d] = {
             "date": d,
-            "mode": next((e.get("mode") for e in events if e.get("event") == "session_start"), None),
+            "mode": latest_start.get("mode"),
+            "execution_type": execution,
+            "execution_label": execution_type_label(execution),
+            "execution_type_source": execution_source,
             "entries": entry_rows,
             "stops": len(stops),
             "order_rejected": len(rejected),
@@ -687,7 +700,25 @@ def build_live(live_dir: Path, account_equity: float) -> dict:
             "marked_pnl": marked,
             "reconcile": reconcile,
         }
-    return {"days": days}
+        if marked is not None:
+            history.append({
+                "date": d,
+                "execution_type": execution,
+                "execution_label": execution_type_label(execution),
+                "marked_pnl": marked,
+                "entries": len(entry_rows),
+                "stops": len(stops),
+            })
+    totals: Dict[str, dict] = {}
+    for row in history:
+        bucket = totals.setdefault(row["execution_type"], {
+            "execution_type": row["execution_type"],
+            "execution_label": row["execution_label"], "sessions": 0,
+            "marked_pnl": 0.0,
+        })
+        bucket["sessions"] += 1
+        bucket["marked_pnl"] = round(bucket["marked_pnl"] + row["marked_pnl"], 2)
+    return {"days": days, "history": history, "totals": totals}
 
 
 def _compact_market_factors(report: dict, preset_id: str, equity: float) -> dict:

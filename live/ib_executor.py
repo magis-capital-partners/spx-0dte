@@ -140,6 +140,7 @@ from ib_connection import (  # noqa: E402
 from stale_quotes import StaleQuoteTracker, evaluate_stale_quotes  # noqa: E402
 from slack_notify import maybe_notify_safety_event  # noqa: E402
 from heartbeat import append_risk_snapshot, write_heartbeat  # noqa: E402
+from execution_type import execution_type  # noqa: E402
 from risk_ledger import build_risk_snapshot  # noqa: E402
 from open_risk_caps import open_risk_block_reason  # noqa: E402
 from live_entry_risk import (  # noqa: E402
@@ -2231,7 +2232,9 @@ def run(live: LiveConfig = ACTIVE) -> None:
           f"work={live.entry_work_seconds:.0f}s ladder={live.entry_ladder_step:.2f} "
           f"{format_vix_session_banner(vix_open, vix_source=vix_source, skip_reason='', sizing_multiplier=vix_sizing_mult, live=live)}")
     write_session_snapshot(today, live, config, live.sizing_scheme)
-    log_event(today, {"event": "session_start", "mode": live.mode, "profile": live.profile,
+    session_execution_type = execution_type(live.mode)
+    log_event(today, {"event": "session_start", "mode": live.mode,
+                      "execution_type": session_execution_type, "profile": live.profile,
                       "sizing_scheme": live.sizing_scheme, "baseline_contracts": config.baseline_contracts,
                       "eligible": True, "vix_open": vix_open, "vix_source": vix_source,
                       "vix_sizing_multiplier": vix_sizing_mult})
@@ -2749,11 +2752,13 @@ def run(live: LiveConfig = ACTIVE) -> None:
                         marked_pnl=last_marked_pnl,
                         entries_halted=entries_halted,
                         flattened=flattened,
-                        extra={"risk": risk},
+                        extra={"risk": risk, "execution_type": session_execution_type},
                     )
                     if (now - last_risk_snapshot_at).total_seconds() >= live.risk_snapshot_seconds:
                         last_risk_snapshot_at = now
-                        append_risk_snapshot(today, risk)
+                        append_risk_snapshot(
+                            today, {**risk, "execution_type": session_execution_type},
+                        )
 
                 # --- Phase B: periodic NetLiq overlay -----------------------------
                 if (
