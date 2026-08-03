@@ -1,24 +1,24 @@
 {
   "schema": 2,
   "source": "cloud",
-  "generated_at": "2026-08-03T11:09:45.271744",
+  "generated_at": "2026-08-03T11:19:43.472403",
   "date": "2026-08-03",
   "pid_alive": true,
-  "heartbeat_ts": "2026-08-03T11:09:39.598465",
+  "heartbeat_ts": "2026-08-03T11:19:38.693221",
   "entries_halted": false,
   "flattened": false,
-  "open_count": 4,
-  "marked_pnl": 150.0,
+  "open_count": 5,
+  "marked_pnl": -320.0,
   "execution_type": "production_live",
   "risk": {
-    "max_loss_no_stop": 80890.0,
-    "planned_stop_loss": 4510.0,
-    "defined_risk_margin": 83000.0,
-    "marked_pnl": 150.0,
-    "marked_return_on_margin": 0.001807,
-    "marked_return_on_margin_pct": 0.18,
-    "open_count": 4,
-    "marked_count": 4,
+    "max_loss_no_stop": 95540.0,
+    "planned_stop_loss": 5280.0,
+    "defined_risk_margin": 98000.0,
+    "marked_pnl": -310.0,
+    "marked_return_on_margin": -0.003163,
+    "marked_return_on_margin_pct": -0.32,
+    "open_count": 5,
+    "marked_count": 5,
     "mark_quality": "ok"
   },
   "risk_history": [
@@ -34,15 +34,15 @@
     {
       "date": "2026-08-03",
       "execution_type": "production_live",
-      "ts": "2026-08-03T11:08:45.414664",
-      "marked_pnl": 80.0,
-      "defined_risk_margin": 83000.0,
-      "marked_return_on_margin_pct": 0.1,
-      "max_loss_no_stop": 80890.0
+      "ts": "2026-08-03T11:18:50.359297",
+      "marked_pnl": -250.0,
+      "defined_risk_margin": 98000.0,
+      "marked_return_on_margin_pct": -0.26,
+      "max_loss_no_stop": 95540.0
     }
   ],
   "last_event": {
-    "ts": "2026-08-03T11:02:25.372020",
+    "ts": "2026-08-03T11:17:13.926676",
     "event": "entry"
   },
   "note": "Sanitized status only. Full console is local to the trading host."
