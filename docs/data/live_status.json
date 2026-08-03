@@ -1,22 +1,22 @@
 {
   "schema": 2,
   "source": "cloud",
-  "generated_at": "2026-08-03T15:34:42.985946",
+  "generated_at": "2026-08-03T15:39:43.125584",
   "date": "2026-08-03",
   "pid_alive": true,
-  "heartbeat_ts": "2026-08-03T15:34:37.651991",
+  "heartbeat_ts": "2026-08-03T15:39:41.243248",
   "entries_halted": false,
   "flattened": false,
   "open_count": 7,
-  "marked_pnl": -5550.0,
+  "marked_pnl": -5560.0,
   "execution_type": "production_live",
   "risk": {
     "max_loss_no_stop": 37290.0,
     "planned_stop_loss": 1570.0,
     "defined_risk_margin": 38000.0,
-    "marked_pnl": -5500.0,
-    "marked_return_on_margin": -0.144737,
-    "marked_return_on_margin_pct": -14.47,
+    "marked_pnl": -5510.0,
+    "marked_return_on_margin": -0.145,
+    "marked_return_on_margin_pct": -14.5,
     "open_count": 7,
     "marked_count": 7,
     "mark_quality": "ok"
@@ -34,10 +34,10 @@
     {
       "date": "2026-08-03",
       "execution_type": "production_live",
-      "ts": "2026-08-03T15:34:25.531770",
-      "marked_pnl": -5500.0,
+      "ts": "2026-08-03T15:39:29.095089",
+      "marked_pnl": -5510.0,
       "defined_risk_margin": 38000.0,
-      "marked_return_on_margin_pct": -14.47,
+      "marked_return_on_margin_pct": -14.5,
       "max_loss_no_stop": 37290.0
     }
   ],
