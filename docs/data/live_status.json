@@ -1,16 +1,26 @@
 {
   "schema": 2,
   "source": "cloud",
-  "generated_at": "2026-08-03T09:29:43.257036",
+  "generated_at": "2026-08-03T09:34:43.559342",
   "date": "2026-08-03",
   "pid_alive": true,
-  "heartbeat_ts": null,
+  "heartbeat_ts": "2026-08-03T09:34:30.478699",
   "entries_halted": false,
   "flattened": false,
   "open_count": 0,
   "marked_pnl": 0.0,
   "execution_type": "production_live",
-  "risk": {},
+  "risk": {
+    "max_loss_no_stop": 0.0,
+    "planned_stop_loss": 0.0,
+    "defined_risk_margin": 0.0,
+    "marked_pnl": 0.0,
+    "marked_return_on_margin": 0.0,
+    "marked_return_on_margin_pct": 0.0,
+    "open_count": 0,
+    "marked_count": 0,
+    "mark_quality": "ok"
+  },
   "risk_history": [
     {
       "date": "2026-07-31",
@@ -20,10 +30,19 @@
       "defined_risk_margin": 98000.0,
       "marked_return_on_margin_pct": -1.22,
       "max_loss_no_stop": 94860.0
+    },
+    {
+      "date": "2026-08-03",
+      "execution_type": "production_live",
+      "ts": "2026-08-03T09:34:30.478699",
+      "marked_pnl": 0.0,
+      "defined_risk_margin": 0.0,
+      "marked_return_on_margin_pct": 0.0,
+      "max_loss_no_stop": 0.0
     }
   ],
   "last_event": {
-    "ts": "2026-08-03T09:29:32.380064",
+    "ts": "2026-08-03T09:30:38.420983",
     "event": "account_guard_startup"
   },
   "note": "Sanitized status only. Full console is local to the trading host."
