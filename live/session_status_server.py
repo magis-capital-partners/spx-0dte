@@ -16,7 +16,7 @@ import json
 import sys
 import threading
 import time
-from datetime import date, datetime
+from datetime import date, datetime, time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -337,6 +337,34 @@ def _status_rollover_loop(
         return
 
 
+def _status_close_loop(
+    stop: threading.Event,
+    shutdown,
+    *,
+    stop_at: str = "16:01",
+    poll_seconds: float = 30.0,
+    now_fn=None,
+) -> None:
+    """Stop the local status service after the regular-session monitor cutoff."""
+    if str(stop_at).strip().lower() == "off":
+        return
+    try:
+        hour, minute = (int(part) for part in str(stop_at).split(":", 1))
+        cutoff = time(hour, minute)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("stop_at must be HH:MM or 'off'") from exc
+    while not stop.is_set():
+        now = (now_fn or datetime.now)()
+        if now.time() >= cutoff:
+            print(
+                f"[{now.isoformat()}] session status stopping at local cutoff {stop_at}",
+                flush=True,
+            )
+            shutdown()
+            return
+        stop.wait(poll_seconds)
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--host", default="127.0.0.1")
@@ -352,6 +380,11 @@ def main() -> int:
         default=60.0,
         help="While serving, rewrite cloud status every N seconds (0=off)",
     )
+    parser.add_argument(
+        "--stop-at",
+        default="16:01",
+        help="Local monitor cutoff HH:MM (default: 16:01; use 'off' for drills)",
+    )
     args = parser.parse_args()
 
     if args.write_status:
@@ -361,6 +394,7 @@ def main() -> int:
 
     stop = threading.Event()
     rollover_requested = threading.Event()
+    close_requested = threading.Event()
     writer: Optional[threading.Thread] = None
     if args.write_interval and args.write_interval > 0:
         write_cloud_status()
@@ -384,6 +418,18 @@ def main() -> int:
         daemon=True,
     )
     rollover.start()
+
+    def _request_close() -> None:
+        close_requested.set()
+        httpd.shutdown()
+
+    close_loop = threading.Thread(
+        target=_status_close_loop,
+        args=(stop, _request_close),
+        kwargs={"stop_at": args.stop_at},
+        daemon=True,
+    )
+    close_loop.start()
     print(
         f"[{datetime.now().isoformat()}] session status on "
         f"http://{args.host}:{args.port}/status (logs=/logs)",
