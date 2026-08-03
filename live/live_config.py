@@ -36,9 +36,9 @@ class LiveConfig:
 
     # --- IB connection ------------------------------------------------------ #
     host: str = "127.0.0.1"
-    # Explicitly use the user-configured IB Gateway API endpoint.  Do not rely
-    # on the paper/live default-port convention for this live session.
-    port: int = 7497
+    # Explicitly use the user-configured TWS live API endpoint. Do not rely on
+    # the paper/live default-port convention for this production session.
+    port: int = 7496
     # Explicit account binding. This Gateway exposes multiple accounts; every
     # account guard and submitted order must use this account only.
     ib_account: str = "U805366"
