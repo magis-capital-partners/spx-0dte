@@ -43,6 +43,14 @@ class LiveConfig:
     # account guard and submitted order must use this account only.
     ib_account: str = "U805366"
     client_id: int = 17
+    # Keep normal live logs compact. Structured fills/errors/tranches already
+    # provide the execution audit trail; ib_insync DEBUG additionally contains
+    # every streamed wire message and can grow to gigabytes in one session.
+    # Set ib_wire_debug_capture=True only for a short diagnostic session.
+    ib_log_level: str = "INFO"
+    ib_wire_debug_capture: bool = False
+    ib_log_max_bytes: int = 10 * 1024 * 1024
+    ib_log_backup_count: int = 3
     # Legacy fixed sleep when use_adaptive_polling=False.
     poll_seconds: float = 15.0
     # 1=live OPRA (real-time). 3=delayed (15-min) — only if you lack index/OPRA subs.

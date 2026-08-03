@@ -28,6 +28,7 @@ import time as _time
 import uuid
 from dataclasses import asdict, dataclass
 from datetime import date, datetime, timedelta
+from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from typing import Dict, List, Optional, Protocol, Sequence, Tuple
 
@@ -224,29 +225,49 @@ class OpenSpread:
 _QUIET_IB_ERROR_CODES = frozenset({10090, 10167, 10197, 202, 2104, 2106, 2158})
 
 
-def setup_ib_logging(today: str) -> Path:
-    """Send ib_insync library logs to data/live/<date>/ib.log, not the console.
+def setup_ib_logging(today: str, live: LiveConfig) -> Path:
+    """Write bounded IB diagnostics without recording every streaming tick.
 
-    IB warning 10090 is logged at INFO by ib_insync's wrapper; routing the
-    ``ib_insync`` logger to a file keeps CMD clean while preserving full detail.
+    Fills, order status, and IB errors have dedicated structured logs. Normal
+    operation retains INFO-level library diagnostics in a rotated ``ib.log``;
+    full DEBUG wire capture is an explicit, still-bounded troubleshooting mode.
     """
     day_dir = LIVE_DIR / today
     day_dir.mkdir(parents=True, exist_ok=True)
     ib_log = day_dir / "ib.log"
 
     ib_logger = logging.getLogger("ib_insync")
+    for existing_handler in ib_logger.handlers:
+        existing_handler.close()
     ib_logger.handlers.clear()
     ib_logger.propagate = False
-    ib_logger.setLevel(logging.DEBUG)
+    configured_level = getattr(logging, live.ib_log_level.upper(), logging.INFO)
+    level = logging.DEBUG if live.ib_wire_debug_capture else configured_level
+    ib_logger.setLevel(level)
 
-    handler = logging.FileHandler(ib_log, encoding="utf-8")
+    handler = RotatingFileHandler(
+        ib_log,
+        maxBytes=live.ib_log_max_bytes,
+        backupCount=live.ib_log_backup_count,
+        encoding="utf-8",
+    )
     handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
     ib_logger.addHandler(handler)
+    ib_logger.info(
+        "IB logging configured level=%s wire_debug=%s max_bytes=%d backups=%d",
+        logging.getLevelName(level),
+        live.ib_wire_debug_capture,
+        live.ib_log_max_bytes,
+        live.ib_log_backup_count,
+    )
 
     # Belt-and-suspenders: ib_insync also hooks the root console at INFO by default.
     if HAS_IB:
         from ib_insync import util
         util.logToConsole(logging.ERROR)
+        # ``logToConsole`` also changes ib_insync's level; restore the session
+        # file policy after suppressing the library's console chatter.
+        ib_logger.setLevel(level)
 
     return ib_log
 
@@ -2265,7 +2286,7 @@ def run(live: LiveConfig = ACTIVE) -> None:
             if needs_signals and baselines_core is None:
                 raise SystemExit("gated profile requires baselines — run scripts/refresh_live_baselines.py")
             ib = IB()
-            ib_log = setup_ib_logging(today)
+            ib_log = setup_ib_logging(today, live)
             port = live.port or (7497 if live.mode == "paper" else 7496)
             ib.connect(live.host, port, clientId=live.client_id)
             register_ib_error_handler(ib, today)
