@@ -815,9 +815,8 @@ def main() -> None:
     args = parser.parse_args()
 
     default_runs = [
-        "p3_poststop_cooldown_120=data/dashboard_runs/p3_poststop_cooldown_120:Production — put 150 + FOMC 13:30 + IC10 Δ0.16 (VIX≥15)",
+        "p3_poststop_cooldown_120=data/dashboard_runs/p3_poststop_cooldown_120:Production — OPEX 2× + month-end 0.5× + FOMC 13:30 + IC10 Δ0.16 (VIX≥15)",
         "p3_poststop_compounding_f1=data/dashboard_runs/p3_poststop_compounding_f1:Compounding f=1 — size tracks equity",
-        "p3_trend_bc_085=data/dashboard_runs/p3_trend_bc_085:Trend BC 0.85 gate (Wave 2 risk-shape)",
     ]
     specs = args.run or default_runs
 
@@ -854,7 +853,7 @@ def main() -> None:
                     "Production stack: put wing 150 / call 75, skew 0.65, flatten −3.25%, FOMC 13:30 cutoff, "
                     "skip session VIX>35, 1.25× upscale VIX 25–35, plus short IC overlay "
                     "(10 contracts @ $13M/31-lot baseline, ~0.16Δ, 50pt wings, VIX≥15, once/day). "
-                    "VIX put-wing widen disabled."
+                    "VIX put-wing widen disabled. Calendar sizing: 2x on monthly OPEX; 0.5x on the last observed month-end session."
                 ),
                 "gates": (
                     "trend 1.0 · skew 0.65 · put wing 150 · flatten −3.25% · FOMC 13:30 · "
