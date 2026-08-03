@@ -23,11 +23,11 @@ class LiveConfig:
 
     # --- Deployment sizing -------------------------------------------------- #
     account_equity: float = 500_000.0
-    # Live pilot: one contract per submitted spread.  The per-entry cap also
+    # Live deployment: two contracts per submitted spread. The per-entry cap
     # prevents time-of-day or elevated-VIX sizing from increasing this.
-    contracts_per_tranche: int = 1
+    contracts_per_tranche: int = 2
     contract_scale: float = 1.0
-    max_contracts_per_tranche: int = 1
+    max_contracts_per_tranche: int = 2
 
     # --- Execution mode ----------------------------------------------------- #
     mode: str = "live"
