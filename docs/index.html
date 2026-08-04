@@ -154,7 +154,7 @@ function SessionNow() {
         <span className={"dot " + dot} />
         Session now
         <span className="pill" style={{marginLeft:10}}>
-          {usingLocal ? "local live" : cloud ? "cloud status" : "offline"}
+          {usingLocal ? "local live" : cloud ? "cloud (sanitized)" : "offline"}
         </span>
       </h2>
       {!src && (
@@ -162,6 +162,14 @@ function SessionNow() {
           No live status yet. On the trading PC start <code>Magis SPX 0DTE Status API</code>
           {" "}and <code>Magis SPX 0DTE Status Publish</code>, or run
           {" "}<code>.\scripts\run_session_status_server.ps1</code>.
+        </p>
+      )}
+      {src && !usingLocal && cloud && (
+        <p className="sub" style={{margin:"0 0 10px"}}>
+          Viewing published cloud metrics (refreshed about every 2 minutes from the trading PC).
+          {" "}Status age: <code>{ageLabel(src.generated_at || src.heartbeat_ts)}</code>.
+          {" "}Full executor stdout is only on the trading PC at <code>http://127.0.0.1:5500/</code>.
+          {localErr && isHttpsPage ? <> Local API unreachable from this browser ({localErr}).</> : null}
         </p>
       )}
       {src && (
@@ -216,10 +224,10 @@ function SessionNow() {
             </div>
           ) : (
             <p className="muted" style={{margin:"8px 0 0"}}>
+              Executor stdout is not published to GitHub Pages (sanitized metrics only).
               {isHttpsPage
-                ? <>Full console needs the trading PC. If Chrome asks to allow local network access, click Allow — or open <code>http://127.0.0.1:5500/</code> via <code>.\scripts\serve_dashboard_local.ps1</code>.</>
-                : <>Full command-prompt stream needs the Status API on this PC (<code>http://127.0.0.1:8765</code>).</>}
-              {localErr && isHttpsPage ? <> Browser blocked local API ({localErr}).</> : null}
+                ? <> On the trading PC, Allow local network access if Chrome prompts, or open <code>http://127.0.0.1:5500/</code> via <code>.\scripts\serve_dashboard_local.ps1</code>.</>
+                : <> Start the Status API on this PC (<code>http://127.0.0.1:8765</code>) for the live console stream.</>}
             </p>
           )}
         </>

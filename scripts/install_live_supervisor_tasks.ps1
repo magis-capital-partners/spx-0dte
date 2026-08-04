@@ -43,10 +43,10 @@ $tasks = @(
     @{
         Name = "Magis SPX 0DTE Status Publish"
         Script = "publish_live_status.ps1"
-        ExtraArgs = @("-Deploy", "-MinMinutes", "5")
-        Description = "Push sanitized live_status.json to GitHub Pages (rate-limited)."
+        ExtraArgs = @("-Deploy", "-MinMinutes", "2")
+        Description = "Push sanitized live_status.json to GitHub Pages (~every 2 min when changed)."
         LimitHours = 1
-        RepeatMinutes = 5
+        RepeatMinutes = 2
     }
 )
 
