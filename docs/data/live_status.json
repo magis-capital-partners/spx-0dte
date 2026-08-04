@@ -1,14 +1,14 @@
 {
   "schema": 2,
   "source": "cloud",
-  "generated_at": "2026-08-04T11:16:50.619397",
+  "generated_at": "2026-08-04T11:20:49.262261",
   "date": "2026-08-04",
-  "pid_alive": true,
-  "heartbeat_ts": "2026-08-04T11:16:44.962498",
+  "pid_alive": false,
+  "heartbeat_ts": "2026-08-04T11:19:33.920013",
   "entries_halted": false,
   "flattened": false,
   "open_count": 2,
-  "marked_pnl": -3870.0,
+  "marked_pnl": -3860.0,
   "execution_type": "production_live",
   "risk": {
     "max_loss_no_stop": 0.0,
@@ -25,7 +25,7 @@
     {
       "date": "2026-08-04",
       "execution_type": "production_live",
-      "ts": "2026-08-04T11:16:26.834563",
+      "ts": "2026-08-04T11:19:27.894708",
       "marked_pnl": -3850.0,
       "defined_risk_margin": 0.0,
       "marked_return_on_margin_pct": 0.0,
