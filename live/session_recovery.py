@@ -243,6 +243,13 @@ def recover_governor_state(
             for reason in event.get("cleared_reasons") or []:
                 halt_reasons.discard(str(reason))
             continue
+        if name == "governor_clear" and event.get("reason") == "operator_clear_stale_quotes":
+            # Explicit operator resume after confirming quotes are healthy.
+            # Only stale_quotes may be removed this way — never flatten/PnL/etc.
+            for reason in event.get("cleared_reasons") or []:
+                if str(reason) == "stale_quotes":
+                    halt_reasons.discard("stale_quotes")
+            continue
         if name == "side_stop_cooldown_start":
             side = str(event.get("side") or "")
             until_raw = event.get("until")
@@ -292,7 +299,11 @@ def _spread_key(side: str, short_strike: float, long_strike: float) -> Tuple[str
 
 
 def open_entry_events_from_fills(events: Sequence[dict]) -> List[dict]:
-    """Return still-open entry events after stops / flatten (chronological)."""
+    """Return still-active entry events after stops / flatten (chronological).
+
+    A ``stop`` keeps the entry in the book marked ``stopped=True`` so the long
+    wing remains expected inventory (manage-only). ``flatten`` clears everything.
+    """
     open_entries: List[dict] = []
     for event in events:
         name = event.get("event")
@@ -300,7 +311,9 @@ def open_entry_events_from_fills(events: Sequence[dict]) -> List[dict]:
             open_entries.clear()
             continue
         if name == "entry":
-            open_entries.append(dict(event))
+            row = dict(event)
+            row["stopped"] = False
+            open_entries.append(row)
             continue
         if name == "stop":
             key = _spread_key(
@@ -310,13 +323,20 @@ def open_entry_events_from_fills(events: Sequence[dict]) -> List[dict]:
             )
             for idx in range(len(open_entries) - 1, -1, -1):
                 row = open_entries[idx]
+                if row.get("stopped"):
+                    continue
                 row_key = _spread_key(
                     str(row.get("side")),
                     float(row.get("short_strike")),
                     float(row.get("long_strike")),
                 )
                 if row_key == key:
-                    open_entries.pop(idx)
+                    row["stopped"] = True
+                    if event.get("stop_fill") is not None:
+                        row["stop_fill"] = event.get("stop_fill")
+                    if event.get("stop_price") is not None:
+                        row["stop_fill_price"] = event.get("stop_fill")
+                        row["logged_stop_price"] = event.get("stop_price")
                     break
     return open_entries
 
@@ -415,8 +435,19 @@ def rebuild_open_spreads_from_entries(
             stop_price=stop_price,
             fill_credit=credit,
         )
+        if event.get("stopped"):
+            spread.stopped = True
+            fill = event.get("stop_fill")
+            if fill is not None:
+                try:
+                    spread.stop_fill_price = float(fill)
+                except (TypeError, ValueError):
+                    spread.stop_fill_price = float(stop_price)
+            else:
+                spread.stop_fill_price = float(stop_price)
         spreads.append(spread)
-        gross += credit * contracts * 100.0
+        if not event.get("stopped"):
+            gross += credit * contracts * 100.0
     return spreads, gross
 
 

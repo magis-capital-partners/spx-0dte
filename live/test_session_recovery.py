@@ -33,12 +33,23 @@ from session_recovery import (  # noqa: E402
 
 
 class OpenEntryEventsTests(unittest.TestCase):
-    def test_entry_then_stop_clears(self) -> None:
+    def test_entry_then_stop_keeps_manage_only_wing(self) -> None:
         events = [
-            {"event": "entry", "side": "bear_call", "short_strike": 7550, "long_strike": 7610, "contracts": 2, "credit": 1.5},
-            {"event": "stop", "side": "bear_call", "short_strike": 7550, "long_strike": 7610},
+            {
+                "event": "entry",
+                "side": "bear_call",
+                "short_strike": 7550,
+                "long_strike": 7610,
+                "contracts": 2,
+                "credit": 1.5,
+                "short_entry_sell": 2.0,
+            },
+            {"event": "stop", "side": "bear_call", "short_strike": 7550, "long_strike": 7610, "stop_fill": 6.1},
         ]
-        self.assertEqual(open_entry_events_from_fills(events), [])
+        rows = open_entry_events_from_fills(events)
+        self.assertEqual(len(rows), 1)
+        self.assertTrue(rows[0]["stopped"])
+        self.assertEqual(rows[0]["stop_fill"], 6.1)
 
     def test_flatten_clears_all(self) -> None:
         events = [
@@ -48,15 +59,17 @@ class OpenEntryEventsTests(unittest.TestCase):
         ]
         self.assertEqual(open_entry_events_from_fills(events), [])
 
-    def test_open_entries_remain(self) -> None:
+    def test_open_entries_remain_with_stopped_sibling(self) -> None:
         events = [
-            {"event": "entry", "side": "bull_put", "short_strike": 7400, "long_strike": 7200, "contracts": 1, "credit": 3.0},
-            {"event": "entry", "side": "bear_call", "short_strike": 7500, "long_strike": 7550, "contracts": 2, "credit": 1.2},
+            {"event": "entry", "side": "bull_put", "short_strike": 7400, "long_strike": 7200, "contracts": 1, "credit": 3.0, "short_entry_sell": 4.0},
+            {"event": "entry", "side": "bear_call", "short_strike": 7500, "long_strike": 7550, "contracts": 2, "credit": 1.2, "short_entry_sell": 1.5},
             {"event": "stop", "side": "bear_call", "short_strike": 7500, "long_strike": 7550},
         ]
         open_rows = open_entry_events_from_fills(events)
-        self.assertEqual(len(open_rows), 1)
-        self.assertEqual(open_rows[0]["side"], "bull_put")
+        self.assertEqual(len(open_rows), 2)
+        by_side = {row["side"]: row for row in open_rows}
+        self.assertFalse(by_side["bull_put"].get("stopped"))
+        self.assertTrue(by_side["bear_call"].get("stopped"))
 
 
 class RebuildSpreadsTests(unittest.TestCase):
@@ -94,7 +107,36 @@ class RebuildSpreadsTests(unittest.TestCase):
         self.assertEqual(nets[LegKey("C", 7545.0, "20260709")], -2)
         self.assertEqual(nets[LegKey("C", 7625.0, "20260709")], 2)
 
-    def test_rebuild_refuses_missing_short_premium(self) -> None:
+    def test_rebuild_stopped_entry_expected_long_only(self) -> None:
+        entries = [
+            {
+                "event": "entry",
+                "side": "bear_call",
+                "short_strike": 7670,
+                "long_strike": 7750,
+                "contracts": 2,
+                "credit": 4.1,
+                "short_entry_sell": 4.4,
+                "long_entry_buy": 0.25,
+                "stopped": True,
+                "stop_fill": 14.45,
+                "ts": "2026-08-04T09:47:21",
+            }
+        ]
+        spreads, gross = rebuild_open_spreads_from_entries(
+            entries,
+            today="2026-08-04",
+            stop_multiple=3.0,
+            OpenSpread=OpenSpread,
+            CandidateRecord=CandidateRecord,
+        )
+        self.assertEqual(len(spreads), 1)
+        self.assertTrue(spreads[0].stopped)
+        self.assertAlmostEqual(gross, 0.0)
+        nets = expected_leg_net_from_spreads(spreads, "2026-08-04")
+        self.assertNotIn(LegKey("C", 7670.0, "20260804"), nets)
+        self.assertEqual(nets[LegKey("C", 7750.0, "20260804")], 2)
+
         entries = [
             {
                 "event": "entry",
@@ -338,6 +380,33 @@ class RecoverGovernorTests(unittest.TestCase):
         gov = recover_governor_state(events)
         self.assertFalse(gov.entries_halted)
         self.assertFalse(recovered_halt_is_mark_only(gov))
+
+    def test_operator_clear_stale_quotes_only(self) -> None:
+        events = [
+            {"event": "halt_entries", "reason": "stale_quotes"},
+            {"event": "halt_entries", "reason": "daily_loss", "marked_pnl": -12000},
+            {
+                "event": "governor_clear",
+                "reason": "operator_clear_stale_quotes",
+                "cleared_reasons": ["stale_quotes", "daily_loss"],
+            },
+        ]
+        gov = recover_governor_state(events)
+        self.assertTrue(gov.entries_halted)
+        self.assertEqual(gov.halt_reasons, ["daily_loss"])
+
+    def test_operator_clear_stale_quotes_resumes_when_only_stale(self) -> None:
+        events = [
+            {"event": "halt_entries", "reason": "stale_quotes"},
+            {
+                "event": "governor_clear",
+                "reason": "operator_clear_stale_quotes",
+                "cleared_reasons": ["stale_quotes"],
+            },
+        ]
+        gov = recover_governor_state(events)
+        self.assertFalse(gov.entries_halted)
+        self.assertEqual(gov.halt_reasons, [])
 
     def test_halt_and_flatten(self) -> None:
         events = [

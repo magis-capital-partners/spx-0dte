@@ -122,6 +122,7 @@ Also cancels orphan working SPXW/BAG orders from a crashed prior run. Do **not**
 | Control | Behavior |
 |---------|----------|
 | **KILL file** | Create `data/live/KILL` or `data/live/<date>/KILL` — executor flattens (with fill confirm) and exits. Present at startup → refuse to start until removed. Portable: works on whichever host runs the session. |
+| **CLEAR_STALE_HALT** | Create `data/live/<date>/CLEAR_STALE_HALT`, then restart the executor. One-shot: lifts a sticky `stale_quotes` entry halt only (never flatten/PnL/account). File is consumed on startup. |
 | **Account overlay** | PnL halt/flatten still use configured `account_equity`. Startup requires IB NetLiq ≥ equity and BuyingPower ≥ 15% of equity. Loop halts entries if NetLiq < 90% of equity. Pre-entry BP check vs estimated margin. |
 | **Disconnect breaker** | On IB disconnect: halt entries, reconnect with backoff (default 120s budget), re-arm native STPs, re-verify book. Failure with open risk → confirmed flatten then exit. |
 | **Mark integrity** | Missing quotes on open risk → halt entries (never treat as $0 PnL). Unavailable marks for 60s → flatten. |

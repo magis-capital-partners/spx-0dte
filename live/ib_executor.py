@@ -130,6 +130,10 @@ from session_recovery import (  # noqa: E402
     release_executor_lock,
 )
 from kill_switch import check_kill_switch  # noqa: E402
+from clear_stale_halt import (  # noqa: E402
+    consume_clear_stale_halt,
+    filter_cleared_stale_reasons,
+)
 from account_guards import (  # noqa: E402
     check_loop_account_guard,
     check_startup_account_guard,
@@ -2519,7 +2523,7 @@ def run(live: LiveConfig = ACTIVE) -> None:
             cleared_reasons = list(governor.halt_reasons)
             entries_halted = False
             print(
-                f"[{datetime.now().isoformat()}] governor clear â€” "
+                f"[{datetime.now().isoformat()}] governor clear — "
                 "recovered mark-only halt after all open legs warmed"
             )
             log_event(today, {
@@ -2527,6 +2531,42 @@ def run(live: LiveConfig = ACTIVE) -> None:
                 "reason": "recovery_quotes_ready",
                 "cleared_reasons": cleared_reasons,
             }, live=live)
+        clear_stale_path = consume_clear_stale_halt(today)
+        if clear_stale_path is not None:
+            stale_to_clear = filter_cleared_stale_reasons(governor.halt_reasons)
+            other_reasons = [
+                r for r in governor.halt_reasons if r not in set(stale_to_clear)
+            ]
+            if flattened:
+                print(
+                    f"[{datetime.now().isoformat()}] CLEAR_STALE_HALT ignored — "
+                    f"session is flattened ({clear_stale_path})"
+                )
+            elif not stale_to_clear:
+                print(
+                    f"[{datetime.now().isoformat()}] CLEAR_STALE_HALT ignored — "
+                    f"no stale_quotes halt to clear (reasons={governor.halt_reasons})"
+                )
+            else:
+                print(
+                    f"[{datetime.now().isoformat()}] governor clear — "
+                    f"operator CLEAR_STALE_HALT removed {stale_to_clear}"
+                    + (f" (kept {other_reasons})" if other_reasons else "")
+                )
+                log_event(today, {
+                    "event": "governor_clear",
+                    "reason": "operator_clear_stale_quotes",
+                    "cleared_reasons": stale_to_clear,
+                    "kept_reasons": other_reasons,
+                }, live=live)
+                entries_halted = flattened or bool(other_reasons)
+            try:
+                clear_stale_path.unlink()
+            except OSError as exc:
+                print(
+                    f"[{datetime.now().isoformat()}] WARN could not remove "
+                    f"{clear_stale_path}: {exc!r}"
+                )
         side_stop_cooldown_until: Dict[str, datetime] = dict(governor.side_stop_cooldown_until)
         side_stop_counts: Dict[str, int] = recover_side_stop_counts(fills_events)
         for warn in governor.warnings:
