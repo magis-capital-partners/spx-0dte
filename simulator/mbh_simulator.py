@@ -337,6 +337,13 @@ class StrategyConfig:
     # Side-specific fixed wing widths (0 = use wing_width / target_delta defaults).
     put_wing_width: float = 0.0
     call_wing_width: float = 0.0
+    fixed_wing_tolerance: float = 0.0
+    # Contract-based live/replay concentration overlays (0 = disabled).
+    max_open_contracts: int = 0
+    max_open_contracts_per_side: int = 0
+    max_open_contracts_same_strike: int = 0
+    max_open_contracts_side_cluster: int = 0
+    open_contract_side_cluster_points: float = 0.0
     # Net-long overlay: buy extra long wings beyond the spread protective leg.
     use_net_long_overlay: bool = False
     put_long_overlay_ratio: float = 1.0
@@ -789,10 +796,12 @@ def _wing_params_for_side(side: str, config: StrategyConfig) -> tuple[float, flo
     """Return (target_width, min_width, max_width, selection_mode) for a spread side."""
     if side == "bull_put" and config.put_wing_width > 0:
         width = config.put_wing_width
-        return width, max(25.0, width - 25.0), width + 50.0, "fixed_width"
+        tolerance = max(float(config.fixed_wing_tolerance), 0.0)
+        return width, max(0.0, width - tolerance), width + tolerance, "fixed_width"
     if side == "bear_call" and config.call_wing_width > 0:
         width = config.call_wing_width
-        return width, max(25.0, width - 15.0), width + 25.0, "fixed_width"
+        tolerance = max(float(config.fixed_wing_tolerance), 0.0)
+        return width, max(0.0, width - tolerance), width + tolerance, "fixed_width"
     return config.wing_width, config.min_wing_width, config.max_wing_width, config.wing_selection_mode
 
 
@@ -2388,6 +2397,42 @@ def entry_risk_block_reason(
     ]
     if len(same_strike) >= config.max_open_trades_same_side_strike:
         return "same_strike_concentration_limit"
+    candidate_contracts = max(int(candidate.contracts or 0), 1)
+    open_trades = [
+        trade for trade in trades
+        if trade.exit_reason == "open" and not trade.stopped
+    ]
+    if (
+        config.max_open_contracts > 0
+        and sum(int(trade.contracts) for trade in open_trades) + candidate_contracts
+        > config.max_open_contracts
+    ):
+        return "max_open_contracts"
+    side_contracts = sum(int(trade.contracts) for trade in open_same_side)
+    if (
+        config.max_open_contracts_per_side > 0
+        and side_contracts + candidate_contracts > config.max_open_contracts_per_side
+    ):
+        return "max_open_per_side"
+    strike_contracts = sum(int(trade.contracts) for trade in same_strike)
+    if (
+        config.max_open_contracts_same_strike > 0
+        and strike_contracts + candidate_contracts > config.max_open_contracts_same_strike
+    ):
+        return "max_open_same_strike"
+    if (
+        config.max_open_contracts_side_cluster > 0
+        and config.open_contract_side_cluster_points > 0
+    ):
+        cluster_contracts = sum(
+            int(trade.contracts)
+            for trade in open_same_side
+            if trade.short_type == candidate.short_type
+            and abs(float(trade.short_strike) - float(candidate.short_strike))
+            <= config.open_contract_side_cluster_points
+        )
+        if cluster_contracts + candidate_contracts > config.max_open_contracts_side_cluster:
+            return "max_open_side_cluster"
     if (
         config.post_stop_min_credit_to_width > 0
         and side_stop_counts.get(candidate.side, 0) > 0

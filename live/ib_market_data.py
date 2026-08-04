@@ -6,6 +6,8 @@ Phase 3 support — fast cache reads for adaptive polling loops.
 """
 from __future__ import annotations
 
+import copy
+import math
 import time as _time
 from dataclasses import dataclass
 from datetime import datetime
@@ -64,18 +66,49 @@ def _ticker_bid_ask(ticker, *, delayed_fallback: bool) -> Tuple[float, float]:
     return max(bid, 0.0), max(ask, 0.0)
 
 
+def _ticker_greeks(ticker) -> Tuple[Optional[float], Optional[float]]:
+    """Return plausible option delta/IV, rejecting IB sentinel values."""
+    greeks = getattr(ticker, "modelGreeks", None)
+    if greeks is None:
+        return None, None
+    delta_raw = getattr(greeks, "delta", None)
+    iv_raw = getattr(greeks, "impliedVol", None)
+    try:
+        delta = float(delta_raw) if delta_raw is not None else None
+    except (TypeError, ValueError):
+        delta = None
+    try:
+        iv = float(iv_raw) if iv_raw is not None else None
+    except (TypeError, ValueError):
+        iv = None
+    if delta is not None and (not math.isfinite(delta) or abs(delta) > 1.0):
+        delta = None
+    # Decimal annualized IV; even a 1,000% ceiling is deliberately generous.
+    if iv is not None and (not math.isfinite(iv) or iv <= 0.0 or iv > 10.0):
+        iv = None
+    return delta, iv
+
+
 def _expiry_iso(expiry_yyyymmdd: str) -> str:
     return f"{expiry_yyyymmdd[:4]}-{expiry_yyyymmdd[4:6]}-{expiry_yyyymmdd[6:8]}"
 
 
 def _spot_from_ticker(ticker) -> float:
+    # SPX index streams update ``last`` but commonly have no streaming bid/ask.
+    # A startup reqTickers snapshot can leave an old bid/ask on the reused
+    # ib_insync Ticker; marketPrice() then returns that stale midpoint as soon as
+    # the live last trades outside the snapshot spread.  Prefer the exchange's
+    # live index print and use marketPrice/close only as startup fallbacks.
+    last = getattr(ticker, "last", None)
+    if last and last > 0:
+        return float(last)
     try:
         px = ticker.marketPrice()
         if px and px > 0:
             return float(px)
     except Exception:
         pass
-    for attr in ("last", "close"):
+    for attr in ("close",):
         val = getattr(ticker, attr, None)
         if val and val > 0:
             return float(val)
@@ -125,11 +158,17 @@ class IBStreamingMarketData:
         self._started = False
         self._next_expiry_quotes: List[OptionQuote] = []
         self._last_chain_log = 0.0
+        self._last_spx_update_at = 0.0
+        self._last_spx_value = 0.0
         self._effective_market_data_type = live.market_data_type
         self._delayed_fallback = live.delayed_quote_fallback and live.market_data_type != 1
 
     def _probe_spx_snapshot(self, wait_sec: float = 2.0) -> float:
-        [ticker] = self.ib.reqTickers(self._spx)
+        # ib_insync keys ticker instances by Python contract identity.  Probe
+        # with a copy so snapshot bid/ask fields can never contaminate the
+        # later streaming ticker for ``self._spx``.
+        probe_contract = copy.copy(self._spx)
+        [ticker] = self.ib.reqTickers(probe_contract)
         self.ib.sleep(wait_sec)
         return _spot_from_ticker(ticker)
 
@@ -195,6 +234,8 @@ class IBStreamingMarketData:
 
     def _setup_spx_feed(self) -> None:
         self._cancel_spx_feed()
+        self._last_spx_update_at = 0.0
+        self._last_spx_value = 0.0
         if self.live.use_streaming_quotes:
             self._spx_ticker = self.ib.reqMktData(self._spx, "", False, False)
             self._spx_ticker.updateEvent += self._on_spx_update
@@ -204,10 +245,14 @@ class IBStreamingMarketData:
     def _wait_for_spot(self) -> float:
         spot = self.spot()
         if spot > 0:
+            self._last_spx_value = spot
+            self._last_spx_update_at = _time.monotonic()
             return spot
         self.ib.sleep(max(self.live.streaming_warmup_seconds, 1.0))
         spot = self.spot()
         if spot > 0:
+            self._last_spx_value = spot
+            self._last_spx_update_at = _time.monotonic()
             return spot
         return self._probe_spx_snapshot(wait_sec=1.0)
 
@@ -274,6 +319,16 @@ class IBStreamingMarketData:
             return 0.0
         return _spot_from_ticker(self._spx_ticker)
 
+    def spot_age_seconds(self) -> float:
+        if self._last_spx_update_at <= 0:
+            return float("inf")
+        return max(_time.monotonic() - self._last_spx_update_at, 0.0)
+
+    def spot_is_stale(self, max_age_seconds: float) -> bool:
+        if max_age_seconds <= 0:
+            return False
+        return self.spot_age_seconds() > max_age_seconds
+
     def maybe_rebalance(self) -> None:
         spot = self.spot()
         if spot <= 0 or self._anchor_spot <= 0:
@@ -301,28 +356,56 @@ class IBStreamingMarketData:
             )
         self.ib.qualifyContracts(*contracts)
         qualified = [c for c in contracts if c.conId]
-        if not qualified:
+        if len(qualified) != 2:
             return
-        tickers = self.ib.reqTickers(*qualified)
         expiry_iso = _expiry_iso(self._expiry_next)
         rows: List[OptionQuote] = []
-        for opt, tk in zip(qualified, tickers):
-            bid, ask = _ticker_bid_ask(tk, delayed_fallback=self._delayed_fallback)
-            delta = tk.modelGreeks.delta if tk.modelGreeks is not None else None
-            iv = tk.modelGreeks.impliedVol if tk.modelGreeks is not None else None
-            rows.append(
-                OptionQuote(
-                    timestamp=now,
-                    expiry=expiry_iso,
-                    option_type="CALL" if opt.right == "C" else "PUT",
-                    strike=float(opt.strike),
-                    bid=bid,
-                    ask=ask,
-                    delta=delta,
-                    iv=iv,
-                    underlying_price=spot,
+        tickers: List = []
+        try:
+            for contract in qualified:
+                tickers.append(
+                    self.ib.reqMktData(
+                        contract,
+                        self.live.streaming_generic_ticks,
+                        False,
+                        False,
+                    )
                 )
+            deadline = _time.monotonic() + max(
+                float(self.live.tranche_quote_timeout_seconds), 0.0,
             )
+            while _time.monotonic() < deadline:
+                prices = [
+                    _ticker_bid_ask(
+                        ticker, delayed_fallback=self._delayed_fallback,
+                    )
+                    for ticker in tickers
+                ]
+                if all(bid > 0 and ask > 0 for bid, ask in prices):
+                    break
+                self.ib.sleep(min(0.05, max(deadline - _time.monotonic(), 0.0)))
+            for opt, tk in zip(qualified, tickers):
+                bid, ask = _ticker_bid_ask(tk, delayed_fallback=self._delayed_fallback)
+                delta, iv = _ticker_greeks(tk)
+                rows.append(
+                    OptionQuote(
+                        timestamp=now,
+                        expiry=expiry_iso,
+                        option_type="CALL" if opt.right == "C" else "PUT",
+                        strike=float(opt.strike),
+                        bid=bid,
+                        ask=ask,
+                        delta=delta,
+                        iv=iv,
+                        underlying_price=spot,
+                    )
+                )
+        finally:
+            for contract in qualified[:len(tickers)]:
+                try:
+                    self.ib.cancelMktData(contract)
+                except Exception:
+                    pass
         self._next_expiry_quotes = rows
 
     def build_option_quotes(self, now: datetime) -> List[OptionQuote]:
@@ -367,38 +450,27 @@ class IBStreamingMarketData:
         short_strike: float,
         long_strike: float,
     ) -> Tuple[Optional[OptionQuote], Optional[OptionQuote]]:
-        """Snapshot both spread legs before entry (updates cache)."""
-        if not HAS_IB or not self._expiry_0dte:
+        """Read the latest subscribed spread-leg quotes without blocking."""
+        if not self._expiry_0dte:
             return None, None
-        right = "P" if short_type == "PUT" else "C"
-        contracts = [
-            Option("SPX", self._expiry_0dte, short_strike, right, "CBOE", tradingClass="SPXW"),
-            Option("SPX", self._expiry_0dte, long_strike, right, "CBOE", tradingClass="SPXW"),
-        ]
-        self.ib.qualifyContracts(*contracts)
-        qualified = [c for c in contracts if c.conId]
-        if len(qualified) != 2:
-            return None, None
-        tickers = self.ib.reqTickers(*qualified)
         expiry_iso = self.expiry_0dte_iso
         spot = self.spot()
         quotes: List[OptionQuote] = []
-        for contract, ticker in zip(qualified, tickers):
-            self._update_cache_from_ticker(contract, ticker)
-            opt_type = "CALL" if contract.right == "C" else "PUT"
-            bid, ask = _ticker_bid_ask(ticker, delayed_fallback=self._delayed_fallback)
-            delta = ticker.modelGreeks.delta if ticker.modelGreeks is not None else None
-            iv = ticker.modelGreeks.impliedVol if ticker.modelGreeks is not None else None
+        opt_type = "PUT" if short_type.upper() in {"P", "PUT"} else "CALL"
+        for strike in (float(short_strike), float(long_strike)):
+            cached = self._cache.get((expiry_iso, opt_type, strike))
+            if cached is None:
+                continue
             quotes.append(
                 OptionQuote(
                     timestamp=now,
                     expiry=expiry_iso,
                     option_type=opt_type,
-                    strike=float(contract.strike),
-                    bid=bid,
-                    ask=ask,
-                    delta=delta,
-                    iv=iv,
+                    strike=strike,
+                    bid=cached.bid,
+                    ask=cached.ask,
+                    delta=cached.delta,
+                    iv=cached.iv,
                     underlying_price=spot,
                 )
             )
@@ -424,7 +496,10 @@ class IBStreamingMarketData:
         cfg = self.config
         put_wing = cfg.put_wing_width if cfg.put_wing_width > 0 else cfg.wing_width
         call_wing = cfg.call_wing_width if cfg.call_wing_width > 0 else cfg.wing_width
-        short_offsets = (50.0, 80.0, 110.0)
+        # Keep enough near-spot strikes subscribed that an exact configured
+        # wing can be built after ordinary intraday moves. Wider offsets are
+        # still retained for candidate diversity.
+        short_offsets = (20.0, 30.0, 40.0, 55.0, 75.0, 100.0)
         priority: List[float] = []
         seen: set[float] = set()
 
@@ -647,7 +722,10 @@ class IBStreamingMarketData:
             self._update_cache_from_ticker(contract, ticker)
 
     def _on_spx_update(self, ticker) -> None:
-        _ = ticker
+        last = getattr(ticker, "last", None)
+        if last and last > 0:
+            self._last_spx_value = float(last)
+            self._last_spx_update_at = _time.monotonic()
 
     def _on_option_update(self, contract: Contract, ticker) -> None:
         self._update_cache_from_ticker(contract, ticker)
@@ -656,8 +734,7 @@ class IBStreamingMarketData:
         opt_type = "CALL" if contract.right == "C" else "PUT"
         key: QuoteKey = (self.expiry_0dte_iso, opt_type, float(contract.strike))
         bid, ask = _ticker_bid_ask(ticker, delayed_fallback=self._delayed_fallback)
-        delta = ticker.modelGreeks.delta if ticker.modelGreeks is not None else None
-        iv = ticker.modelGreeks.impliedVol if ticker.modelGreeks is not None else None
+        delta, iv = _ticker_greeks(ticker)
         self._cache[key] = CachedQuote(bid=bid, ask=ask, delta=delta, iv=iv, updated_at=_time.time())
 
     def _log_chain_health(self, spot: float, quotes: Sequence[OptionQuote]) -> None:

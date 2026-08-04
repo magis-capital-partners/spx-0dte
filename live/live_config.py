@@ -69,8 +69,17 @@ class LiveConfig:
     # Restart/reconnect: wait for every recovered position leg to have a fresh
     # markable quote before the mark-integrity governor begins.
     recovery_quote_warmup_seconds: float = 10.0
-    spot_rebalance_points: float = 50.0
+    spot_rebalance_points: float = 10.0
     fetch_next_expiry_at_tranche: bool = True
+    # Bound temporary next-expiry quote collection. Never use IB's ~11-second
+    # blocking snapshot path inside an entry tranche.
+    tranche_quote_timeout_seconds: float = 0.75
+    # Fail closed for new entries if the SPX index stream has not delivered a
+    # valid live-last update within this window. Open-position option marks and
+    # stops continue to be managed; stale underlying alone never flattens.
+    stale_spot_halt_seconds: float = 5.0
+    # A z-score this large is a feed/sentinel problem, not a tradable signal.
+    signal_sanity_abs_z: float = 12.0
 
     # --- Phase 3: adaptive polling ------------------------------------------ #
     use_adaptive_polling: bool = True
@@ -124,6 +133,7 @@ class LiveConfig:
     # Record the SMART-combo NBBO alongside the two leg quotes.  The guard
     # remains off until paper validation confirms IB's BAG quote convention.
     combo_quote_guard_enabled: bool = False
+    combo_quote_timeout_seconds: float = 0.75
     # A condor must be routed as one four-leg BAG, never as two independent
     # vertical orders.  Leave this off until the paired-order path has passed
     # replay and paper-soak validation; the live overlay then removes the
@@ -178,14 +188,14 @@ class LiveConfig:
     stale_quote_confirm_polls: int = 3
     stale_quote_halt_seconds: float = 20.0
     stale_quote_near_stop_seconds: float = 10.0
-    # Paper-fidelity open-risk backstops (independent of backtest credit cap).
-    # Calibrated just above the reconstructed two-contract pilot maxima from
-    # 1,469 active production-backtest days: 38 total / 37 per side /
-    # 23 at one short strike. These catch runaway accumulation without
-    # routinely overriding the strategy path in paper testing.
-    max_open_contracts: int = 40
-    max_open_per_side: int = 40
-    max_open_same_strike: int = 25
+    # Production-live concentration limits. At the two-lot pilot these permit
+    # at most three same-side structures, only one at an exact strike, and two
+    # structures inside a 25-point directional cluster.
+    max_open_contracts: int = 8
+    max_open_per_side: int = 6
+    max_open_same_strike: int = 2
+    max_open_side_cluster: int = 4
+    side_cluster_points: float = 25.0
     # Live stop-count caps (production profile uses 999; tighten here).
     live_max_stops_per_side: int = 2
     live_max_stops_per_day: int = 4

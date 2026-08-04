@@ -141,6 +141,11 @@ def _entry_fill_event(pending: PendingEntry, *, contracts: int, partial: bool = 
     slippage = round(pending.natural_credit - fill_credit, 4)
     event = {
         "event": "entry",
+        "tranche_time": (
+            pending.tranche_time.replace(second=0, microsecond=0).isoformat()
+            if pending.tranche_time is not None
+            else None
+        ),
         "side": pending.candidate.side,
         "sleeve": pending.sleeve,
         "short_strike": pending.candidate.short_strike,
@@ -150,6 +155,9 @@ def _entry_fill_event(pending: PendingEntry, *, contracts: int, partial: bool = 
         "limit_credit": round(pending.limit_credit, 2),
         "credit": round(fill_credit, 2),
         "fill_slippage": slippage,
+        "submission_to_fill_seconds": round(
+            max(0.0, (datetime.now() - pending.submitted_at).total_seconds()), 3,
+        ),
         "score": round(pending.score, 3),
         "ladder_steps": pending.ladder_step,
         **_entry_leg_fields(pending),
@@ -166,6 +174,11 @@ def _entry_reject_event(pending: PendingEntry, *, reason: str, status: Optional[
     trade = pending.trade
     return {
         "event": "order_rejected",
+        "tranche_time": (
+            pending.tranche_time.replace(second=0, microsecond=0).isoformat()
+            if pending.tranche_time is not None
+            else None
+        ),
         "side": pending.candidate.side,
         "short_strike": pending.candidate.short_strike,
         "long_strike": pending.candidate.long_strike,
@@ -286,6 +299,11 @@ def poll_pending_entry(
             pending.limit_credit = new_limit
             log_event(today, {
                 "event": "entry_ladder",
+                "tranche_time": (
+                    pending.tranche_time.replace(second=0, microsecond=0).isoformat()
+                    if pending.tranche_time is not None
+                    else None
+                ),
                 "side": pending.candidate.side,
                 "short_strike": pending.candidate.short_strike,
                 "long_strike": pending.candidate.long_strike,

@@ -13,6 +13,7 @@ import argparse
 import json
 import sys
 from collections import Counter
+from dataclasses import replace
 from datetime import date, datetime
 from pathlib import Path
 from typing import Dict, List, Optional
@@ -27,19 +28,12 @@ from expiry_calendar import (  # noqa: E402
     load_era_rules,
     resolve_start_date,
 )
-from live_features import (  # noqa: E402
-    SessionFeatureState,
-    compute_raw_features,
-    raw_to_signal_snapshot,
-    split_session_quotes,
-)
 from mbh_simulator import (  # noqa: E402
     OptionQuote,
     read_quotes_csv,
     read_signals_csv,
     simulate_day,
 )
-from historical_baselines import compute_baselines  # noqa: E402
 from regime_validation import apply_rolling_baseline, discover_dates  # noqa: E402
 
 LIVE_DIR = ROOT / "data" / "live"
@@ -103,86 +97,149 @@ def summarize_live(events: list) -> dict:
     }
 
 
-def _quotes_at_time(quotes: List[OptionQuote], ts: datetime) -> List[OptionQuote]:
-    key = ts.replace(tzinfo=None).isoformat(timespec="seconds")
-    return [q for q in quotes if q.timestamp.replace(tzinfo=None).isoformat(timespec="seconds") == key]
-
-
 def _tranche_signal_diffs(
-    day: str,
-    quotes: List[OptionQuote],
-    train_dates: List[str],
-    processed_dir: Path,
+    signals: list,
     tranches: List[dict],
+    executed_by_tranche: Dict[datetime, int],
 ) -> List[dict]:
-    """Compare live tranche skip reasons vs replayed signals (when tranches.jsonl exists)."""
-    baselines = compute_baselines(processed_dir, "SPXW", train_dates)
-    state = SessionFeatureState()
+    """Compare live rows with the canonical minute-by-minute replay signals."""
+    replay_by_minute = {
+        signal.timestamp.replace(tzinfo=None, second=0, microsecond=0): signal
+        for signal in signals
+    }
     diffs: List[dict] = []
     for row in tranches:
         ts_raw = row.get("timestamp") or row.get("entry_time")
         if not ts_raw:
             continue
-        ts = datetime.fromisoformat(str(ts_raw).replace("Z", ""))
-        bucket = _quotes_at_time(quotes, ts)
-        if not bucket:
+        ts = datetime.fromisoformat(str(ts_raw).replace("Z", "")).replace(
+            second=0, microsecond=0,
+        )
+        snap = replay_by_minute.get(ts)
+        if snap is None:
             continue
-        zero_q, next_q = split_session_quotes(bucket, day)
-        if not zero_q:
-            continue
-        spot_vals = [q.underlying_price for q in zero_q if q.underlying_price]
-        if not spot_vals:
-            continue
-        next_bucket = None
-        if next_q:
-            next_by_ts: Dict[str, list] = {}
-            for q in next_q:
-                k = q.timestamp.replace(tzinfo=None).isoformat(timespec="seconds")
-                next_by_ts.setdefault(k, []).append(q)
-            ts_key = ts.replace(tzinfo=None).isoformat(timespec="seconds")
-            next_bucket = next_by_ts.get(ts_key)
-
-        raw = compute_raw_features(zero_q, float(spot_vals[0]), ts, state, next_expiry_quotes=next_bucket)
-        snap = raw_to_signal_snapshot(raw, baselines, ts)
         diffs.append(
             {
                 "time": ts.strftime("%H:%M"),
                 "live_skip": row.get("skip_reason") or ("entry" if row.get("executed") else ""),
-                "live_executed": row.get("executed", 0),
-                "trend_z": round(snap.trend_score, 3),
-                "skew_z": round(snap.skew_z, 3),
+                "live_executed": executed_by_tranche.get(ts, row.get("executed", 0)),
+                "live_trend_z": round(float(row.get("trend_score", 0.0)), 3),
+                "backtest_trend_z": round(snap.trend_score, 3),
+                "trend_delta": round(float(row.get("trend_score", 0.0)) - snap.trend_score, 3),
+                "live_skew_z": round(float(row.get("skew_z", 0.0)), 3),
+                "backtest_skew_z": round(snap.skew_z, 3),
+                "skew_delta": round(float(row.get("skew_z", 0.0)) - snap.skew_z, 3),
             }
         )
     return diffs
 
 
-def _build_sizing_policy(live_cfg, schedule):
+def _executed_by_tranche(events: List[dict]) -> Dict[datetime, int]:
+    """Map asynchronous entry fills back to the tranche that created them."""
+    counts: Dict[datetime, int] = {}
+    for event in events:
+        if event.get("event") != "entry":
+            continue
+        raw = event.get("tranche_time") or event.get("ts")
+        if not raw:
+            continue
+        ts = datetime.fromisoformat(str(raw).replace("Z", "")).replace(
+            second=0, microsecond=0,
+        )
+        counts[ts] = counts.get(ts, 0) + int(event.get("contracts", 0) or 0)
+    return counts
+
+
+class _AsRunSizePolicy:
+    """Apply the baseline that was active at each signal timestamp."""
+
+    def __init__(self, base_policy, changes: List[tuple]) -> None:
+        self.base_policy = base_policy
+        self.changes = sorted(changes, key=lambda item: item[0])
+
+    def contracts(self, signal, config) -> int:
+        baseline = config.baseline_contracts
+        if signal is not None:
+            for changed_at, value in self.changes:
+                if changed_at > signal.timestamp.replace(tzinfo=None):
+                    break
+                baseline = value
+        return self.base_policy.contracts(signal, replace(config, baseline_contracts=baseline))
+
+
+def _build_sizing_policy(live_cfg, schedule, events: Optional[List[dict]] = None):
     """Match live VIX elevated / skip policy when enabled on the session snapshot."""
     if schedule is None:
         from unconditional_baseline import FixedSizePolicy
 
-        return FixedSizePolicy()
+        policy = FixedSizePolicy()
+    else:
+        use_vix = bool(getattr(live_cfg, "use_vix_elevated_sizing", False) or getattr(live_cfg, "use_vix_session_gate", False))
+        if use_vix:
+            from vix_sizing_policies import VixElevatedSkipPolicy
 
-    use_vix = bool(getattr(live_cfg, "use_vix_elevated_sizing", False) or getattr(live_cfg, "use_vix_session_gate", False))
-    if use_vix:
-        from vix_sizing_policies import VixElevatedSkipPolicy
+            policy = VixElevatedSkipPolicy(
+                schedule,
+                elevated_min=float(getattr(live_cfg, "vix_elevated_min", 25.0)),
+                elevated_max=float(getattr(live_cfg, "vix_elevated_max", 35.0)),
+                elevated_scale=float(getattr(live_cfg, "vix_elevated_scale", 1.25))
+                if getattr(live_cfg, "use_vix_elevated_sizing", False)
+                else 1.0,
+                skip_above=float(getattr(live_cfg, "vix_skip_open_above", 35.0))
+                if getattr(live_cfg, "use_vix_session_gate", False)
+                else 1e9,
+                max_contracts=int(getattr(live_cfg, "max_contracts_per_tranche", 0) or 0) or None,
+            )
+        else:
+            from time_of_day_sizing_runner import TimeOfDaySizePolicy
 
-        return VixElevatedSkipPolicy(
-            schedule,
-            elevated_min=float(getattr(live_cfg, "vix_elevated_min", 25.0)),
-            elevated_max=float(getattr(live_cfg, "vix_elevated_max", 35.0)),
-            elevated_scale=float(getattr(live_cfg, "vix_elevated_scale", 1.25))
-            if getattr(live_cfg, "use_vix_elevated_sizing", False)
-            else 1.0,
-            skip_above=float(getattr(live_cfg, "vix_skip_open_above", 35.0))
-            if getattr(live_cfg, "use_vix_session_gate", False)
-            else 1e9,
-            max_contracts=int(getattr(live_cfg, "max_contracts_per_tranche", 0) or 0) or None,
+            policy = TimeOfDaySizePolicy(schedule)
+
+    changes = []
+    for event in events or []:
+        if event.get("event") != "session_start" or event.get("baseline_contracts") is None:
+            continue
+        raw = event.get("ts")
+        if raw:
+            changes.append((datetime.fromisoformat(str(raw).replace("Z", "")), int(event["baseline_contracts"])))
+    return _AsRunSizePolicy(policy, changes) if changes else policy
+
+
+def resolve_replay_config(
+    snapshot: dict,
+    equity_override: Optional[float] = None,
+):
+    """Resolve a snapshot with the same live-only safety overlays as execution."""
+    from live_config import LiveConfig
+    from live_entry_risk import apply_live_risk_overlays
+    from strategy_profiles import resolve_strategy_config
+
+    saved_live = dict(snapshot.get("live_config") or {})
+    live = LiveConfig(**saved_live)
+    # Older snapshots predate the nearby-strike cluster cap. Treat absence as
+    # disabled so a forensic replay does not retroactively apply a new safety.
+    if "max_open_side_cluster" not in saved_live:
+        live.max_open_side_cluster = 0
+    if "side_cluster_points" not in saved_live:
+        live.side_cluster_points = 0.0
+    if equity_override is not None:
+        live.account_equity = float(equity_override)
+        live.contracts_per_tranche = 0
+
+    config, schedule = resolve_strategy_config(live)
+    config = apply_live_risk_overlays(config, live)
+    if equity_override is not None:
+        # The normalized replay answers the strategy-scale question; retain
+        # stop/condor overlays but do not constrain it by a pilot-account lot cap.
+        config = replace(
+            config,
+            max_open_contracts=0,
+            max_open_contracts_per_side=0,
+            max_open_contracts_same_strike=0,
+            max_open_contracts_side_cluster=0,
+            open_contract_side_cluster_points=0.0,
         )
-
-    from time_of_day_sizing_runner import TimeOfDaySizePolicy
-
-    return TimeOfDaySizePolicy(schedule)
+    return live, config, schedule
 
 
 def _summarize_backtest(result, *, available: bool = True, reason: str = "") -> dict:
@@ -210,17 +267,9 @@ def replay_backtest(
     train_count: int,
     *,
     equity_override: Optional[float] = None,
+    events: Optional[List[dict]] = None,
 ) -> dict:
-    from live_config import LiveConfig
-    from strategy_profiles import resolve_strategy_config
-
-    live = LiveConfig(**snapshot["live_config"])
-    if equity_override is not None:
-        live.account_equity = float(equity_override)
-        # Clear paper lot override so resolve_strategy_config scales from equity.
-        live.contracts_per_tranche = 0
-
-    config, schedule = resolve_strategy_config(live)
+    live, config, schedule = resolve_replay_config(snapshot, equity_override)
     floor, eras = load_era_rules(DEFAULT_RULES)
     processed_dates = discover_dates(processed_dir, "SPXW")
     resolved_start = resolve_start_date(processed_dates, floor, require_mon_and_wed=True)
@@ -240,11 +289,16 @@ def replay_backtest(
     apply_rolling_baseline(processed_dir, "SPXW", train_dates, day, "signals_unconditional.csv")
     day_dir = processed_dir / "symbol=SPXW" / f"date={day}"
     quotes = read_quotes_csv(day_dir / "normalized_option_quotes.csv")
-    policy = _build_sizing_policy(live, schedule)
+    signals = read_signals_csv(day_dir / "signals_unconditional.csv")
+    policy = _build_sizing_policy(
+        live,
+        schedule,
+        events if equity_override is None else None,
+    )
 
     result = simulate_day(
         quotes,
-        read_signals_csv(day_dir / "signals_unconditional.csv"),
+        signals,
         config=config,
         policy=policy,
     )
@@ -253,6 +307,7 @@ def replay_backtest(
     summary["baseline_contracts"] = config.baseline_contracts
     summary["train_dates"] = train_dates
     summary["quotes"] = quotes
+    summary["signals"] = signals
     return summary
 
 
@@ -285,8 +340,11 @@ def main() -> None:
     live_summary = summarize_live(events)
     processed = Path(args.processed_dir)
 
-    paper_bt = replay_backtest(args.date, snapshot, processed, args.train_count)
+    paper_bt = replay_backtest(
+        args.date, snapshot, processed, args.train_count, events=events,
+    )
     quotes = paper_bt.pop("quotes", None) if paper_bt.get("available") else None
+    signals = paper_bt.pop("signals", None) if paper_bt.get("available") else None
     train_dates = paper_bt.pop("train_dates", []) if paper_bt.get("available") else []
 
     # Normalized $13M replay (skip if paper equity already ~13M)
@@ -303,16 +361,15 @@ def main() -> None:
             equity_override=args.normalized_equity,
         )
         norm_bt.pop("quotes", None)
+        norm_bt.pop("signals", None)
         norm_bt.pop("train_dates", None)
 
     signal_diffs: List[dict] = []
-    if quotes is not None and tranches:
+    if signals is not None and tranches:
         signal_diffs = _tranche_signal_diffs(
-            args.date,
-            quotes,
-            train_dates,
-            processed,
+            signals,
             tranches,
+            _executed_by_tranche(events),
         )
 
     report = {

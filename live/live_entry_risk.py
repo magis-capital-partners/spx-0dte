@@ -17,6 +17,15 @@ def apply_live_risk_overlays(config: StrategyConfig, live: Any) -> StrategyConfi
         max_stops_per_day=int(
             getattr(live, "live_max_stops_per_day", getattr(config, "max_stops_per_day", 999))
         ),
+        max_open_contracts=int(getattr(live, "max_open_contracts", 0)),
+        max_open_contracts_per_side=int(getattr(live, "max_open_per_side", 0)),
+        max_open_contracts_same_strike=int(getattr(live, "max_open_same_strike", 0)),
+        max_open_contracts_side_cluster=int(
+            getattr(live, "max_open_side_cluster", 0)
+        ),
+        open_contract_side_cluster_points=float(
+            getattr(live, "side_cluster_points", 0.0)
+        ),
     )
     if bool(getattr(live, "use_portfolio_allocator_live", False)):
         cfg = replace(cfg, use_portfolio_allocator=True)
@@ -42,6 +51,7 @@ def open_spreads_as_trades(open_spreads: Sequence[Any]) -> list:
                 short_type=cand.short_type,
                 short_strike=float(cand.short_strike),
                 long_strike=float(cand.long_strike),
+                contracts=int(getattr(spread, "contracts", 0) or 0),
                 stopped=stopped,
                 exit_reason="stop" if stopped else "open",
                 model=getattr(cand, "sleeve", "") or "core",

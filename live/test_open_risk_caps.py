@@ -51,6 +51,19 @@ class OpenRiskCapTests(unittest.TestCase):
         )
         self.assertEqual(reason, "")
 
+    def test_nearby_same_side_strikes_share_cluster_cap(self) -> None:
+        reason = open_risk_block_reason(
+            _spread(strike=7590.0).candidate,
+            [_spread(strike=7580.0), _spread(strike=7585.0)],
+            contracts=2,
+            max_open_contracts=20,
+            max_open_per_side=20,
+            max_open_same_strike=20,
+            max_open_side_cluster=4,
+            side_cluster_points=25.0,
+        )
+        self.assertEqual(reason, "max_open_side_cluster")
+
 
 if __name__ == "__main__":
     unittest.main()

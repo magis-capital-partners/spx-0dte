@@ -114,6 +114,7 @@ def _pending(
         submitted_at=now - timedelta(seconds=90),
         work_until=now + timedelta(seconds=work_seconds),
         next_ladder_at=now + timedelta(seconds=next_ladder_in),
+        tranche_time=now.replace(second=0, microsecond=0),
         ladder_step=ladder_step,
         sleeve="core",
         score=1.5,
@@ -352,6 +353,7 @@ class PollPendingEntryTests(unittest.TestCase):
         self.assertEqual(resolution["event"], "entry")
         self.assertTrue(resolution.get("partial"))
         self.assertEqual(resolution["contracts"], 1)
+        self.assertEqual(resolution["tranche_time"], "2026-07-29T09:49:00")
         self.assertEqual(ib.place_calls, 0)
 
 

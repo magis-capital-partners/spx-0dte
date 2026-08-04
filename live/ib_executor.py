@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import sys
 import time as _time
 import uuid
@@ -101,9 +102,10 @@ from entry_execution import (  # noqa: E402
 )
 from live_features import (  # noqa: E402
     SessionFeatureState,
-    compute_raw_features,
+    compute_raw_features_once_per_minute,
     extract_baselines_core,
     raw_to_signal_snapshot,
+    signal_features_are_sane,
     split_session_quotes,
     validate_baselines_freshness,
 )
@@ -329,6 +331,7 @@ class IBSignalProvider:
                 f"spot_history={len(restored.spot_history)})"
             )
         self._stream = IBStreamingMarketData(ib, live, config)
+        self.last_signal_block_reason = ""
 
     @staticmethod
     def load_baselines(path: Path, max_age_days: int) -> tuple[dict, dict]:
@@ -373,8 +376,15 @@ class IBSignalProvider:
         quotes = self._stream.build_option_quotes(now)
         spot = self._stream.spot()
         if spot <= 0:
+            self.last_signal_block_reason = "missing_underlying"
             return [], None
+        if self.live.use_streaming_quotes and self._stream.spot_is_stale(
+            self.live.stale_spot_halt_seconds
+        ):
+            self.last_signal_block_reason = "stale_underlying"
+            return quotes, None
 
+        self.last_signal_block_reason = ""
         signal = self._build_signal(now, quotes, spot, at_tranche=at_tranche)
         return quotes, signal
 
@@ -415,13 +425,26 @@ class IBSignalProvider:
         session = now.date().isoformat()
         zero_q, _ = split_session_quotes(quotes, session)
         next_q = self._stream.next_expiry_quotes() if at_tranche else None
-        raw = compute_raw_features(zero_q, spot, now, self._feature_state, next_expiry_quotes=next_q)
-        signal = raw_to_signal_snapshot(raw, self.baselines, now)
+        previous_sample_minute = self._feature_state.last_sample_minute
+        raw = compute_raw_features_once_per_minute(
+            zero_q,
+            spot,
+            now,
+            self._feature_state,
+            next_expiry_quotes=next_q,
+        )
+        sample_ts = now.replace(second=0, microsecond=0)
+        signal = raw_to_signal_snapshot(raw, self.baselines, sample_ts)
+        if not signal_features_are_sane(
+            signal, max_abs_z=self.live.signal_sanity_abs_z,
+        ):
+            self.last_signal_block_reason = "invalid_signal"
+            return None
         if self.session_vix is not None:
             from dataclasses import replace as dc_replace
 
             signal = dc_replace(signal, vix=self.session_vix)
-        if at_tranche:
+        if self._feature_state.last_sample_minute != previous_sample_minute:
             try:
                 save_feature_state(self.today, self._feature_state)
             except OSError:
@@ -496,29 +519,42 @@ def build_combo(ib: "IB", candidate: CandidateRecord, today: str) -> "Contract":
     return bag, short_leg_opt
 
 
-def fetch_combo_execution_quote(ib: "IB", bag: "Contract") -> ComboQuote:
-    """Request the immediate SMART BAG NBBO used by IB's price collar.
+def fetch_combo_execution_quote(
+    ib: "IB", bag: "Contract", *, timeout_seconds: float = 0.75,
+) -> ComboQuote:
+    """Collect a bounded SMART BAG quote without blocking the executor loop.
 
-    A failed/malformed snapshot intentionally returns an unavailable quote;
-    the optional guard can then fail closed instead of guessing from leg prices.
+    ``reqTickers`` may wait roughly eleven seconds for an IB snapshot.  A
+    cancellable stream lets the entry path enforce its own sub-second budget.
+    Credit BAG prices can legitimately be negative, so zero and negative
+    finite prices are retained.
     """
+    ticker = None
     try:
-        tickers = ib.reqTickers(bag)
-        if not tickers:
-            return ComboQuote(None, None)
-        ticker = tickers[0]
-        bid = float(ticker.bid) if ticker.bid is not None and ticker.bid > 0 else None
-        ask = float(ticker.ask) if ticker.ask is not None and ticker.ask > 0 else None
-        # Negative credit BAG quotes may be exposed by ib_insync as negative
-        # values, so retain them rather than applying the usual positive-NBBO
-        # filter used for single option legs.
-        if ticker.bid is not None and float(ticker.bid) < 0:
-            bid = float(ticker.bid)
-        if ticker.ask is not None and float(ticker.ask) < 0:
-            ask = float(ticker.ask)
-        return ComboQuote(bid, ask)
+        ticker = ib.reqMktData(bag, "", False, False)
+        deadline = _time.monotonic() + max(0.0, timeout_seconds)
+        while True:
+            bid_raw = getattr(ticker, "bid", None)
+            ask_raw = getattr(ticker, "ask", None)
+            bid = float(bid_raw) if bid_raw is not None else None
+            ask = float(ask_raw) if ask_raw is not None else None
+            if bid is not None and not math.isfinite(bid):
+                bid = None
+            if ask is not None and not math.isfinite(ask):
+                ask = None
+            if bid is not None or ask is not None:
+                return ComboQuote(bid, ask)
+            if _time.monotonic() >= deadline:
+                return ComboQuote(None, None)
+            ib.sleep(min(0.05, max(0.0, deadline - _time.monotonic())))
     except Exception:
         return ComboQuote(None, None)
+    finally:
+        if ticker is not None:
+            try:
+                ib.cancelMktData(bag)
+            except Exception:
+                pass
 
 
 def build_paired_condor_combo(
@@ -995,6 +1031,11 @@ def cancel_pending_entry(
         pass
     log_event(today, {
         "event": "entry_cancelled",
+        "tranche_time": (
+            pending.tranche_time.replace(second=0, microsecond=0).isoformat()
+            if pending.tranche_time is not None
+            else None
+        ),
         "side": pending.candidate.side,
         "short_strike": pending.candidate.short_strike,
         "long_strike": pending.candidate.long_strike,
@@ -1008,9 +1049,16 @@ def cancel_pending_entry(
         "entry_fault",
         "native_stop_disarm_timeout",
         "poll_error",
+        "stale_underlying",
+        "disconnect",
     }:
         log_event(today, {
             "event": "order_rejected",
+            "tranche_time": (
+                pending.tranche_time.replace(second=0, microsecond=0).isoformat()
+                if pending.tranche_time is not None
+                else None
+            ),
             "side": pending.candidate.side,
             "short_strike": pending.candidate.short_strike,
             "long_strike": pending.candidate.long_strike,
@@ -1088,6 +1136,22 @@ def submit_spread_entry(
     short_sell = candidate.short_quote.bid if candidate.short_quote else 0.0
     long_buy = candidate.long_quote.ask if candidate.long_quote else 0.0
     entry_diagnostics = {
+        "decision_spot": round(float(candidate.spot), 4),
+        "candidate_timestamp": candidate.timestamp.isoformat(),
+        "short_delta": (
+            round(float(candidate.short_delta), 6)
+            if candidate.short_delta is not None
+            else None
+        ),
+        "long_delta": (
+            round(float(candidate.long_delta), 6)
+            if candidate.long_delta is not None
+            else None
+        ),
+        "width": round(float(candidate.width), 4),
+        "trend_score": round(float(candidate.trend_score), 6),
+        "skew_z": round(float(candidate.skew_z), 6),
+        "straddle_residual_z": round(float(candidate.straddle_residual_z), 6),
         "short_bid": round(float(short_sell), 4),
         "short_ask": round(float(candidate.short_quote.ask), 4) if candidate.short_quote else None,
         "long_bid": round(float(candidate.long_quote.bid), 4) if candidate.long_quote else None,
@@ -1104,28 +1168,21 @@ def submit_spread_entry(
         spread.fill_credit = limit
         return spread, None, ""
 
-    # Cancel→add→replace: disarm native STP on this short before the combo SELL.
-    clear_short_leg_backstops(
-        ib, candidate, open_spreads, today, dry=dry, reason="pre_entry",
-    )
+    # Build and validate the BAG before touching protection on an existing short.
     bag, _short_leg_opt = build_combo(ib, candidate, today)
-    combo_quote = fetch_combo_execution_quote(ib, bag)
-    combo_decision = protect_credit_limit(limit, combo_quote)
-    entry_diagnostics.update({
-        "combo_bid": combo_quote.bid,
-        "combo_ask": combo_quote.ask,
-        "combo_requested_credit": round(limit, 2),
-        "combo_collar_credit": combo_decision.collar_credit,
-        "combo_quote_reason": combo_decision.reason,
-    })
     if live.combo_quote_guard_enabled:
+        combo_quote = fetch_combo_execution_quote(
+            ib, bag, timeout_seconds=live.combo_quote_timeout_seconds,
+        )
+        combo_decision = protect_credit_limit(limit, combo_quote)
+        entry_diagnostics.update({
+            "combo_bid": combo_quote.bid,
+            "combo_ask": combo_quote.ask,
+            "combo_requested_credit": round(limit, 2),
+            "combo_collar_credit": combo_decision.collar_credit,
+            "combo_quote_reason": combo_decision.reason,
+        })
         if not combo_decision.ok or combo_decision.allowed_credit is None:
-            # Re-arm any same-strike backstop that was disarmed before quote
-            # validation.  Do not route an order without a usable BAG NBBO.
-            place_or_replace_native_stop_for_short(
-                ib, candidate, open_spreads, today, dry=dry, live=live,
-                config=config, reason="combo_quote_blocked",
-            )
             return None, None, combo_decision.reason or "combo_quote_blocked"
         if combo_decision.allowed_credit != limit:
             limit = combo_decision.allowed_credit
@@ -1133,6 +1190,14 @@ def submit_spread_entry(
             entry_diagnostics["combo_allowed_credit"] = round(limit, 2)
         else:
             entry_diagnostics["combo_guard_repriced"] = False
+    else:
+        entry_diagnostics["combo_quote_reason"] = "guard_disabled"
+
+    # Disarm a same-strike native STP only after validation and immediately
+    # before routing the additional short position.
+    clear_short_leg_backstops(
+        ib, candidate, open_spreads, today, dry=dry, reason="pre_entry",
+    )
     combo_order = LimitOrder("BUY", contracts, -limit)
     combo_order.tif = "DAY"
     combo_order.account = live.ib_account
@@ -1168,6 +1233,17 @@ def submit_spread_entry(
     )
     log_event(today, {
         "event": "entry_submitted",
+        "tranche_time": now.replace(second=0, microsecond=0).isoformat(),
+        "decision_latency_seconds": round(
+            max(
+                0.0,
+                (
+                    datetime.now()
+                    - now.replace(second=0, microsecond=0, tzinfo=None)
+                ).total_seconds(),
+            ),
+            3,
+        ),
         "side": candidate.side,
         "short_strike": candidate.short_strike,
         "long_strike": candidate.long_strike,
@@ -1475,6 +1551,12 @@ def manage_stops(
         elif spread.stop_confirm_count < config.stop_confirmation_count:
             continue
 
+        breach_started = spread.stop_breach_since
+        actual_confirm_seconds = (
+            (clock - breach_started).total_seconds()
+            if breach_started is not None
+            else 0.0
+        )
         spread.stopped = True
         fill_px = sq.ask
         if not dry and HAS_IB and ib is not None:
@@ -1529,6 +1611,24 @@ def manage_stops(
                 "stop_fill": round(fill_px, 2),
                 "contracts": spread.contracts,
                 "confirm_seconds": live.stop_confirm_seconds,
+                "breach_started": (
+                    breach_started.isoformat() if breach_started is not None else None
+                ),
+                "actual_confirm_seconds": round(actual_confirm_seconds, 3),
+                "trigger_excess": round(max(0.0, sq.ask - spread.stop_price), 4),
+                "trigger_excess_dollars": round(
+                    max(0.0, sq.ask - spread.stop_price)
+                    * spread.contracts
+                    * config.multiplier,
+                    2,
+                ),
+                "fill_excess": round(max(0.0, fill_px - spread.stop_price), 4),
+                "fill_excess_dollars": round(
+                    max(0.0, fill_px - spread.stop_price)
+                    * spread.contracts
+                    * config.multiplier,
+                    2,
+                ),
                 "condor_id": spread.condor_id,
                 "dry": dry,
             },
@@ -1809,6 +1909,10 @@ def write_session_snapshot(today: str, live: LiveConfig, config: StrategyConfig,
     (day_dir / "config.json").write_text(
         json.dumps(snapshot, indent=2, default=str), encoding="utf-8"
     )
+    # ``config.json`` is the latest resolved state; the append-only history
+    # preserves restarts and intraday size/config changes for as-run replay.
+    with (day_dir / "config_history.jsonl").open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(snapshot, default=str) + "\n")
 
 
 # --------------------------------------------------------------------------- #
@@ -1973,6 +2077,8 @@ def _process_tranche(
             max_open_contracts=live.max_open_contracts,
             max_open_per_side=live.max_open_per_side,
             max_open_same_strike=live.max_open_same_strike,
+            max_open_side_cluster=live.max_open_side_cluster,
+            side_cluster_points=live.side_cluster_points,
         )
         if cap_reason:
             cand.status = "blocked"
@@ -2107,6 +2213,8 @@ def _process_tranche(
                         max_open_contracts=live.max_open_contracts,
                         max_open_per_side=live.max_open_per_side,
                         max_open_same_strike=live.max_open_same_strike,
+                        max_open_side_cluster=live.max_open_side_cluster,
+                        side_cluster_points=live.side_cluster_points,
                     )
             if pair_contracts <= 0:
                 pair_reason = pair_reason or "risk_blocked_size_cap"
@@ -2627,6 +2735,53 @@ def run(live: LiveConfig = ACTIVE) -> None:
                             )
                 quotes, signal = provider.fetch(now, at_tranche=at_tranche)
                 last_quotes = list(quotes)
+
+                if (
+                    ib_provider is not None
+                    and ib_provider.last_signal_block_reason == "stale_underlying"
+                    and not entries_halted
+                ):
+                    entries_halted = True
+                    active_pending = pending_entry
+                    cancel_pending_entry(
+                        ib, active_pending, today,
+                        reason="stale_underlying", dry=dry,
+                    )
+                    pending_entry = None
+                    if active_pending is not None and native_stops_enabled(live):
+                        place_or_replace_native_stop_for_short(
+                            ib,
+                            active_pending.candidate,
+                            open_spreads,
+                            today,
+                            dry=dry,
+                            live=live,
+                            config=config,
+                            reason="stale_underlying",
+                        )
+                    spot_age = ib_provider._stream.spot_age_seconds()
+                    print(
+                        f"[{now.isoformat()}] HALT new entries "
+                        f"(SPX stream stale for {spot_age:.1f}s)."
+                    )
+                    log_event(today, {
+                        "event": "halt_entries",
+                        "reason": "stale_underlying",
+                        "spot_age_seconds": round(spot_age, 3),
+                        "threshold_seconds": live.stale_spot_halt_seconds,
+                    }, live=live)
+                elif (
+                    ib_provider is not None
+                    and at_tranche
+                    and ib_provider.last_signal_block_reason
+                ):
+                    reason = ib_provider.last_signal_block_reason
+                    print(f"[{now.isoformat()}] SKIP tranche ({reason}).")
+                    log_event(today, {
+                        "event": "signal_blocked",
+                        "reason": reason,
+                        "tranche_time": now.replace(second=0, microsecond=0).isoformat(),
+                    }, live=live)
 
                 pending_entry = enforce_native_stop_disarm_budget(
                     ib,

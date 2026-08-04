@@ -25,6 +25,8 @@ class SessionFeatureState:
     first_minutes: Optional[float] = None
     previous_spot: Optional[float] = None
     spot_history: List[float] = field(default_factory=list)
+    last_sample_minute: Optional[str] = None
+    last_raw_features: Dict[str, float] = field(default_factory=dict)
 
     def to_dict(self) -> dict:
         return {
@@ -33,6 +35,8 @@ class SessionFeatureState:
             "previous_spot": self.previous_spot,
             # Cap history so mid-day restarts stay cheap to serialize.
             "spot_history": list(self.spot_history[-390:]),
+            "last_sample_minute": self.last_sample_minute,
+            "last_raw_features": dict(self.last_raw_features),
         }
 
     @classmethod
@@ -45,6 +49,11 @@ class SessionFeatureState:
             first_minutes=payload.get("first_minutes"),
             previous_spot=payload.get("previous_spot"),
             spot_history=[float(x) for x in hist if x is not None],
+            last_sample_minute=payload.get("last_sample_minute"),
+            last_raw_features={
+                str(k): float(v)
+                for k, v in (payload.get("last_raw_features") or {}).items()
+            },
         )
 
 
@@ -166,6 +175,41 @@ def compute_raw_features(
     }
 
 
+def compute_raw_features_once_per_minute(
+    quotes: Sequence[OptionQuote],
+    spot: float,
+    ts: datetime,
+    state: SessionFeatureState,
+    next_expiry_quotes: Optional[Sequence[OptionQuote]] = None,
+) -> Dict[str, float]:
+    """Advance state on the same one-minute clock used by the backtest.
+
+    The executor polls sub-second near stops.  Those reads must not become
+    hundreds of synthetic observations or redefine ``previous_spot``.  The
+    first valid quote set in each minute is canonical and subsequent polls
+    receive a copy of the cached raw features.
+    """
+    sample_ts = ts.replace(second=0, microsecond=0, tzinfo=None)
+    minute = sample_ts.isoformat(timespec="minutes")
+    if state.last_sample_minute == minute and state.last_raw_features:
+        return dict(state.last_raw_features)
+
+    before = len(state.spot_history)
+    raw = compute_raw_features(
+        quotes,
+        spot,
+        sample_ts,
+        state,
+        next_expiry_quotes=next_expiry_quotes,
+    )
+    # An empty/unmarkable chain does not consume the minute; a later warm quote
+    # may still establish the canonical observation.
+    if len(state.spot_history) > before:
+        state.last_sample_minute = minute
+        state.last_raw_features = dict(raw)
+    return raw
+
+
 def zscore_raw_features(raw: Dict[str, float], baselines: dict, ts: datetime) -> Dict[str, float]:
     """Apply minute-of-day (fallback global) z-scores — same as ``transform_rows``."""
     key = minute_key(ts.isoformat())
@@ -190,6 +234,22 @@ def raw_to_signal_snapshot(
         trend_score=zscored["trend_score"],
         realized_vs_implied_z=zscored["realized_vs_implied_z"],
     )
+
+
+def signal_features_are_sane(
+    signal: SignalSnapshot, *, max_abs_z: float,
+) -> bool:
+    """Reject non-finite or implausibly extreme vendor-derived z-scores."""
+    if max_abs_z <= 0:
+        return True
+    values = (
+        signal.straddle_residual_z,
+        signal.skew_z,
+        signal.term_ratio_z,
+        signal.trend_score,
+        signal.realized_vs_implied_z,
+    )
+    return all(math.isfinite(float(value)) and abs(float(value)) <= max_abs_z for value in values)
 
 
 def split_session_quotes(
