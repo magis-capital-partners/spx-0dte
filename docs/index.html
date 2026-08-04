@@ -135,8 +135,13 @@ function SessionNow() {
     if (logRef.current) logRef.current.scrollTop = logRef.current.scrollHeight;
   }, [logs]);
 
-  const src = local || cloud;
-  const usingLocal = !!local;
+  // On github.io, any response from the *viewer's* loopback can look like
+  // "local live" even when it is a hollow/unrelated Status API. Only trust
+  // loopback there when an executor is actually alive; otherwise use cloud.
+  const trustLocal = !!local && (!isHttpsPage || !!local.pid_alive);
+  const usingLocal = trustLocal;
+  const src = trustLocal ? local : (cloud || local);
+  const showConsole = trustLocal;
   const alive = !!(src && src.pid_alive);
   const halted = !!(src && src.entries_halted);
   const flat = !!(src && src.flattened);
@@ -217,7 +222,7 @@ function SessionNow() {
               {" · "}sanitized only (no console)
             </p>
           ) : null}
-          {usingLocal ? (
+          {showConsole ? (
             <div>
               <div className="muted" style={{marginBottom:6, fontSize:11, textTransform:"uppercase"}}>Executor stdout</div>
               <div className="console" ref={logRef}>{logs.length ? logs.join("\n") : "(no stdout yet)"}</div>
