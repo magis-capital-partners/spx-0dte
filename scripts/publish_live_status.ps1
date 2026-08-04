@@ -76,6 +76,27 @@ if (-not $status) {
 & $Git -C $Root commit -m "chore: refresh sanitized live session status"
 if ($LASTEXITCODE -ne 0) { throw "git commit failed (exit $LASTEXITCODE)" }
 
+# Status Publish often races other machines' status commits; rebase then push.
+& $Git -C $Root pull --rebase origin HEAD
+if ($LASTEXITCODE -ne 0) {
+    # Live status JSON conflicts are expected; take our freshly written file.
+    $conflicted = & $Git -C $Root diff --name-only --diff-filter=U
+    if ($conflicted -match "docs/data/live_status.json") {
+        & $Python live/session_status_server.py --write-status
+        if ($LASTEXITCODE -ne 0) { throw "rewrite-status after conflict failed" }
+        & $Git -C $Root add -- "docs/data/live_status.json"
+        $env:GIT_EDITOR = "true"
+        & $Git -C $Root -c core.editor=true rebase --continue
+        if ($LASTEXITCODE -ne 0) {
+            & $Git -C $Root rebase --abort
+            throw "git pull --rebase failed after live_status conflict"
+        }
+    } else {
+        & $Git -C $Root rebase --abort
+        throw "git pull --rebase failed (exit $LASTEXITCODE); conflicts=$conflicted"
+    }
+}
+
 & $Git -C $Root push origin HEAD
 if ($LASTEXITCODE -ne 0) { throw "git push failed (exit $LASTEXITCODE)" }
 
