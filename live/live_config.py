@@ -23,11 +23,11 @@ class LiveConfig:
 
     # --- Deployment sizing -------------------------------------------------- #
     account_equity: float = 500_000.0
-    # Live deployment: two contracts per submitted spread. The per-entry cap
+    # Live deployment: one contract per submitted spread. The per-entry cap
     # prevents time-of-day or elevated-VIX sizing from increasing this.
-    contracts_per_tranche: int = 2
+    contracts_per_tranche: int = 1
     contract_scale: float = 1.0
-    max_contracts_per_tranche: int = 2
+    max_contracts_per_tranche: int = 1
 
     # --- Execution mode ----------------------------------------------------- #
     mode: str = "live"
@@ -107,6 +107,28 @@ class LiveConfig:
     # stop_confirm_seconds=120). Set ≤0 to fall back to poll-count confirmation
     # via StrategyConfig.stop_confirmation_count.
     stop_confirm_seconds: float = 120.0
+    # --- Dynamic stop confirmation (2026-08-04 post-mortem) ------------------ #
+    # 96% of that session's $690 stop drag accrued BEFORE order submission,
+    # inside the flat 120s window. Confirmation time now accrues only while the
+    # short-leg quote is fresh, and severe breaches skip the wait entirely.
+    # Breach time accrues only when the short-leg quote updated within this
+    # window; stale/frozen quotes PAUSE (not reset) the confirmation clock.
+    # 0 disables the freshness gate.
+    stop_quote_max_age_seconds: float = 5.0
+    # Cap on confirmation time credited per loop iteration, so a stalled loop
+    # or silent outage cannot complete a 120s confirmation in one step.
+    stop_confirm_max_step_seconds: float = 10.0
+    # Fast tier: ask >= stop_price × ratio shortens confirmation to
+    # stop_fast_confirm_seconds. 0 disables.
+    stop_fast_confirm_ask_ratio: float = 1.10
+    stop_fast_confirm_seconds: float = 20.0
+    # Immediate tier: ask >= stop_price × ratio executes without confirmation
+    # (with stop_multiple=3.0 and ratio 1.30 this is ~3.9× entry credit,
+    # still inside the 4.5× native STP backstop). 0 disables.
+    stop_immediate_ask_ratio: float = 1.30
+    # Underlying crossing the short strike is a decisive directional breach:
+    # execute immediately instead of confirming.
+    stop_immediate_on_underlying_cross: bool = True
     # Cancel → add → replace native BUY STP on the short leg.
     # Synthetic loop stops remain primary (at strategy 3× after confirm_seconds);
     # native STP is a WIDER disaster backstop if the process dies. Default
@@ -200,6 +222,11 @@ class LiveConfig:
     reconnect_max_seconds: float = 120.0
     reconnect_initial_backoff: float = 2.0
     reconnect_max_backoff: float = 30.0
+    # Upstream connectivity breaker (IB system events 1100/1101/1102): TWS can
+    # lose its connection to IB servers while the local API socket stays up.
+    # Halt new entries immediately on 1100 and pause stop confirmations until
+    # 1101/1102 restores; 1101 additionally forces a market-data resubscribe.
+    use_upstream_health_breaker: bool = True
 
     # --- Next-wave safeties ------------------------------------------------- #
     # Stale-quote halt (entries only; never flatten on stale alone).

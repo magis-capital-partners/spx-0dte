@@ -28,10 +28,10 @@ import sys
 import time as _time
 import uuid
 from dataclasses import asdict, dataclass
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, time as dt_time, timedelta
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
-from typing import Dict, List, Optional, Protocol, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Protocol, Sequence, Tuple
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "simulator"))
@@ -146,6 +146,8 @@ from ib_connection import (  # noqa: E402
     ib_is_connected,
     reconnect_ib,
 )
+from connection_health import ConnectionHealthMonitor  # noqa: E402
+from run_metadata import build_run_metadata  # noqa: E402
 from stale_quotes import StaleQuoteTracker, evaluate_stale_quotes  # noqa: E402
 from slack_notify import maybe_notify_safety_event  # noqa: E402
 from heartbeat import append_risk_snapshot, write_heartbeat  # noqa: E402
@@ -163,6 +165,12 @@ from strategy_profiles import resolve_strategy_config  # noqa: E402
 
 
 LIVE_DIR = ROOT / "data" / "live"
+
+# Feature state (spot history, first straddle) must only advance on regular-
+# session observations. Pre-open polls fed the live realized-vol history with
+# points the backtest baselines never saw, producing degenerate z-scores at
+# the first tranche (2026-08-04: realized_vs_implied_z = -1.29M at 09:32).
+SESSION_OPEN = dt_time(9, 30)
 
 
 def gates_require_signals(config: StrategyConfig) -> bool:
@@ -213,6 +221,10 @@ class OpenSpread:
     stop_order_id: Optional[int] = None
     stop_confirm_count: int = 0
     stop_breach_since: Optional[datetime] = None
+    # Confirmation time accrued on fresh quotes only (see manage_stops).
+    stop_confirmed_seconds: float = 0.0
+    stop_last_breach_eval: Optional[datetime] = None
+    stop_confirm_paused: bool = False
     stopped: bool = False
     closed: bool = False
     stop_fill_price: Optional[float] = None
@@ -280,9 +292,20 @@ def setup_ib_logging(today: str, live: LiveConfig) -> Path:
     return ib_log
 
 
-def register_ib_error_handler(ib: "IB", today: str) -> None:
-    """Structured IB error/warning log at data/live/<date>/ib_errors.jsonl."""
+def register_ib_error_handler(
+    ib: "IB",
+    today: str,
+    *,
+    health: Optional[ConnectionHealthMonitor] = None,
+) -> None:
+    """Structured IB error/warning log at data/live/<date>/ib_errors.jsonl.
+
+    Feeds system connectivity events (1100/1101/1102) into the upstream health
+    monitor and dedupes repeated per-contract console spam (e.g. error 200
+    "no security definition") — every occurrence is still written to jsonl.
+    """
     errors_path = LIVE_DIR / today / "ib_errors.jsonl"
+    printed_contract_errors: set = set()
 
     def _on_error(reqId: int, errorCode: int, errorString: str, contract) -> None:
         record = {
@@ -296,8 +319,15 @@ def register_ib_error_handler(ib: "IB", today: str) -> None:
         errors_path.parent.mkdir(parents=True, exist_ok=True)
         with errors_path.open("a", encoding="utf-8") as handle:
             handle.write(json.dumps(record) + "\n")
+        if health is not None:
+            health.on_ib_error(errorCode)
         if errorCode not in _QUIET_IB_ERROR_CODES:
             label = getattr(contract, "localSymbol", None) or getattr(contract, "symbol", "")
+            if errorCode == 200 and label:
+                dedupe_key = (errorCode, label)
+                if dedupe_key in printed_contract_errors:
+                    return
+                printed_contract_errors.add(dedupe_key)
             print(f"IB error {errorCode} (reqId {reqId}): {errorString}"
                   + (f" [{label}]" if label else ""))
 
@@ -465,6 +495,12 @@ class IBSignalProvider:
     ) -> Optional[SignalSnapshot]:
         if self.baselines is None:
             return SignalSnapshot(timestamp=now, vix=self.session_vix)
+        if now.time() < SESSION_OPEN:
+            # Never let pre-open quotes advance the sampler or feature state:
+            # backtest baselines are built from 09:30+ observations only.
+            self.last_signal_block_reason = "signal_warming"
+            self.last_signal_diagnostics = {"sample_status": "pre_open"}
+            return None
         session = now.date().isoformat()
         zero_q, _ = split_session_quotes(quotes, session)
         self._minute_sampler.observe(now, spot, zero_q)
@@ -510,7 +546,17 @@ class IBSignalProvider:
         if not signal_features_are_sane(
             signal, max_abs_z=self.live.signal_sanity_abs_z,
         ):
+            # Record the discarded values so cold-start/feed anomalies are
+            # auditable without ever reaching candidate selection or tranches.
             self.last_signal_block_reason = "invalid_signal"
+            self.last_signal_diagnostics.update({
+                "discarded_straddle_residual_z": float(signal.straddle_residual_z),
+                "discarded_skew_z": float(signal.skew_z),
+                "discarded_term_ratio_z": float(signal.term_ratio_z),
+                "discarded_trend_score": float(signal.trend_score),
+                "discarded_realized_vs_implied_z": float(signal.realized_vs_implied_z),
+                "sanity_abs_z_limit": float(self.live.signal_sanity_abs_z),
+            })
             return None
         if self.session_vix is not None:
             from dataclasses import replace as dc_replace
@@ -1587,8 +1633,15 @@ def _buy_short_leg_stop(
     short_ask: float,
     live: LiveConfig,
     open_spreads: Sequence[OpenSpread],
-) -> Tuple[bool, float]:
-    """Phase 4: limit at ask + buffer, escalate to MKT if unfilled."""
+    *,
+    decision_at: Optional[datetime] = None,
+) -> Tuple[bool, float, Dict[str, float]]:
+    """Phase 4: limit at ask + buffer, escalate to MKT if unfilled.
+
+    Returns ``(ok, fill_price, timings)`` where timings carry the
+    decision→submission and submission→fill latencies for the trade record.
+    """
+    decision_ts = decision_at or datetime.now()
     # Cancel aggregated native STP on this short before the protective BUY.
     clear_short_leg_backstops(
         ib, candidate, open_spreads, today, dry=False, reason="synthetic_stop",
@@ -1598,23 +1651,75 @@ def _buy_short_leg_stop(
     limit_order = LimitOrder("BUY", spread.contracts, limit_px)
     limit_order.tif = "DAY"
     limit_order.account = live.ib_account
+    submitted_ts = datetime.now()
+    timings: Dict[str, float] = {
+        "decision_to_submission_seconds": round(
+            max(0.0, (submitted_ts - decision_ts).total_seconds()), 3,
+        ),
+    }
     trade = ib.placeOrder(short_opt, limit_order)
     state, reason = _wait_for_order(ib, trade, timeout_sec=live.stop_limit_timeout_seconds)
     if state == "filled":
         fill = float(trade.orderStatus.avgFillPrice or limit_px)
-        return True, fill
+        timings["submission_to_fill_seconds"] = round(
+            max(0.0, (datetime.now() - submitted_ts).total_seconds()), 3,
+        )
+        return True, fill, timings
     if state == "pending":
         ib.cancelOrder(trade.order)
         ib.sleep(0.25)
     print(f"[{datetime.now().isoformat()}] STOP limit unfilled @ {limit_px:.2f} ({reason}) — MKT fallback")
+    timings["escalated_to_market"] = 1.0
     stop_market_order = Order(action="BUY", totalQuantity=spread.contracts, orderType="MKT")
     stop_market_order.account = live.ib_account
     mkt = ib.placeOrder(short_opt, stop_market_order)
     mkt_state, _ = _wait_for_order(ib, mkt, timeout_sec=5.0)
     if mkt_state == "filled":
         fill = float(mkt.orderStatus.avgFillPrice or short_ask)
-        return True, fill
-    return False, short_ask
+        timings["submission_to_fill_seconds"] = round(
+            max(0.0, (datetime.now() - submitted_ts).total_seconds()), 3,
+        )
+        return True, fill, timings
+    return False, short_ask, timings
+
+
+def _reset_stop_confirmation(spread: OpenSpread) -> None:
+    spread.stop_confirm_count = 0
+    spread.stop_breach_since = None
+    spread.stop_confirmed_seconds = 0.0
+    spread.stop_last_breach_eval = None
+    spread.stop_confirm_paused = False
+
+
+def effective_stop_confirm_seconds(
+    *,
+    ask: float,
+    stop_price: float,
+    spot: float,
+    short_type: str,
+    short_strike: float,
+    live: LiveConfig,
+) -> Tuple[float, str]:
+    """Dynamic confirmation window for a breached short-leg stop.
+
+    Minor noise keeps the full ``stop_confirm_seconds`` (backtest parity);
+    a severe premium breach or the underlying crossing the short strike is a
+    decisive move where waiting only buys additional overrun.
+    """
+    base = float(live.stop_confirm_seconds)
+    immediate_ratio = float(getattr(live, "stop_immediate_ask_ratio", 0.0) or 0.0)
+    if immediate_ratio > 0 and stop_price > 0 and ask >= stop_price * immediate_ratio:
+        return 0.0, "severe_breach"
+    if bool(getattr(live, "stop_immediate_on_underlying_cross", False)) and spot > 0:
+        is_call = short_type.upper() in {"C", "CALL"}
+        crossed = spot >= short_strike if is_call else spot <= short_strike
+        if crossed:
+            return 0.0, "underlying_cross"
+    fast_ratio = float(getattr(live, "stop_fast_confirm_ask_ratio", 0.0) or 0.0)
+    if fast_ratio > 0 and stop_price > 0 and ask >= stop_price * fast_ratio:
+        fast = float(getattr(live, "stop_fast_confirm_seconds", base) or base)
+        return min(base, fast), "fast_breach"
+    return base, "standard"
 
 
 def manage_stops(
@@ -1627,70 +1732,144 @@ def manage_stops(
     live: LiveConfig,
     *,
     now: Optional[datetime] = None,
+    quote_age_fn=None,
+    spot: float = 0.0,
+    connection_ok: bool = True,
 ) -> List[OpenSpread]:
-    """Short-leg stop with time (or poll-count) confirmation; limit→MKT.
+    """Short-leg stop with freshness-gated, dynamic confirmation; limit→MKT.
 
-    Default live.stop_confirm_seconds=120 mirrors backtest 2×1-minute bars.
+    Confirmation time accrues on ``stop_confirmed_seconds`` only while the
+    short-leg quote is fresh (``quote_age_fn`` within
+    ``live.stop_quote_max_age_seconds``) and the upstream connection is
+    healthy; stale marks or a TWS outage PAUSE the clock instead of letting it
+    run against frozen prices (2026-08-04: timers advanced through seven
+    silent 1100 disconnections). Each loop step credits at most
+    ``live.stop_confirm_max_step_seconds`` so a stalled loop cannot complete a
+    confirmation in one jump.
+
+    The confirmation window itself is dynamic (``effective_stop_confirm_seconds``):
+    120s for minor noise, a short window for a fast premium breach, and
+    immediate execution for severe breaches or an underlying strike crossing.
     When stop_confirm_seconds ≤ 0, falls back to config.stop_confirmation_count.
     """
     if not config.use_short_leg_stops or not quotes:
         return []
     clock = now or datetime.now()
     lookup = {(q.option_type, q.strike): q for q in quotes}
+    max_quote_age = float(getattr(live, "stop_quote_max_age_seconds", 0.0) or 0.0)
+    max_step = float(getattr(live, "stop_confirm_max_step_seconds", 0.0) or 0.0)
     newly_stopped: List[OpenSpread] = []
     for spread in open_spreads:
         if spread.stopped or spread.closed:
             continue
         sq = lookup.get((spread.candidate.short_type, spread.candidate.short_strike))
         if sq is None or sq.ask <= 0:
-            spread.stop_confirm_count = 0
-            spread.stop_breach_since = None
+            _reset_stop_confirmation(spread)
             continue
-        if sq.ask >= spread.stop_price:
-            if spread.stop_breach_since is None:
-                spread.stop_breach_since = clock
-            spread.stop_confirm_count += 1
-        else:
-            spread.stop_confirm_count = 0
-            spread.stop_breach_since = None
+        if sq.ask < spread.stop_price:
+            _reset_stop_confirmation(spread)
             continue
 
-        if live.stop_confirm_seconds > 0:
-            breached_for = (clock - spread.stop_breach_since).total_seconds()
-            if breached_for < live.stop_confirm_seconds:
+        # --- breached: decide whether this evaluation may advance the clock --
+        quote_age: Optional[float] = None
+        if quote_age_fn is not None:
+            try:
+                quote_age = quote_age_fn(
+                    spread.candidate.short_type, spread.candidate.short_strike,
+                )
+            except Exception:
+                quote_age = None
+        quote_fresh = (
+            max_quote_age <= 0
+            or quote_age_fn is None
+            or (quote_age is not None and quote_age <= max_quote_age)
+        )
+        evaluable = connection_ok and quote_fresh
+
+        if spread.stop_breach_since is None:
+            spread.stop_breach_since = clock
+            spread.stop_confirmed_seconds = 0.0
+            spread.stop_last_breach_eval = None
+        spread.stop_confirm_count += 1
+
+        if not evaluable:
+            # Pause: keep accrued confirmation, stop the clock, never fire
+            # against a stale mark or during an upstream outage.
+            spread.stop_last_breach_eval = None
+            if not spread.stop_confirm_paused:
+                spread.stop_confirm_paused = True
+                log_event(today, {
+                    "event": "stop_confirm_paused",
+                    "side": spread.candidate.side,
+                    "short_strike": spread.candidate.short_strike,
+                    "reason": "connection_unhealthy" if not connection_ok else "stale_quote",
+                    "quote_age_seconds": (
+                        round(quote_age, 3) if quote_age is not None else None
+                    ),
+                    "confirmed_seconds": round(spread.stop_confirmed_seconds, 3),
+                }, live=live)
+            continue
+        if spread.stop_confirm_paused:
+            spread.stop_confirm_paused = False
+            log_event(today, {
+                "event": "stop_confirm_resumed",
+                "side": spread.candidate.side,
+                "short_strike": spread.candidate.short_strike,
+                "confirmed_seconds": round(spread.stop_confirmed_seconds, 3),
+            }, live=live)
+
+        if spread.stop_last_breach_eval is not None:
+            step = (clock - spread.stop_last_breach_eval).total_seconds()
+            if max_step > 0:
+                step = min(step, max_step)
+            spread.stop_confirmed_seconds += max(step, 0.0)
+        spread.stop_last_breach_eval = clock
+
+        effective_spot = spot if spot > 0 else float(sq.underlying_price or 0.0)
+        confirm_needed, confirm_mode = effective_stop_confirm_seconds(
+            ask=sq.ask,
+            stop_price=spread.stop_price,
+            spot=effective_spot,
+            short_type=spread.candidate.short_type,
+            short_strike=float(spread.candidate.short_strike),
+            live=live,
+        )
+        if confirm_needed > 0 or live.stop_confirm_seconds > 0:
+            if spread.stop_confirmed_seconds < confirm_needed:
                 continue
-        elif spread.stop_confirm_count < config.stop_confirmation_count:
+        elif (
+            confirm_mode in ("standard", "fast_breach")
+            and spread.stop_confirm_count < config.stop_confirmation_count
+        ):
+            # Poll-count fallback (stop_confirm_seconds <= 0); immediate
+            # modes (severe breach / underlying cross) still fire at once.
             continue
 
         breach_started = spread.stop_breach_since
-        actual_confirm_seconds = (
-            (clock - breach_started).total_seconds()
-            if breach_started is not None
-            else 0.0
-        )
+        actual_confirm_seconds = spread.stop_confirmed_seconds
         spread.stopped = True
         fill_px = sq.ask
+        stop_timings: Dict[str, float] = {}
         if not dry and HAS_IB and ib is not None:
             net_before = (
                 _short_leg_ib_net(ib, spread.candidate, today, live)
                 if live.confirm_stop_against_ib
                 else None
             )
-            ok, fill_px = _buy_short_leg_stop(
+            ok, fill_px, stop_timings = _buy_short_leg_stop(
                 ib, spread, spread.candidate, today, sq.ask, live, open_spreads,
+                decision_at=clock,
             )
             if not ok:
                 spread.stopped = False
-                spread.stop_confirm_count = 0
-                spread.stop_breach_since = None
+                _reset_stop_confirmation(spread)
                 continue
             if live.confirm_stop_against_ib and net_before is not None:
                 net_after = _short_leg_ib_net(ib, spread.candidate, today, live)
                 # Short nets are negative; covering should raise net by ~contracts.
                 if net_after is None or net_after < net_before + int(spread.contracts):
                     spread.stopped = False
-                    spread.stop_confirm_count = 0
-                    spread.stop_breach_since = None
+                    _reset_stop_confirmation(spread)
                     log_event(today, {
                         "event": "stop_unconfirmed",
                         "side": spread.candidate.side,
@@ -1709,6 +1888,7 @@ def manage_stops(
                     continue
         spread.stop_fill_price = fill_px
         spread.stop_breach_since = None
+        spread.stop_last_breach_eval = None
         newly_stopped.append(spread)
         log_event(
             today,
@@ -1722,6 +1902,8 @@ def manage_stops(
                 "stop_fill": round(fill_px, 2),
                 "contracts": spread.contracts,
                 "confirm_seconds": live.stop_confirm_seconds,
+                "confirm_mode": confirm_mode,
+                "confirm_needed_seconds": round(confirm_needed, 3),
                 "breach_started": (
                     breach_started.isoformat() if breach_started is not None else None
                 ),
@@ -1740,6 +1922,7 @@ def manage_stops(
                     * config.multiplier,
                     2,
                 ),
+                **stop_timings,
                 "condor_id": spread.condor_id,
                 "dry": dry,
             },
@@ -1747,7 +1930,8 @@ def manage_stops(
         )
         print(
             f"[{datetime.now().isoformat()}] STOP short {spread.candidate.short_strike} "
-            f"ask={sq.ask:.2f}>={spread.stop_price:.2f} fill={fill_px:.2f} (keep long wing)"
+            f"ask={sq.ask:.2f}>={spread.stop_price:.2f} fill={fill_px:.2f} "
+            f"mode={confirm_mode} (keep long wing)"
             f"{' (dry)' if dry else ''}"
         )
 
@@ -1906,11 +2090,21 @@ def flatten_all(
 # --------------------------------------------------------------------------- #
 # Logging / session snapshot
 # --------------------------------------------------------------------------- #
+# Per-process run identity (git commit, config hash, run id, pid) injected
+# into every structured record so intraday restarts are auditable.
+_RUN_METADATA: dict = {}
+
+
+def set_run_metadata(metadata: dict) -> None:
+    _RUN_METADATA.clear()
+    _RUN_METADATA.update(metadata)
+
+
 def log_event(today: str, event: dict, *, live: Optional[LiveConfig] = None) -> None:
     day_dir = LIVE_DIR / today
     day_dir.mkdir(parents=True, exist_ok=True)
     path = day_dir / "fills.jsonl"
-    event = {"ts": datetime.now().isoformat(), **event}
+    event = {"ts": datetime.now().isoformat(), **event, **_RUN_METADATA}
     with path.open("a", encoding="utf-8") as handle:
         handle.write(json.dumps(event) + "\n")
     cfg = live or ACTIVE
@@ -1978,7 +2172,7 @@ def log_tranche(today: str, record: dict) -> None:
     day_dir = LIVE_DIR / today
     day_dir.mkdir(parents=True, exist_ok=True)
     path = day_dir / "tranches.jsonl"
-    payload = {"ts": datetime.now().isoformat(), **record}
+    payload = {"ts": datetime.now().isoformat(), **record, **_RUN_METADATA}
     with path.open("a", encoding="utf-8") as handle:
         handle.write(json.dumps(payload, default=str) + "\n")
 
@@ -2013,6 +2207,7 @@ def write_session_snapshot(today: str, live: LiveConfig, config: StrategyConfig,
     snapshot = {
         "date": today,
         "generated_at": datetime.now().isoformat(),
+        **_RUN_METADATA,
         "live_config": asdict(live),
         "sizing_scheme": sizing_scheme,
         "strategy_config": asdict(config),
@@ -2036,13 +2231,25 @@ def _tranche_base_contracts(
     *,
     vix_sizing_multiplier: float = 1.0,
 ) -> int:
-    """Flat baseline, optionally reshaped by time-of-day and VIX elevated band."""
-    base = config.baseline_contracts
+    """Flat baseline, optionally reshaped by time-of-day and VIX elevated band.
+
+    Scale factors are combined and rounded once, and any positive product is
+    floored at one contract: a small baseline must never be silently rounded
+    to zero by a late-day decay multiplier (2026-08-04: ``round(1 × 0.45) = 0``
+    suppressed all afternoon entries). Only an explicit 0.0 schedule
+    multiplier (or a zero baseline) halts entries; per-entry hard caps such as
+    ``max_contracts_per_tranche`` still bound the upside.
+    """
+    base = int(config.baseline_contracts)
+    if base <= 0:
+        return 0
+    multiplier = 1.0
     if sizing_schedule:
-        base = round(base * schedule_multiplier(now.time(), sizing_schedule))
-    if vix_sizing_multiplier != 1.0:
-        base = round(base * vix_sizing_multiplier)
-    return max(0, base)
+        multiplier *= schedule_multiplier(now.time(), sizing_schedule)
+    multiplier *= vix_sizing_multiplier
+    if multiplier <= 0:
+        return 0
+    return max(1, round(base * multiplier))
 
 
 def _process_tranche(
@@ -2399,6 +2606,7 @@ def run(live: LiveConfig = ACTIVE) -> None:
 
     config, sizing_schedule = resolve_strategy_config(live)
     config = apply_live_risk_overlays(config, live)
+    set_run_metadata(build_run_metadata(asdict(live), asdict(config)))
     today_date = datetime.now().date()
     today = today_date.isoformat()
     dry = live.mode == "dry"
@@ -2488,6 +2696,7 @@ def run(live: LiveConfig = ACTIVE) -> None:
     last_quotes: List[OptionQuote] = []
     last_marked_pnl: float = 0.0
     connect_ib = (live.mode in ("paper", "live")) or (dry and live.dry_with_ib)
+    connection_health = ConnectionHealthMonitor()
 
     try:
         if not connect_ib:
@@ -2508,7 +2717,7 @@ def run(live: LiveConfig = ACTIVE) -> None:
             ib_log = setup_ib_logging(today, live)
             port = live.port or (7497 if live.mode == "paper" else 7496)
             ib.connect(live.host, port, clientId=live.client_id)
-            register_ib_error_handler(ib, today)
+            register_ib_error_handler(ib, today, health=connection_health)
             print(f"IB connected (port {port}, market_data_type={live.market_data_type} requested)")
             print(f"IB messages -> {ib_log} and data/live/{today}/ib_errors.jsonl")
             print(f"Tranche diagnostics -> data/live/{today}/tranches.jsonl")
@@ -2722,6 +2931,7 @@ def run(live: LiveConfig = ACTIVE) -> None:
         last_account_guard_at = datetime.now() - timedelta(seconds=live.account_guard_poll_seconds)
         mark_bad_since: Optional[datetime] = None
         disconnect_halt = False
+        upstream_halt = False
         stale_tracker = StaleQuoteTracker()
         last_heartbeat_at = datetime.now() - timedelta(seconds=live.heartbeat_seconds)
         last_risk_snapshot_at = datetime.now() - timedelta(seconds=live.risk_snapshot_seconds)
@@ -2823,7 +3033,7 @@ def run(live: LiveConfig = ACTIVE) -> None:
                         if open_risk:
                             _trigger_flatten("reconnect_failed", last_marked_pnl)
                         raise SystemExit("IB reconnect failed — exiting")
-                    register_ib_error_handler(ib, today)
+                    register_ib_error_handler(ib, today, health=connection_health)
                     # Re-check book vs IB after reconnect (fail loud on residual).
                     recovered_chk = recover_session_book(
                         today=today,
@@ -2863,6 +3073,99 @@ def run(live: LiveConfig = ACTIVE) -> None:
                     disconnect_halt = False
                     entries_halted = halted_before_disconnect or flattened
                     continue
+
+                # --- Phase C2: upstream connectivity breaker (IB 1100/1101/1102) --
+                # TWS can lose its link to IB servers while the local API socket
+                # stays connected: quotes freeze but ib.isConnected() is True.
+                # Halt entries immediately; stop confirmations pause via the
+                # connection_ok flag passed to manage_stops below.
+                if (
+                    getattr(live, "use_upstream_health_breaker", True)
+                    and connect_ib
+                    and ib is not None
+                    and not dry
+                ):
+                    for transition in connection_health.consume_transitions():
+                        if transition.kind == "upstream_lost":
+                            # Gate entries via upstream_halt only; never mutate
+                            # entries_halted so PnL/account/mark halts raised
+                            # during the outage survive the restore.
+                            upstream_halt = True
+                            print(
+                                f"[{now.isoformat()}] IB UPSTREAM LOST (error "
+                                f"{transition.code}) — halting entries, pausing "
+                                "stop confirmations until connectivity restores."
+                            )
+                            log_event(today, {
+                                "event": "halt_entries",
+                                "reason": "ib_upstream_lost",
+                                "ib_error_code": transition.code,
+                            }, live=live)
+                            lost_pending = pending_entry
+                            cancel_pending_entry(
+                                ib, lost_pending, today,
+                                reason="ib_upstream_lost", dry=dry,
+                            )
+                            pending_entry = None
+                            if lost_pending is not None and native_stops_enabled(live):
+                                # Best-effort re-arm; verify_native_stops
+                                # replaces it post-restore if this fails.
+                                place_or_replace_native_stop_for_short(
+                                    ib,
+                                    lost_pending.candidate,
+                                    open_spreads,
+                                    today,
+                                    dry=dry,
+                                    live=live,
+                                    config=config,
+                                    reason="ib_upstream_lost",
+                                )
+                        elif transition.kind == "upstream_restored":
+                            print(
+                                f"[{now.isoformat()}] IB upstream restored (error "
+                                f"{transition.code}"
+                                + (", market data lost — resubscribing)"
+                                   if transition.resubscribe_required else ")")
+                            )
+                            log_event(today, {
+                                "event": "ib_upstream_restored",
+                                "ib_error_code": transition.code,
+                                "resubscribe_required": transition.resubscribe_required,
+                                "outage_was_halting": upstream_halt,
+                            }, live=live)
+                            if (
+                                transition.resubscribe_required
+                                and ib_provider is not None
+                            ):
+                                # 1101: subscriptions are gone; rebuild streams
+                                # and require fresh quotes on every open leg.
+                                try:
+                                    ib_provider.shutdown()
+                                except Exception:
+                                    pass
+                                ib_provider.start()
+                                ib_provider.set_open_spread_legs(open_spreads)
+                                resub_gaps = ib_provider.wait_for_open_spread_quotes(
+                                    live.recovery_quote_warmup_seconds
+                                )
+                                if resub_gaps:
+                                    print(
+                                        f"[{datetime.now().isoformat()}] RESUBSCRIBE "
+                                        "QUOTE WARN: no fresh markable quote for "
+                                        + ", ".join(
+                                            f"{right}{strike:g}"
+                                            for right, strike in resub_gaps
+                                        )
+                                    )
+                                connection_health.mark_resubscribed()
+                            if upstream_halt:
+                                # Clear only the upstream-induced entry gate;
+                                # PnL/account/mark/stale halts are untouched.
+                                upstream_halt = False
+                                log_event(today, {
+                                    "event": "governor_clear",
+                                    "reason": "ib_upstream_restored",
+                                }, live=live)
 
                 at_tranche = should_fire_tranche(now, config, traded_tranches)
                 if ib_provider is not None:
@@ -3051,8 +3354,16 @@ def run(live: LiveConfig = ACTIVE) -> None:
                         )
                     last_native_stop_verify_at = now
 
+                stop_quote_age_fn = None
+                stop_spot = 0.0
+                if ib_provider is not None:
+                    stop_quote_age_fn = ib_provider._stream.quote_age_seconds
+                    stop_spot = ib_provider._stream.spot()
                 newly_stopped = manage_stops(
                     ib, open_spreads, quotes, config, today, dry, live, now=now,
+                    quote_age_fn=stop_quote_age_fn,
+                    spot=stop_spot,
+                    connection_ok=not connection_health.upstream_down,
                 )
                 if newly_stopped:
                     apply_side_stop_cooldowns(
@@ -3111,9 +3422,14 @@ def run(live: LiveConfig = ACTIVE) -> None:
                         today,
                         open_count=open_n,
                         marked_pnl=last_marked_pnl,
-                        entries_halted=entries_halted,
+                        entries_halted=entries_halted or upstream_halt,
                         flattened=flattened,
-                        extra={"risk": risk, "execution_type": session_execution_type},
+                        extra={
+                            "risk": risk,
+                            "execution_type": session_execution_type,
+                            "connection_health": connection_health.snapshot(),
+                            **_RUN_METADATA,
+                        },
                     )
                     if (now - last_risk_snapshot_at).total_seconds() >= live.risk_snapshot_seconds:
                         last_risk_snapshot_at = now
@@ -3238,7 +3554,7 @@ def run(live: LiveConfig = ACTIVE) -> None:
                         live=live,
                         ib=ib,
                         dry=dry,
-                        entries_halted=entries_halted or disconnect_halt,
+                        entries_halted=entries_halted or disconnect_halt or upstream_halt,
                         open_spreads=open_spreads,
                         gross_credit_sold=gross_credit_sold,
                         daily_credit_cap=daily_credit_cap,

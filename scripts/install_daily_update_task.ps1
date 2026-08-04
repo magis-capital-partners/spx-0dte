@@ -7,18 +7,18 @@
 #
 # Prerequisites:
 #   1. Set THETADATA_API_KEY as a User environment variable (this script can do it).
-#   2. PC should be on / awake around the scheduled time (default 6:30 PM ET weekdays).
+#   2. PC should be on / awake around the scheduled time (default 4:05 PM ET weekdays).
 #   3. gh CLI authenticated if you want -Deploy to push + trigger Pages.
 #
 # Usage:
 #   .\scripts\install_daily_update_task.ps1
 #   .\scripts\install_daily_update_task.ps1 -ApiKey "td1_..." -Deploy
-#   .\scripts\install_daily_update_task.ps1 -Time "18:30" -Deploy
+#   .\scripts\install_daily_update_task.ps1 -Time "16:05" -Deploy
 #   .\scripts\install_daily_update_task.ps1 -Uninstall
 
 param(
     [string]$TaskName = "SPX-0DTE Daily Data Update",
-    [string]$Time = "18:30",
+    [string]$Time = "16:05",
     [string]$ApiKey = "",
     [switch]$Deploy,
     [switch]$Uninstall,
@@ -63,7 +63,9 @@ $action = New-ScheduledTaskAction `
     -Argument ($argList -join " ") `
     -WorkingDirectory $Root
 
-# Weekdays at $Time (local machine time). ThetaData same-day history is usually ready after the close.
+# Weekdays at $Time (local machine time). The daily workflow begins shortly
+# after the cash close so the refreshed backtest and dashboard can publish
+# during the post-close window.
 $trigger = New-ScheduledTaskTrigger -Weekly -DaysOfWeek Monday,Tuesday,Wednesday,Thursday,Friday -At $Time
 
 $settings = New-ScheduledTaskSettingsSet `

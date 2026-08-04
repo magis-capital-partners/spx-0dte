@@ -26,7 +26,9 @@ def test_next_tranche_after_now() -> None:
 def test_adaptive_idle_sleeps_toward_tranche() -> None:
     live = LiveConfig(use_adaptive_polling=True, poll_seconds_max_idle=30.0, pre_tranche_wake_seconds=2.0)
     config = build_p3_trend_skew_config()
-    now = datetime(2026, 7, 7, 9, 40, 0)
+    # 20s past the minute: outside the deterministic signal-sampling window,
+    # which legitimately caps sleep at signal_sample_poll_seconds (0.25s).
+    now = datetime(2026, 7, 7, 9, 40, 20)
     sleep_for = adaptive_sleep_seconds(live=live, now=now, open_spreads=[], quotes=[], config=config)
     secs = seconds_until_next_tranche(now, config)
     assert secs is not None

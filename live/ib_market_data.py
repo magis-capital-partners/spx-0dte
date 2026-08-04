@@ -160,6 +160,14 @@ class IBStreamingMarketData:
         self._expiry_0dte: Optional[str] = None
         self._expiry_next: Optional[str] = None
         self._listed_strikes: List[float] = []
+        # Expiration-aware strike qualification: reqSecDefOptParams returns the
+        # union of strikes across ALL expirations, so filtering against it lets
+        # strikes that are not listed on today's 0DTE expiry through to
+        # qualifyContracts (2026-08-04: 56× IB error 200). One contract-details
+        # request per expiry yields the true listed set.
+        self._expiry_strikes: Dict[str, List[float]] = {}
+        # Negative cache: specs IB refused to qualify are never re-requested.
+        self._unqualified_specs: set[Tuple[str, str, float]] = set()
         # Exact 0DTE legs belonging to open/recovered positions. These always
         # take priority over candidate-scanning lines and survive rebalances.
         self._required_0dte_legs: set[Tuple[str, float]] = set()
@@ -354,17 +362,28 @@ class IBStreamingMarketData:
         spot = self.spot()
         if spot <= 0:
             return
-        listed = sorted(self._spxw.strikes) if self._spxw else []
+        # Use the NEXT expiry's own listed strikes — the 0DTE/union grid can
+        # include strikes that do not exist on the next expiry (IB error 200).
+        listed = self._strikes_for_expiry(self._expiry_next)
         if not listed:
             return
+        if not hasattr(self, "_unqualified_specs"):
+            self._unqualified_specs = set()
         atm = min(listed, key=lambda s: abs(s - spot))
         contracts = []
         for right in ("P", "C"):
+            if (self._expiry_next, right, float(atm)) in self._unqualified_specs:
+                return
             contracts.append(
                 Option("SPX", self._expiry_next, atm, right, "CBOE", tradingClass="SPXW")
             )
         self.ib.qualifyContracts(*contracts)
         qualified = [c for c in contracts if c.conId]
+        for contract in contracts:
+            if not contract.conId:
+                self._unqualified_specs.add(
+                    (self._expiry_next, str(contract.right), float(contract.strike))
+                )
         if len(qualified) != 2:
             return
         expiry_iso = _expiry_iso(self._expiry_next)
@@ -534,11 +553,51 @@ class IBStreamingMarketData:
         future = sorted(e for e in spxw.expirations if e >= today)
         return future[0] if future else None
 
+    def _strikes_for_expiry(self, expiry: Optional[str]) -> List[float]:
+        """True listed strike set for one expiry (cached, single API call).
+
+        Falls back to the coarse ``reqSecDefOptParams`` union when the
+        contract-details request fails, in which case the negative cache in
+        ``_subscribe_strikes`` still prevents repeated error-200 churn.
+        """
+        if not expiry:
+            return []
+        # Lazy init keeps partially-constructed streams (tests, recovery
+        # tooling built via object.__new__) working.
+        if not hasattr(self, "_expiry_strikes"):
+            self._expiry_strikes = {}
+        cached = self._expiry_strikes.get(expiry)
+        if cached is not None:
+            return cached
+        strikes: List[float] = []
+        if HAS_IB:
+            try:
+                details = self.ib.reqContractDetails(
+                    Option("SPX", expiry, 0, "", "CBOE", tradingClass="SPXW")
+                )
+                strikes = sorted({
+                    float(cd.contract.strike)
+                    for cd in details
+                    if cd.contract is not None and cd.contract.strike
+                })
+            except Exception:
+                strikes = []
+        if not strikes and self._spxw is not None:
+            strikes = sorted(float(s) for s in self._spxw.strikes)
+        self._expiry_strikes[expiry] = strikes
+        print(
+            f"[market] expiry {expiry}: {len(strikes)} listed strike(s) cached "
+            "for qualification"
+        )
+        return strikes
+
     def _select_strikes(self, spot: float) -> List[float]:
         max_strikes = max(8, self.live.max_chain_lines // 2)
         lo = spot - self.live.chain_points_below
         hi = spot + self.live.chain_points_above
-        listed = sorted(s for s in self._spxw.strikes if lo <= s <= hi)
+        listed = sorted(
+            s for s in self._strikes_for_expiry(self._expiry_0dte) if lo <= s <= hi
+        )
         if not listed:
             return []
 
@@ -687,8 +746,21 @@ class IBStreamingMarketData:
         self._listed_strikes = sorted({strike for _, strike in specs})
         self._anchor_spot = spot
 
+        # Negative cache: never re-request specs IB already refused (error 200).
+        # Required open-position legs always bypass it — a transient qualify
+        # failure must never permanently blind us to live risk.
+        if not hasattr(self, "_unqualified_specs"):
+            self._unqualified_specs = set()
+        skipped_negative = 0
         new_contracts: List[Contract] = []
         for right, strike in specs:
+            required = (right, float(strike)) in self._required_0dte_legs
+            if (
+                not required
+                and (self._expiry_0dte, right, float(strike)) in self._unqualified_specs
+            ):
+                skipped_negative += 1
+                continue
             new_contracts.append(
                 Option(
                     "SPX",
@@ -699,8 +771,17 @@ class IBStreamingMarketData:
                     tradingClass="SPXW",
                 )
             )
+        if skipped_negative:
+            print(
+                f"[market] skipped {skipped_negative} known-unqualified spec(s) "
+                "(negative cache)"
+            )
         self.ib.qualifyContracts(*new_contracts)
         qualified = [c for c in new_contracts if c.conId]
+        for contract in new_contracts:
+            spec = (str(contract.right), float(contract.strike))
+            if not contract.conId and spec not in self._required_0dte_legs:
+                self._unqualified_specs.add((self._expiry_0dte, *spec))
         qualified_specs = {
             (str(contract.right), float(contract.strike))
             for contract in qualified
