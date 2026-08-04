@@ -36,6 +36,15 @@ class CachedQuote:
     updated_at: float = 0.0
 
 
+@dataclass(frozen=True)
+class FeatureInputHealth:
+    ok: bool
+    reason: str = ""
+    max_age_seconds: float = math.inf
+    timestamp_dispersion_seconds: float = math.inf
+    quote_count: int = 0
+
+
 def _nearest_listed_strike(listed: Sequence[float], target: float) -> Optional[float]:
     if not listed:
         return None
@@ -442,6 +451,46 @@ class IBStreamingMarketData:
         if cached is None or cached.updated_at <= 0:
             return None
         return _time.time() - cached.updated_at
+
+    def quote_update_time(self, option_type: str, strike: float) -> Optional[float]:
+        cached = self._cache.get((self.expiry_0dte_iso, option_type, float(strike)))
+        return cached.updated_at if cached is not None and cached.updated_at > 0 else None
+
+    def feature_input_health(
+        self,
+        spot: float,
+        *,
+        max_age_seconds: float,
+        max_dispersion_seconds: float,
+    ) -> FeatureInputHealth:
+        """Validate the ATM and 25-delta cross-section used by live alpha."""
+        rows = [
+            (key, quote) for key, quote in self._cache.items()
+            if key[0] == self.expiry_0dte_iso
+            and quote.bid > 0 and quote.ask > quote.bid
+            and quote.delta is not None and math.isfinite(float(quote.delta))
+            and quote.iv is not None and math.isfinite(float(quote.iv)) and quote.iv > 0
+            and quote.updated_at > 0
+        ]
+        selected: List[CachedQuote] = []
+        for option_type in ("CALL", "PUT"):
+            side = [(key, quote) for key, quote in rows if key[1] == option_type]
+            if not side:
+                return FeatureInputHealth(False, "missing_feature_quotes", quote_count=len(selected))
+            selected.append(min(side, key=lambda row: abs(row[0][2] - spot))[1])
+            selected.append(min(side, key=lambda row: abs(abs(float(row[1].delta)) - 0.25))[1])
+        if len({id(row) for row in selected}) < 4:
+            return FeatureInputHealth(False, "missing_feature_quotes", quote_count=len(selected))
+        now = _time.time()
+        ages = [max(0.0, now - row.updated_at) for row in selected]
+        updates = [row.updated_at for row in selected]
+        max_age = max(ages)
+        dispersion = max(updates) - min(updates)
+        if max_age_seconds > 0 and max_age > max_age_seconds:
+            return FeatureInputHealth(False, "stale_feature_quotes", max_age, dispersion, 4)
+        if max_dispersion_seconds > 0 and dispersion > max_dispersion_seconds:
+            return FeatureInputHealth(False, "unsynchronized_feature_quotes", max_age, dispersion, 4)
+        return FeatureInputHealth(True, max_age_seconds=max_age, timestamp_dispersion_seconds=dispersion, quote_count=4)
 
     def refresh_spread_legs(
         self,

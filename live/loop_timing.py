@@ -61,26 +61,46 @@ def adaptive_sleep_seconds(
     config: StrategyConfig,
 ) -> float:
     """Phase 3: fast when at risk, idle until next tranche when flat."""
+    second = now.second + now.microsecond / 1_000_000.0
+    sample_start = max(
+        live.signal_sample_offset_seconds - live.signal_sample_window_seconds,
+        0.0,
+    )
+    sample_deadline = (
+        live.signal_sample_offset_seconds + live.signal_sample_max_wait_seconds
+    )
+    in_sample_window = sample_start <= second <= sample_deadline
+    if in_sample_window:
+        sample_cap = live.signal_sample_poll_seconds
+    elif second < sample_start:
+        sample_cap = max(sample_start - second, live.signal_sample_poll_seconds)
+    else:
+        sample_cap = max(60.0 - second + sample_start, live.signal_sample_poll_seconds)
+
     if not live.use_adaptive_polling:
-        return live.poll_seconds
+        return min(live.poll_seconds, sample_cap)
 
     lookup = {(q.option_type, q.strike): q for q in quotes}
     if any_near_stop(open_spreads, lookup, live):
-        return live.poll_seconds_near_stop
+        return min(live.poll_seconds_near_stop, sample_cap)
 
     active = [s for s in open_spreads if not s.closed]
     if active:
-        return live.poll_seconds_active
+        return min(live.poll_seconds_active, sample_cap)
 
     secs = seconds_until_next_tranche(now, config)
     if secs is None:
-        return live.poll_seconds_max_idle
+        return min(live.poll_seconds_max_idle, sample_cap)
 
     if secs <= live.pre_tranche_wake_seconds:
-        return live.poll_seconds_pre_tranche
+        return min(live.poll_seconds_pre_tranche, sample_cap)
 
     idle = secs - live.pre_tranche_wake_seconds
-    return min(max(idle, live.poll_seconds_pre_tranche), live.poll_seconds_max_idle)
+    return min(
+        max(idle, live.poll_seconds_pre_tranche),
+        live.poll_seconds_max_idle,
+        sample_cap,
+    )
 
 
 def should_fire_tranche(

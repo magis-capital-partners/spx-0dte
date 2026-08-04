@@ -8,6 +8,7 @@ then the same z-score lookup against rolling baselines.
 from __future__ import annotations
 
 import math
+import statistics
 from dataclasses import dataclass, field
 from datetime import datetime, time
 from typing import Dict, List, Optional, Sequence, Tuple
@@ -15,6 +16,96 @@ from typing import Dict, List, Optional, Sequence, Tuple
 from historical_baselines import FEATURES, minute_key, zscore
 from mbh_simulator import OptionQuote, SignalSnapshot
 from rv_feature import atm_iv_from_pair, realized_vs_implied_raw
+
+
+@dataclass(frozen=True)
+class MinuteFeatureSample:
+    timestamp: datetime
+    spot: float
+    quotes: List[OptionQuote]
+    observation_count: int
+
+
+class DeterministicMinuteSampler:
+    """Aggregate a fixed boundary window so alpha is not tied to poll timing."""
+
+    def __init__(
+        self,
+        *,
+        sample_offset_seconds: float = 1.0,
+        sample_window_seconds: float = 1.0,
+        min_observations: int = 2,
+        max_wait_seconds: float = 1.0,
+    ) -> None:
+        self.sample_offset_seconds = max(float(sample_offset_seconds), 0.0)
+        self.sample_window_seconds = max(float(sample_window_seconds), 0.0)
+        self.min_observations = max(int(min_observations), 1)
+        self.max_wait_seconds = max(float(max_wait_seconds), 0.0)
+        self._minute: Optional[datetime] = None
+        self._observations: List[Tuple[float, List[OptionQuote]]] = []
+
+    @staticmethod
+    def _minute_for(ts: datetime) -> datetime:
+        return ts.replace(second=0, microsecond=0, tzinfo=None)
+
+    def _roll(self, now: datetime) -> datetime:
+        minute = self._minute_for(now)
+        if self._minute != minute:
+            self._minute = minute
+            self._observations = []
+        return minute
+
+    def observe(self, now: datetime, spot: float, quotes: Sequence[OptionQuote]) -> None:
+        minute = self._roll(now)
+        elapsed = (now.replace(tzinfo=None) - minute).total_seconds()
+        window_start = max(self.sample_offset_seconds - self.sample_window_seconds, 0.0)
+        if elapsed < window_start:
+            return
+        if elapsed > self.sample_offset_seconds + self.max_wait_seconds:
+            return
+        valid = [q for q in quotes if q.bid > 0 and q.ask > q.bid]
+        if math.isfinite(float(spot)) and spot > 0 and valid:
+            self._observations.append((float(spot), list(valid)))
+
+    def status(self, now: datetime) -> str:
+        minute = self._roll(now)
+        elapsed = (now.replace(tzinfo=None) - minute).total_seconds()
+        count = len(self._observations)
+        if elapsed >= self.sample_offset_seconds and count >= self.min_observations:
+            return "ready"
+        if elapsed >= self.sample_offset_seconds + self.max_wait_seconds:
+            return "ready" if count else "unavailable"
+        return "collecting"
+
+    def aggregate(self, now: datetime) -> Optional[MinuteFeatureSample]:
+        if self.status(now) != "ready" or not self._observations:
+            return None
+        minute = self._minute_for(now)
+        by_key: Dict[Tuple[str, str, float], List[OptionQuote]] = {}
+        for _, quotes in self._observations:
+            for quote in quotes:
+                key = (str(quote.expiry), quote.option_type, float(quote.strike))
+                by_key.setdefault(key, []).append(quote)
+
+        def optional_median(rows: Sequence[OptionQuote], field_name: str) -> Optional[float]:
+            values = [float(value) for row in rows if (value := getattr(row, field_name)) is not None and math.isfinite(float(value))]
+            return statistics.median(values) if values else None
+
+        quotes_out: List[OptionQuote] = []
+        spot = statistics.median(row[0] for row in self._observations)
+        for (expiry, option_type, strike), rows in sorted(by_key.items()):
+            quotes_out.append(OptionQuote(
+                timestamp=minute,
+                expiry=expiry,
+                option_type=option_type,
+                strike=strike,
+                bid=statistics.median(row.bid for row in rows),
+                ask=statistics.median(row.ask for row in rows),
+                delta=optional_median(rows, "delta"),
+                iv=optional_median(rows, "iv"),
+                underlying_price=spot,
+            ))
+        return MinuteFeatureSample(minute, spot, quotes_out, len(self._observations))
 
 
 @dataclass

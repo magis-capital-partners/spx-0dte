@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import sys
+import time
 import unittest
 from datetime import datetime
 from pathlib import Path
@@ -57,6 +58,41 @@ def _stream() -> IBStreamingMarketData:
 
 
 class TrancheMarketDataLatencyTests(unittest.TestCase):
+    def test_feature_health_requires_fresh_synchronized_core_quotes(self) -> None:
+        stream = _stream()
+        now = time.time()
+        stream._cache = {
+            ("2026-08-03", "CALL", 7500.0): CachedQuote(10.0, 10.2, 0.50, 0.20, now - 0.2),
+            ("2026-08-03", "PUT", 7500.0): CachedQuote(9.8, 10.0, -0.50, 0.21, now - 0.3),
+            ("2026-08-03", "CALL", 7525.0): CachedQuote(3.0, 3.1, 0.25, 0.19, now - 0.4),
+            ("2026-08-03", "PUT", 7475.0): CachedQuote(3.1, 3.2, -0.25, 0.22, now - 0.5),
+        }
+        health = stream.feature_input_health(
+            7500.0, max_age_seconds=5.0, max_dispersion_seconds=1.0,
+        )
+        self.assertTrue(health.ok)
+        self.assertLessEqual(health.timestamp_dispersion_seconds, 1.0)
+
+        stream._cache[("2026-08-03", "PUT", 7475.0)].updated_at = now - 10.0
+        stale = stream.feature_input_health(
+            7500.0, max_age_seconds=5.0, max_dispersion_seconds=1.0,
+        )
+        self.assertEqual(stale.reason, "stale_feature_quotes")
+
+    def test_feature_health_rejects_cross_section_time_dispersion(self) -> None:
+        stream = _stream()
+        now = time.time()
+        stream._cache = {
+            ("2026-08-03", "CALL", 7500.0): CachedQuote(10.0, 10.2, 0.50, 0.20, now - 0.1),
+            ("2026-08-03", "PUT", 7500.0): CachedQuote(9.8, 10.0, -0.50, 0.21, now - 0.2),
+            ("2026-08-03", "CALL", 7525.0): CachedQuote(3.0, 3.1, 0.25, 0.19, now - 0.3),
+            ("2026-08-03", "PUT", 7475.0): CachedQuote(3.1, 3.2, -0.25, 0.22, now - 3.0),
+        }
+        health = stream.feature_input_health(
+            7500.0, max_age_seconds=5.0, max_dispersion_seconds=1.0,
+        )
+        self.assertEqual(health.reason, "unsynchronized_feature_quotes")
+
     def test_invalid_ib_greeks_are_not_cached(self) -> None:
         stream = _stream()
         contract = SimpleNamespace(right="P", strike=7500.0)

@@ -88,6 +88,15 @@ class LiveConfig:
     poll_seconds_pre_tranche: float = 0.5
     poll_seconds_max_idle: float = 30.0
     pre_tranche_wake_seconds: float = 2.0
+    # Alpha is sampled on a fixed minute-boundary window, independent of loop
+    # cadence. Risk and order management continue on their faster clocks.
+    signal_sample_offset_seconds: float = 1.0
+    signal_sample_window_seconds: float = 1.0
+    signal_sample_min_observations: int = 2
+    signal_sample_max_wait_seconds: float = 1.0
+    signal_sample_poll_seconds: float = 0.25
+    signal_max_feature_quote_age_seconds: float = 5.0
+    signal_max_feature_timestamp_dispersion_seconds: float = 1.5
 
     # --- Phase 4: stop execution ------------------------------------------ #
     stop_limit_slippage_pct: float = 0.05
@@ -127,6 +136,15 @@ class LiveConfig:
     entry_max_ladder_steps: int = 3
     entry_poll_seconds: float = 0.5
     max_leg_quote_age_seconds: float = 5.0
+    entry_max_signal_age_seconds: float = 75.0
+    entry_max_spot_drift_points: float = 8.0
+    entry_max_spot_drift_pct: float = 0.0015
+    entry_min_credit_ratio: float = 0.80
+    entry_max_credit_drop: float = 0.50
+    entry_max_short_delta_drift: float = 0.05
+    entry_max_leg_timestamp_dispersion_seconds: float = 1.0
+    entry_max_short_bid_ask_width: float = 0.50
+    entry_max_long_bid_ask_width: float = 0.30
     # True with OPRA (market_data_type=1); rejects crossed/stale NBBO on entry.
     entry_require_live_nbbo: bool = True
     refresh_legs_before_entry: bool = True

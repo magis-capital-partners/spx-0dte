@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import sys
+import unittest
 from datetime import datetime
 from pathlib import Path
 
@@ -31,6 +32,32 @@ def test_adaptive_idle_sleeps_toward_tranche() -> None:
     assert secs is not None
     assert sleep_for <= 30.0
     assert sleep_for >= live.poll_seconds_pre_tranche
+
+
+class SignalSamplingTimingTests(unittest.TestCase):
+    def test_idle_loop_wakes_for_each_minute_sample_window(self) -> None:
+        live = LiveConfig(
+            use_adaptive_polling=True,
+            poll_seconds_max_idle=30.0,
+            signal_sample_offset_seconds=1.0,
+            signal_sample_window_seconds=1.0,
+            signal_sample_poll_seconds=0.25,
+        )
+        config = build_p3_trend_skew_config()
+        before_window = datetime(2026, 7, 7, 9, 40, 50)
+        self.assertLessEqual(
+            adaptive_sleep_seconds(
+                live=live, now=before_window, open_spreads=[], quotes=[], config=config,
+            ),
+            10.0,
+        )
+        inside_window = datetime(2026, 7, 7, 9, 41, 0, 500_000)
+        self.assertLessEqual(
+            adaptive_sleep_seconds(
+                live=live, now=inside_window, open_spreads=[], quotes=[], config=config,
+            ),
+            0.25,
+        )
 
 
 def main() -> None:

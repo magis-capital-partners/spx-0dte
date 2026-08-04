@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import sys
 import unittest
+from dataclasses import replace
 from datetime import datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
@@ -16,6 +17,7 @@ from live_config import LiveConfig  # noqa: E402
 from mbh_simulator import CandidateRecord, OptionQuote  # noqa: E402
 from entry_execution import (  # noqa: E402
     PendingEntry,
+    evaluate_entry_quality,
     entry_limit_credit,
     entry_quote_block_reason,
     natural_credit,
@@ -122,6 +124,85 @@ def _pending(
 
 
 class EntryExecutionTests(unittest.TestCase):
+    def test_fast_entry_quality_accepts_unchanged_market(self) -> None:
+        now = datetime(2026, 8, 3, 10, 2, 2)
+        cand = _cand(7545, 7615, bid=3.25, ask_long=0.10)
+        cand.timestamp = now.replace(second=0)
+        result = evaluate_entry_quality(
+            cand,
+            LiveConfig(),
+            now=now,
+            current_spot=7501.0,
+            spot_age_seconds=0.2,
+            reference_spot=7500.0,
+            reference_credit=natural_credit(cand),
+            reference_short_delta=0.15,
+            leg_ages=[0.2, 0.3],
+            leg_update_times=[100.0, 99.8],
+            short_delta_min=0.10,
+            short_delta_max=0.30,
+        )
+        self.assertTrue(result.ok)
+
+    def test_fast_entry_quality_blocks_spot_credit_delta_and_desync(self) -> None:
+        now = datetime(2026, 8, 3, 10, 2, 2)
+        cand = _cand(7545, 7615, bid=3.25, ask_long=0.10)
+        cand.timestamp = now.replace(second=0)
+        base = dict(
+            candidate=cand,
+            live=LiveConfig(
+                entry_max_spot_drift_points=8.0,
+                entry_min_credit_ratio=0.80,
+                entry_max_short_delta_drift=0.05,
+                entry_max_leg_timestamp_dispersion_seconds=1.0,
+            ),
+            now=now,
+            current_spot=7500.0,
+            spot_age_seconds=0.2,
+            reference_spot=7500.0,
+            reference_credit=natural_credit(cand),
+            reference_short_delta=0.15,
+            leg_ages=[0.2, 0.3],
+            leg_update_times=[100.0, 99.8],
+            short_delta_min=0.10,
+            short_delta_max=0.30,
+        )
+
+        self.assertEqual(evaluate_entry_quality(**{**base, "current_spot": 7510.0}).reason, "spot_drift")
+
+        cand.short_quote = replace(cand.short_quote, bid=1.5)
+        self.assertEqual(evaluate_entry_quality(**base).reason, "credit_deterioration")
+        cand.short_quote = replace(cand.short_quote, bid=3.20)
+
+        cand.short_quote = replace(cand.short_quote, delta=0.24)
+        self.assertEqual(evaluate_entry_quality(**base).reason, "short_delta_drift")
+        cand.short_quote = replace(cand.short_quote, delta=0.15)
+
+        self.assertEqual(
+            evaluate_entry_quality(**{**base, "leg_update_times": [100.0, 97.0]}).reason,
+            "quote_desync",
+        )
+
+    def test_fast_entry_quality_blocks_expired_signal(self) -> None:
+        now = datetime(2026, 8, 3, 10, 3, 20)
+        cand = _cand(7545, 7615, bid=3.25, ask_long=0.10)
+        cand.timestamp = datetime(2026, 8, 3, 10, 2)
+        result = evaluate_entry_quality(
+            cand,
+            LiveConfig(entry_max_signal_age_seconds=75.0),
+            now=now,
+            current_spot=7500.0,
+            spot_age_seconds=0.2,
+            reference_spot=7500.0,
+            reference_credit=natural_credit(cand),
+            reference_short_delta=0.15,
+            leg_ages=[0.2, 0.3],
+            leg_update_times=[100.0, 99.8],
+            short_delta_min=0.10,
+            short_delta_max=0.30,
+        )
+        self.assertEqual(result.reason, "signal_expired")
+
     def test_natural_credit(self) -> None:
         cand = _cand(7545, 7615, bid=3.25, ask_long=0.15)
         self.assertAlmostEqual(natural_credit(cand), 3.05, places=2)
@@ -159,6 +240,25 @@ class EntryExecutionTests(unittest.TestCase):
 
 
 class PollPendingEntryTests(unittest.TestCase):
+    def test_quality_deterioration_cancels_working_order_before_ladder(self) -> None:
+        now = datetime(2026, 7, 29, 9, 49, 0)
+        ib = _FakeIB()
+        pending = _pending(_FakeTrade("Submitted"), now=now, next_ladder_in=-1.0)
+        remaining, resolution = poll_pending_entry(
+            ib,
+            pending,
+            LiveConfig(entry_ladder_step=0.05),
+            "2026-07-29",
+            now,
+            log_event=lambda *_a, **_k: None,
+            quality_block_reason="entry_quality_spot_drift",
+        )
+        self.assertIsNone(remaining)
+        assert resolution is not None
+        self.assertEqual(resolution["reason"], "entry_quality_spot_drift")
+        self.assertEqual(ib.cancel_calls, 1)
+        self.assertEqual(ib.place_calls, 0)
+
     def test_cancelled_rejects_without_place_order(self) -> None:
         now = datetime(2026, 7, 29, 9, 49, 0)
         ib = _FakeIB()

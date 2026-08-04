@@ -65,6 +65,79 @@ def entry_quote_block_reason(
     return ""
 
 
+@dataclass(frozen=True)
+class EntryQualityResult:
+    ok: bool
+    reason: str = ""
+    diagnostics: Optional[Dict[str, Any]] = None
+
+
+def evaluate_entry_quality(
+    candidate: CandidateRecord,
+    live: LiveConfig,
+    *,
+    now: datetime,
+    current_spot: float,
+    spot_age_seconds: Optional[float],
+    reference_spot: float,
+    reference_credit: float,
+    reference_short_delta: float,
+    leg_ages: Optional[List[Optional[float]]],
+    leg_update_times: Optional[List[Optional[float]]],
+    short_delta_min: float,
+    short_delta_max: float,
+) -> EntryQualityResult:
+    """Stateless, cheap veto evaluated before submit and every working poll."""
+    reason = entry_quote_block_reason(candidate, live, leg_ages=leg_ages)
+    if reason:
+        return EntryQualityResult(False, reason, {"entry_quality_reason": reason})
+    sq, lq = candidate.short_quote, candidate.long_quote
+    assert sq is not None and lq is not None
+    credit = natural_credit(candidate)
+    short_delta = abs(float(sq.delta if sq.delta is not None else candidate.short_delta))
+    spot_drift = abs(float(current_spot) - float(reference_spot))
+    credit_drop = float(reference_credit) - credit
+    signal_ts = candidate.timestamp.replace(tzinfo=None)
+    signal_age = max(0.0, (now.replace(tzinfo=None) - signal_ts).total_seconds())
+    finite_times = [float(value) for value in (leg_update_times or []) if value is not None]
+    dispersion = max(finite_times) - min(finite_times) if len(finite_times) >= 2 else 0.0
+    diagnostics: Dict[str, Any] = {
+        "entry_quality_spot": round(float(current_spot), 3),
+        "entry_quality_spot_drift": round(spot_drift, 3),
+        "entry_quality_credit": round(credit, 3),
+        "entry_quality_credit_ratio": round(credit / max(reference_credit, 1e-9), 4),
+        "entry_quality_short_delta": round(short_delta, 4),
+        "entry_quality_signal_age_seconds": round(signal_age, 3),
+        "entry_quality_quote_dispersion_seconds": round(dispersion, 3),
+    }
+
+    checks = [
+        (spot_age_seconds is None or (live.max_leg_quote_age_seconds > 0 and spot_age_seconds > live.max_leg_quote_age_seconds), "stale_spot"),
+        (live.entry_max_signal_age_seconds > 0 and signal_age > live.entry_max_signal_age_seconds, "signal_expired"),
+        (live.entry_max_leg_timestamp_dispersion_seconds > 0 and dispersion > live.entry_max_leg_timestamp_dispersion_seconds, "quote_desync"),
+        (
+            (live.entry_max_spot_drift_points > 0 and spot_drift > live.entry_max_spot_drift_points)
+            or (live.entry_max_spot_drift_pct > 0 and spot_drift / max(abs(reference_spot), 1.0) > live.entry_max_spot_drift_pct),
+            "spot_drift",
+        ),
+        (
+            (live.entry_min_credit_ratio > 0 and credit < reference_credit * live.entry_min_credit_ratio)
+            or (live.entry_max_credit_drop > 0 and credit_drop > live.entry_max_credit_drop),
+            "credit_deterioration",
+        ),
+        (not short_delta_min <= short_delta <= short_delta_max, "short_delta_out_of_range"),
+        (live.entry_max_short_delta_drift > 0 and abs(short_delta - abs(reference_short_delta)) > live.entry_max_short_delta_drift, "short_delta_drift"),
+        (live.entry_max_short_bid_ask_width > 0 and sq.ask - sq.bid > live.entry_max_short_bid_ask_width, "short_quote_wide"),
+        (live.entry_max_long_bid_ask_width > 0 and lq.ask - lq.bid > live.entry_max_long_bid_ask_width, "long_quote_wide"),
+    ]
+    for failed, failed_reason in checks:
+        if failed:
+            diagnostics["entry_quality_reason"] = failed_reason
+            return EntryQualityResult(False, failed_reason, diagnostics)
+    diagnostics["entry_quality_reason"] = "ok"
+    return EntryQualityResult(True, diagnostics=diagnostics)
+
+
 @dataclass
 class PendingEntry:
     spread: Any
@@ -81,6 +154,10 @@ class PendingEntry:
     sleeve: str = "core"
     score: float = 0.0
     entry_diagnostics: Optional[Dict[str, Any]] = None
+    reference_spot: Optional[float] = None
+    reference_natural_credit: Optional[float] = None
+    reference_short_delta: Optional[float] = None
+    signal_timestamp: Optional[datetime] = None
 
 
 def _order_status(trade) -> str:
@@ -215,6 +292,7 @@ def poll_pending_entry(
     now: datetime,
     *,
     log_event,
+    quality_block_reason: str = "",
 ) -> Tuple[Optional[PendingEntry], Optional[dict]]:
     """Advance a working entry; return (remaining pending, resolution event)."""
     trade = pending.trade
@@ -231,6 +309,12 @@ def poll_pending_entry(
         return _resolve_terminal_or_reject(
             pending, reason=f"entry_terminal_{trade.orderStatus.status or status}",
         )
+
+    if quality_block_reason:
+        if _is_active_status(trade):
+            ib.cancelOrder(trade.order)
+            ib.sleep(0.25)
+        return _resolve_terminal_or_reject(pending, reason=quality_block_reason)
 
     if now >= pending.work_until:
         filled = _filled_qty(trade)

@@ -92,6 +92,7 @@ from live_config import ACTIVE, LiveConfig  # noqa: E402
 from combo_pricing import ComboQuote, protect_credit_limit  # noqa: E402
 from entry_execution import (  # noqa: E402
     PendingEntry,
+    evaluate_entry_quality,
     entry_limit_credit,
     entry_quote_block_reason,
     natural_credit,
@@ -101,6 +102,7 @@ from entry_execution import (  # noqa: E402
     work_deadline,
 )
 from live_features import (  # noqa: E402
+    DeterministicMinuteSampler,
     SessionFeatureState,
     compute_raw_features_once_per_minute,
     extract_baselines_core,
@@ -336,6 +338,13 @@ class IBSignalProvider:
             )
         self._stream = IBStreamingMarketData(ib, live, config)
         self.last_signal_block_reason = ""
+        self.last_signal_diagnostics: Dict[str, Any] = {}
+        self._minute_sampler = DeterministicMinuteSampler(
+            sample_offset_seconds=live.signal_sample_offset_seconds,
+            sample_window_seconds=live.signal_sample_window_seconds,
+            min_observations=live.signal_sample_min_observations,
+            max_wait_seconds=live.signal_sample_max_wait_seconds,
+        )
 
     @staticmethod
     def load_baselines(path: Path, max_age_days: int) -> tuple[dict, dict]:
@@ -374,9 +383,6 @@ class IBSignalProvider:
         self._stream.maybe_rebalance()
         if not self.live.use_streaming_quotes:
             self._stream._refresh_snapshot_cache()
-        if at_tranche:
-            self._stream.refresh_next_expiry_at_tranche(now)
-
         quotes = self._stream.build_option_quotes(now)
         spot = self._stream.spot()
         if spot <= 0:
@@ -416,6 +422,39 @@ class IBSignalProvider:
             self._stream.quote_age_seconds(candidate.short_type, candidate.long_strike),
         ]
 
+    def leg_quote_update_times(self, candidate: CandidateRecord) -> List[Optional[float]]:
+        return [
+            self._stream.quote_update_time(candidate.short_type, candidate.short_strike),
+            self._stream.quote_update_time(candidate.short_type, candidate.long_strike),
+        ]
+
+    def evaluate_candidate_quality(
+        self,
+        candidate: CandidateRecord,
+        now: datetime,
+        *,
+        reference_spot: float,
+        reference_credit: float,
+        reference_short_delta: float,
+    ):
+        is_condor = (candidate.sleeve or "").lower() == "condor"
+        delta_min = self.config.condor_min_abs_delta if is_condor else self.config.min_abs_delta
+        delta_max = self.config.condor_max_abs_delta if is_condor else self.config.max_abs_delta
+        return evaluate_entry_quality(
+            candidate,
+            self.live,
+            now=now,
+            current_spot=self._stream.spot(),
+            spot_age_seconds=self._stream.spot_age_seconds(),
+            reference_spot=reference_spot,
+            reference_credit=reference_credit,
+            reference_short_delta=reference_short_delta,
+            leg_ages=self.leg_quote_ages(candidate),
+            leg_update_times=self.leg_quote_update_times(candidate),
+            short_delta_min=delta_min,
+            short_delta_max=delta_max,
+        )
+
     def _build_signal(
         self,
         now: datetime,
@@ -428,16 +467,45 @@ class IBSignalProvider:
             return SignalSnapshot(timestamp=now, vix=self.session_vix)
         session = now.date().isoformat()
         zero_q, _ = split_session_quotes(quotes, session)
+        self._minute_sampler.observe(now, spot, zero_q)
+        sample_status = self._minute_sampler.status(now)
+        self.last_signal_diagnostics = {"sample_status": sample_status}
+        if sample_status == "collecting":
+            self.last_signal_block_reason = "signal_warming"
+            return None
+        if sample_status == "unavailable":
+            self.last_signal_block_reason = "signal_inputs_unavailable"
+            return None
+        sample = self._minute_sampler.aggregate(now)
+        if sample is None:
+            self.last_signal_block_reason = "signal_inputs_unavailable"
+            return None
+        health = self._stream.feature_input_health(
+            sample.spot,
+            max_age_seconds=self.live.signal_max_feature_quote_age_seconds,
+            max_dispersion_seconds=self.live.signal_max_feature_timestamp_dispersion_seconds,
+        )
+        self.last_signal_diagnostics.update({
+            "sample_observations": sample.observation_count,
+            "feature_quote_count": health.quote_count,
+            "feature_max_age_seconds": round(health.max_age_seconds, 3),
+            "feature_timestamp_dispersion_seconds": round(health.timestamp_dispersion_seconds, 3),
+        })
+        if not health.ok:
+            self.last_signal_block_reason = health.reason
+            return None
+        if at_tranche:
+            self._stream.refresh_next_expiry_at_tranche(now)
         next_q = self._stream.next_expiry_quotes() if at_tranche else None
         previous_sample_minute = self._feature_state.last_sample_minute
         raw = compute_raw_features_once_per_minute(
-            zero_q,
-            spot,
-            now,
+            sample.quotes,
+            sample.spot,
+            sample.timestamp,
             self._feature_state,
             next_expiry_quotes=next_q,
         )
-        sample_ts = now.replace(second=0, microsecond=0)
+        sample_ts = sample.timestamp
         signal = raw_to_signal_snapshot(raw, self.baselines, sample_ts)
         if not signal_features_are_sane(
             signal, max_abs_z=self.live.signal_sanity_abs_z,
@@ -453,6 +521,7 @@ class IBSignalProvider:
                 save_feature_state(self.today, self._feature_state)
             except OSError:
                 pass
+        self.last_signal_block_reason = ""
         return signal
 
 
@@ -1128,12 +1197,26 @@ def submit_spread_entry(
     provider: Optional["IBSignalProvider"] = None,
 ) -> Tuple[Optional[OpenSpread], Optional[PendingEntry], str]:
     """Validate quotes and submit a working combo limit (non-blocking when not dry)."""
+    reference_spot = float(candidate.spot)
+    reference_credit = max(float(candidate.credit or 0.0), natural_credit(candidate))
+    reference_short_delta = abs(float(candidate.short_delta or 0.0))
     if provider is not None:
         provider.refresh_candidate_legs(candidate, now)
     leg_ages = provider.leg_quote_ages(candidate) if provider is not None else None
     block = entry_quote_block_reason(candidate, live, leg_ages=leg_ages)
     if block:
         return None, None, block
+    quality = None
+    if provider is not None:
+        quality = provider.evaluate_candidate_quality(
+            candidate,
+            now,
+            reference_spot=reference_spot,
+            reference_credit=reference_credit,
+            reference_short_delta=reference_short_delta,
+        )
+        if not quality.ok:
+            return None, None, f"entry_quality_{quality.reason}"
 
     nat = natural_credit(candidate)
     limit = entry_limit_credit(nat, live)
@@ -1161,6 +1244,13 @@ def submit_spread_entry(
         "long_bid": round(float(candidate.long_quote.bid), 4) if candidate.long_quote else None,
         "long_ask": round(float(long_buy), 4),
     }
+    if quality is not None and quality.diagnostics:
+        entry_diagnostics.update(quality.diagnostics)
+    if provider is not None:
+        entry_diagnostics.update({
+            f"signal_{key}": value
+            for key, value in provider.last_signal_diagnostics.items()
+        })
     spread = OpenSpread(
         candidate=candidate,
         contracts=contracts,
@@ -1234,6 +1324,10 @@ def submit_spread_entry(
         sleeve=candidate.sleeve or "core",
         score=candidate.score,
         entry_diagnostics=entry_diagnostics,
+        reference_spot=reference_spot,
+        reference_natural_credit=reference_credit,
+        reference_short_delta=reference_short_delta,
+        signal_timestamp=candidate.timestamp,
     )
     log_event(today, {
         "event": "entry_submitted",
@@ -1288,12 +1382,25 @@ def submit_paired_condor_entry(
     """
     candidates = (put_candidate, call_candidate)
     for candidate in candidates:
+        reference_spot = float(candidate.spot)
+        reference_credit = max(float(candidate.credit or 0.0), natural_credit(candidate))
+        reference_delta = abs(float(candidate.short_delta or 0.0))
         if provider is not None:
             provider.refresh_candidate_legs(candidate, now)
         ages = provider.leg_quote_ages(candidate) if provider is not None else None
         block = entry_quote_block_reason(candidate, live, leg_ages=ages)
         if block:
             return [], f"paired_condor_{candidate.side}_{block}"
+        if provider is not None:
+            quality = provider.evaluate_candidate_quality(
+                candidate,
+                now,
+                reference_spot=reference_spot,
+                reference_credit=reference_credit,
+                reference_short_delta=reference_delta,
+            )
+            if not quality.ok:
+                return [], f"paired_condor_{candidate.side}_entry_quality_{quality.reason}"
     naturals = [natural_credit(candidate) for candidate in candidates]
     total_natural = sum(naturals)
     total_limit = entry_limit_credit(total_natural, live)
@@ -2775,6 +2882,14 @@ def run(live: LiveConfig = ACTIVE) -> None:
                             )
                 quotes, signal = provider.fetch(now, at_tranche=at_tranche)
                 last_quotes = list(quotes)
+                if (
+                    at_tranche
+                    and ib_provider is not None
+                    and ib_provider.last_signal_block_reason == "signal_warming"
+                ):
+                    # Keep the tranche armed while the deterministic boundary
+                    # window collects multiple synchronized observations.
+                    at_tranche = False
 
                 if (
                     ib_provider is not None
@@ -2821,6 +2936,7 @@ def run(live: LiveConfig = ACTIVE) -> None:
                         "event": "signal_blocked",
                         "reason": reason,
                         "tranche_time": now.replace(second=0, microsecond=0).isoformat(),
+                        **ib_provider.last_signal_diagnostics,
                     }, live=live)
 
                 pending_entry = enforce_native_stop_disarm_budget(
@@ -2838,8 +2954,37 @@ def run(live: LiveConfig = ACTIVE) -> None:
                     active_pending = pending_entry
                     resolution = None
                     try:
+                        quality_block = ""
+                        if (
+                            ib_provider is not None
+                            and active_pending.reference_spot is not None
+                            and active_pending.reference_natural_credit is not None
+                            and active_pending.reference_short_delta is not None
+                        ):
+                            check_now = datetime.now()
+                            ib_provider.refresh_candidate_legs(active_pending.candidate, check_now)
+                            quality = ib_provider.evaluate_candidate_quality(
+                                active_pending.candidate,
+                                check_now,
+                                reference_spot=active_pending.reference_spot,
+                                reference_credit=active_pending.reference_natural_credit,
+                                reference_short_delta=active_pending.reference_short_delta,
+                            )
+                            if quality.diagnostics:
+                                active_pending.entry_diagnostics = {
+                                    **(active_pending.entry_diagnostics or {}),
+                                    **quality.diagnostics,
+                                }
+                            if not quality.ok:
+                                quality_block = f"entry_quality_{quality.reason}"
                         pending_entry, resolution = poll_pending_entry(
-                            ib, active_pending, live, today, now, log_event=log_event,
+                            ib,
+                            active_pending,
+                            live,
+                            today,
+                            now,
+                            log_event=log_event,
+                            quality_block_reason=quality_block,
                         )
                         # Belt-and-suspenders: never keep a non-active trade as pending.
                         if (
