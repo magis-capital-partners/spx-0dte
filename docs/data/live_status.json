@@ -1,10 +1,10 @@
 {
   "schema": 2,
   "source": "cloud",
-  "generated_at": "2026-08-04T12:32:49.780443",
+  "generated_at": "2026-08-04T12:34:49.822919",
   "date": "2026-08-04",
   "pid_alive": true,
-  "heartbeat_ts": "2026-08-04T12:32:48.064276",
+  "heartbeat_ts": "2026-08-04T12:34:47.883440",
   "entries_halted": false,
   "flattened": false,
   "open_count": 2,
@@ -25,8 +25,8 @@
     {
       "date": "2026-08-04",
       "execution_type": "production_live",
-      "ts": "2026-08-04T12:32:23.976473",
-      "marked_pnl": -3650.0,
+      "ts": "2026-08-04T12:34:29.798448",
+      "marked_pnl": -3630.0,
       "defined_risk_margin": 0.0,
       "marked_return_on_margin_pct": 0.0,
       "max_loss_no_stop": 0.0
