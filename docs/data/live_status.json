@@ -1,20 +1,20 @@
 {
   "schema": 2,
   "source": "cloud",
-  "generated_at": "2026-08-04T11:20:49.262261",
+  "generated_at": "2026-08-04T11:22:50.141421",
   "date": "2026-08-04",
-  "pid_alive": false,
-  "heartbeat_ts": "2026-08-04T11:19:33.920013",
+  "pid_alive": true,
+  "heartbeat_ts": "2026-08-04T11:22:47.822631",
   "entries_halted": false,
   "flattened": false,
   "open_count": 2,
-  "marked_pnl": -3860.0,
+  "marked_pnl": -3880.0,
   "execution_type": "production_live",
   "risk": {
     "max_loss_no_stop": 0.0,
     "planned_stop_loss": 0.0,
     "defined_risk_margin": 0.0,
-    "marked_pnl": -3850.0,
+    "marked_pnl": -3870.0,
     "marked_return_on_margin": 0.0,
     "marked_return_on_margin_pct": 0.0,
     "open_count": 2,
@@ -25,15 +25,15 @@
     {
       "date": "2026-08-04",
       "execution_type": "production_live",
-      "ts": "2026-08-04T11:19:27.894708",
-      "marked_pnl": -3850.0,
+      "ts": "2026-08-04T11:22:41.799423",
+      "marked_pnl": -3860.0,
       "defined_risk_margin": 0.0,
       "marked_return_on_margin_pct": 0.0,
       "max_loss_no_stop": 0.0
     }
   ],
   "last_event": {
-    "ts": "2026-08-04T11:14:26.438067",
+    "ts": "2026-08-04T11:21:41.540544",
     "event": "governor_recovered"
   },
   "note": "Sanitized status only. Full console is local to the trading host."
