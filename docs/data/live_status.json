@@ -1,7 +1,7 @@
 {
   "schema": 2,
   "source": "cloud",
-  "generated_at": "2026-08-04T18:46:49.314427",
+  "generated_at": "2026-08-04T18:49:47.877169",
   "date": "2026-08-04",
   "pid_alive": false,
   "heartbeat_ts": "2026-08-04T15:59:56.136746",
@@ -22,6 +22,24 @@
     "mark_quality": "ok"
   },
   "risk_history": [
+    {
+      "date": "2026-07-31",
+      "execution_type": "production_live",
+      "ts": "2026-07-31T16:00:00.436159",
+      "marked_pnl": -1200.0,
+      "defined_risk_margin": 98000.0,
+      "marked_return_on_margin_pct": -1.22,
+      "max_loss_no_stop": 94860.0
+    },
+    {
+      "date": "2026-08-03",
+      "execution_type": "production_live",
+      "ts": "2026-08-03T15:59:36.730884",
+      "marked_pnl": -5500.0,
+      "defined_risk_margin": 38000.0,
+      "marked_return_on_margin_pct": -14.47,
+      "max_loss_no_stop": 37290.0
+    },
     {
       "date": "2026-08-04",
       "execution_type": "production_live",
