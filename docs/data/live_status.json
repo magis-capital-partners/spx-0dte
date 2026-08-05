@@ -1,10 +1,10 @@
 {
   "schema": 2,
   "source": "cloud",
-  "generated_at": "2026-08-05T15:24:43.824390",
+  "generated_at": "2026-08-05T15:29:44.475692",
   "date": "2026-08-05",
   "pid_alive": true,
-  "heartbeat_ts": "2026-08-05T15:24:41.096221",
+  "heartbeat_ts": "2026-08-05T15:29:41.259641",
   "entries_halted": false,
   "flattened": false,
   "open_count": 5,
@@ -69,13 +69,13 @@
     {
       "date": "2026-08-05",
       "execution_type": "production_live",
-      "ts": "2026-08-05T15:24:11.052128",
-      "marked_pnl": 3955.0,
+      "ts": "2026-08-05T15:29:29.229180",
+      "marked_pnl": 3965.0,
       "closed_pnl": 1180.0,
-      "total_pnl": 5135.0,
+      "total_pnl": 5145.0,
       "contracts_traded": 13,
       "defined_risk_margin": 82500.0,
-      "marked_return_on_margin_pct": 4.79,
+      "marked_return_on_margin_pct": 4.81,
       "max_loss_no_stop": 78315.0
     }
   ],
