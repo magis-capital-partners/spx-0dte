@@ -33,6 +33,28 @@ $doDeploy = $Deploy -or $Push
 $doTriggerPages = $TriggerPagesBuild -or $doDeploy -or $DeployOnly
 $doBuild = -not $SkipBuild -and -not $DeployOnly
 
+function Push-WithRebase {
+  # Two machines publish live_status.json to main every few minutes, so a plain
+  # push is frequently rejected as non-fast-forward. Autostash keeps an in-flight
+  # live_status.json edit from blocking the rebase.
+  param([int]$Attempts = 3)
+  for ($i = 1; $i -le $Attempts; $i++) {
+    & $Git push origin main
+    if ($LASTEXITCODE -eq 0) {
+      Write-Host "Pushed main (docs/)."
+      return
+    }
+    if ($i -eq $Attempts) { break }
+    Write-Warning "Push rejected (attempt $i/$Attempts); rebasing onto origin/main and retrying."
+    & $Git pull --rebase --autostash origin main
+    if ($LASTEXITCODE -ne 0) {
+      & $Git rebase --abort 2>&1 | Out-Null
+      throw "Could not rebase onto origin/main; dashboard data was committed locally but not pushed."
+    }
+  }
+  throw "git push origin main failed after $Attempts attempt(s); dashboard data was committed locally but not pushed."
+}
+
 function Invoke-PagesBuildRequest {
   param([string]$Repository)
   Write-Host "Requesting GitHub Pages build for $Repository ..."
@@ -83,34 +105,38 @@ if ($doBuild) {
     --account-equity $Equity `
     --include-live `
     --out "$Root\docs\data\dashboard_data.json"
+  if ($LASTEXITCODE -ne 0) { throw "build_dashboard_data.py failed (exit $LASTEXITCODE); refusing to deploy stale data." }
 }
 
 if ($doDeploy -or $DeployOnly) {
   Push-Location $Root
-  # Only stage dashboard artifacts - avoid sweeping unrelated docs/ files (PDFs, guides, etc.).
-  foreach ($artifact in @(
-    "docs/data/dashboard_data.json",
-    "docs/data/build_stamp.txt",
-    "docs/index.html",
-    "docs/build_dashboard_data.py",
-    "docs/data/investors.json"
-    "scripts/sync_dashboard.ps1"
-  )) {
-    if (Test-Path (Join-Path $Root $artifact)) {
-      & $Git add -- $artifact
+  try {
+    # Only stage dashboard artifacts - avoid sweeping unrelated docs/ files (PDFs, guides, etc.).
+    foreach ($artifact in @(
+      "docs/data/dashboard_data.json",
+      "docs/data/build_stamp.txt",
+      "docs/index.html",
+      "docs/build_dashboard_data.py",
+      "docs/data/investors.json"
+      "scripts/sync_dashboard.ps1"
+    )) {
+      if (Test-Path (Join-Path $Root $artifact)) {
+        & $Git add -- $artifact
+      }
     }
+    # Also stage any other tracked files already under docs/data/ that changed.
+    & $Git add -- "docs/data/"
+    $staged = & $Git diff --cached --name-only
+    if ($staged) {
+      & $Git -c user.name="Drew Goldman" -c user.email="dag5wd@virginia.edu" commit -m "dashboard: refresh backtest data and deploy"
+      if ($LASTEXITCODE -ne 0) { throw "git commit failed (exit $LASTEXITCODE)" }
+      Push-WithRebase
+    } else {
+      Write-Host "No dashboard changes to commit; continuing with Pages build trigger."
+    }
+  } finally {
+    Pop-Location
   }
-  # Also stage any other tracked files already under docs/data/ that changed.
-  & $Git add -- "docs/data/"
-  $staged = & $Git diff --cached --name-only
-  if ($staged) {
-    & $Git -c user.name="Drew Goldman" -c user.email="dag5wd@virginia.edu" commit -m "dashboard: refresh backtest data and deploy"
-    & $Git push origin main
-    Write-Host "Pushed main (docs/)."
-  } else {
-    Write-Host "No dashboard changes to commit; continuing with Pages build trigger."
-  }
-  Pop-Location
 }
 
 if ($doTriggerPages) {
