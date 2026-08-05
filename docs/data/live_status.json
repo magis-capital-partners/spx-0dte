@@ -1,10 +1,10 @@
 {
   "schema": 2,
   "source": "cloud",
-  "generated_at": "2026-08-05T10:44:42.945756",
+  "generated_at": "2026-08-05T10:49:43.160679",
   "date": "2026-08-05",
-  "pid_alive": true,
-  "heartbeat_ts": "2026-08-05T10:44:33.737066",
+  "pid_alive": false,
+  "heartbeat_ts": "2026-08-05T10:49:32.057586",
   "entries_halted": true,
   "flattened": true,
   "open_count": 0,
@@ -52,7 +52,7 @@
     {
       "date": "2026-08-05",
       "execution_type": "production_live",
-      "ts": "2026-08-05T10:44:03.749109",
+      "ts": "2026-08-05T10:48:32.268791",
       "marked_pnl": 0.0,
       "defined_risk_margin": 0.0,
       "marked_return_on_margin_pct": 0.0,
@@ -60,8 +60,8 @@
     }
   ],
   "last_event": {
-    "ts": "2026-08-05T10:44:03.744100",
-    "event": "governor_recovered"
+    "ts": "2026-08-05T10:49:40.664465",
+    "event": "account_guard_startup"
   },
   "note": "Sanitized status only. Full console is local to the trading host."
 }
