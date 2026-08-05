@@ -29,6 +29,22 @@ if ($LASTEXITCODE -ne 0) {
 
 Write-Host ("session_status_server: python={0} writeInterval={1}s stopAt={2}" -f $Python, $WriteInterval, $StopAt)
 
+# Evict accidental `python -m http.server <port>` squatters. They bind with
+# SO_REUSEADDR and silently serve 404 for /status + /logs, which is exactly how
+# the dashboard loses executor stdout while the Status API task still looks up.
+$listeners = Get-NetTCPConnection -LocalPort $Port -State Listen -ErrorAction SilentlyContinue
+foreach ($conn in $listeners) {
+    $owner = Get-CimInstance Win32_Process -Filter ("ProcessId = {0}" -f $conn.OwningProcess) -ErrorAction SilentlyContinue
+    if (-not $owner -or -not $owner.CommandLine) { continue }
+    if ($owner.CommandLine -match "session_status_server\.py") { continue }
+    if ($owner.CommandLine -match "http\.server") {
+        Write-Warning ("Killing port-{0} squatter pid={1}: {2}" -f $Port, $owner.ProcessId, $owner.CommandLine)
+        Stop-Process -Id $owner.ProcessId -Force -ErrorAction SilentlyContinue
+    } else {
+        Write-Warning ("Port {0} owned by unexpected pid={1}: {2}" -f $Port, $owner.ProcessId, $owner.CommandLine)
+    }
+}
+
 while ($true) {
     & $Python live/session_status_server.py `
         --host $HostAddress `

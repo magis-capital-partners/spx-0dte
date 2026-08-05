@@ -406,7 +406,22 @@ def main() -> int:
         )
         writer.start()
 
-    httpd = ThreadingHTTPServer((args.host, args.port), _Handler)
+    # Exclusive bind: Windows SO_REUSEADDR otherwise lets a stray
+    # ``python -m http.server 8765`` steal /status and /logs while this
+    # process still appears healthy (2026-08-05: dashboard showed no stdout).
+    class _ExclusiveStatusServer(ThreadingHTTPServer):
+        allow_reuse_address = False
+
+    try:
+        httpd = _ExclusiveStatusServer((args.host, args.port), _Handler)
+    except OSError as exc:
+        print(
+            f"[{datetime.now().isoformat()}] FATAL: cannot bind "
+            f"{args.host}:{args.port} — another process owns the Status API port "
+            f"({exc}). Kill any `python -m http.server {args.port}` and restart.",
+            flush=True,
+        )
+        return 1
     started_day = _today()
 
     def _request_rollover() -> None:
