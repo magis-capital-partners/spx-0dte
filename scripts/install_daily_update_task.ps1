@@ -7,18 +7,23 @@
 #
 # Prerequisites:
 #   1. Set THETADATA_API_KEY as a User environment variable (this script can do it).
-#   2. PC should be on / awake around the scheduled time (default 4:05 PM ET weekdays).
+#   2. PC should be on / awake around the scheduled time (default 4:15 PM ET weekdays).
 #   3. gh CLI authenticated if you want -Deploy to push + trigger Pages.
+#
+# Why 4:15 and not 4:05: SPX settlement close/index data (Yahoo ^GSPC, used to
+# value 0DTE spreads at expiry) isn't reliably finalized right at 4:00 PM —
+# some component prints trickle in. Running at 4:05 risked reconciling
+# against a stale/incomplete close; 4:15 gives it a few extra minutes.
 #
 # Usage:
 #   .\scripts\install_daily_update_task.ps1
 #   .\scripts\install_daily_update_task.ps1 -ApiKey "td1_..." -Deploy
-#   .\scripts\install_daily_update_task.ps1 -Time "16:05" -Deploy
+#   .\scripts\install_daily_update_task.ps1 -Time "16:15" -Deploy
 #   .\scripts\install_daily_update_task.ps1 -Uninstall
 
 param(
     [string]$TaskName = "SPX-0DTE Daily Data Update",
-    [string]$Time = "16:05",
+    [string]$Time = "16:15",
     [string]$ApiKey = "",
     [switch]$Deploy,
     [switch]$Uninstall,

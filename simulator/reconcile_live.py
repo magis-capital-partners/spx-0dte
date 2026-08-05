@@ -35,10 +35,54 @@ from mbh_simulator import (  # noqa: E402
     simulate_day,
 )
 from regime_validation import apply_rolling_baseline, discover_dates  # noqa: E402
+from index_daily import csv_path_for_symbol, load_index_daily  # noqa: E402
 
 LIVE_DIR = ROOT / "data" / "live"
 DEFAULT_PROCESSED = ROOT / "data" / "processed"
 NORMALIZED_EQUITY = 13_000_000.0
+
+
+def settlement_close(day: str) -> Optional[float]:
+    """Official SPX closing print for ``day`` from data/calendar/spx_daily.csv.
+
+    This is the cash-settlement reference for 0DTE SPXW spreads (European,
+    settled off the index close) — distinct from the executor's own
+    in-session mark, which is a live-quote snapshot and can be stale or
+    wide right around the close.
+    """
+    path = csv_path_for_symbol("^GSPC")
+    if not path.exists():
+        return None
+    by_date = load_index_daily(path)
+    row = by_date.get(day)
+    return row.close if row else None
+
+
+def settlement_marked_pnl(entries: List[dict], spot: float) -> float:
+    """Theoretical P&L if every entry fill were held to 0DTE settlement at ``spot``.
+
+    Groups fills by (side, short_strike, long_strike) so repeat tranches into
+    the same spread net together, then values each group's residual credit
+    spread by cash-settlement intrinsic value at the official close. This is
+    a *reference* figure — it assumes nothing was bought back early, so it
+    will disagree with the executor's reported marked_pnl whenever a stop or
+    a flatten actually closed a leg before expiration.
+    """
+    total = 0.0
+    for entry in entries:
+        side = entry.get("side")
+        short_strike = float(entry.get("short_strike") or 0.0)
+        long_strike = float(entry.get("long_strike") or 0.0)
+        contracts = float(entry.get("contracts") or 0.0)
+        credit = float(entry.get("credit") or 0.0)
+        if side == "bear_call":
+            value = max(0.0, spot - short_strike) - max(0.0, spot - long_strike)
+        elif side == "bull_put":
+            value = max(0.0, short_strike - spot) - max(0.0, long_strike - spot)
+        else:
+            continue
+        total += (credit - value) * contracts * 100.0
+    return round(total, 2)
 
 
 def load_live_session(day: str) -> tuple:
@@ -340,6 +384,18 @@ def main() -> None:
     live_summary = summarize_live(events)
     processed = Path(args.processed_dir)
 
+    spot = settlement_close(args.date)
+    live_summary["settlement_price"] = spot
+    if spot is not None:
+        entries = [e for e in events if e.get("event") == "entry"]
+        theo = settlement_marked_pnl(entries, spot)
+        live_summary["settlement_marked_pnl"] = theo
+        if live_summary.get("marked_pnl") is not None:
+            live_summary["marked_pnl_vs_settlement"] = round(theo - live_summary["marked_pnl"], 2)
+    else:
+        live_summary["settlement_marked_pnl"] = None
+        live_summary["marked_pnl_vs_settlement"] = None
+
     paper_bt = replay_backtest(
         args.date, snapshot, processed, args.train_count, events=events,
     )
@@ -395,6 +451,12 @@ def main() -> None:
         f"stops={live_summary['stops']} bear_call={live_summary['bear_call_pct']}% "
         f"sides={live_summary['sides']} marked_pnl={live_summary.get('marked_pnl')}"
     )
+    if live_summary.get("settlement_price") is not None:
+        print(
+            f"SETTLE   : spx_close={live_summary['settlement_price']} "
+            f"settlement_marked_pnl={live_summary.get('settlement_marked_pnl')} "
+            f"vs_reported={live_summary.get('marked_pnl_vs_settlement')}"
+        )
     for label, bt, diff in (
         ("PAPER $", paper_bt, report["diff_paper_scale"]),
         ("NORM $13M", norm_bt, report["diff_normalized_13m"]),

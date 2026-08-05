@@ -3,6 +3,10 @@
 # Runs locally (Windows Task Scheduler). Does NOT use GitHub Actions minutes.
 # GitHub Pages branch deploy from docs/ also uses no Actions minutes.
 #
+# Scheduled for 4:15 PM ET (not 4:05) so the SPX daily-close download has time
+# to reflect the finalized settlement print before reconcile_live.py values
+# today's 0DTE spreads against it.
+#
 # Usage (from repo root):
 #   $env:THETADATA_API_KEY = "..."   # or set as User env var permanently
 #   .\scripts\daily_data_update.ps1
