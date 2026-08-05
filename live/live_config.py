@@ -261,13 +261,16 @@ class LiveConfig:
     stale_quote_confirm_polls: int = 3
     stale_quote_halt_seconds: float = 20.0
     stale_quote_near_stop_seconds: float = 10.0
-    # Production-live concentration limits. At the two-lot pilot these permit
-    # at most three same-side structures, only one at an exact strike, and two
-    # structures inside a 25-point directional cluster.
-    max_open_contracts: int = 8
-    max_open_per_side: int = 6
+    # Production-live concentration limits. max_open_contracts / per_side /
+    # side_cluster tripled 2026-08-05 (8/6/4 -> 24/18/12) at the account's
+    # request after the book ran into the 8-contract cap same-side; kept
+    # proportional so per_side/side_cluster don't bind before the raised
+    # aggregate cap does. max_open_same_strike is a same-strike concentration
+    # control, not an aggregate-exposure one, and was deliberately left at 2.
+    max_open_contracts: int = 24
+    max_open_per_side: int = 18
     max_open_same_strike: int = 2
-    max_open_side_cluster: int = 4
+    max_open_side_cluster: int = 12
     side_cluster_points: float = 25.0
     # Live stop-count caps (production profile uses 999; tighten here).
     live_max_stops_per_side: int = 2
