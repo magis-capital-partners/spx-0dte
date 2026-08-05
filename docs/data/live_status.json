@@ -1,17 +1,45 @@
 {
   "schema": 2,
   "source": "cloud",
-  "generated_at": "2026-08-05T09:44:51.072067",
+  "generated_at": "2026-08-05T09:49:46.684611",
   "date": "2026-08-05",
-  "pid_alive": false,
-  "heartbeat_ts": null,
+  "pid_alive": true,
+  "heartbeat_ts": "2026-08-05T09:49:41.183348",
   "entries_halted": false,
   "flattened": false,
-  "open_count": 0,
-  "marked_pnl": 0.0,
-  "execution_type": "unknown",
-  "risk": {},
+  "open_count": 2,
+  "marked_pnl": 85.0,
+  "execution_type": "production_live",
+  "risk": {
+    "max_loss_no_stop": 13945.0,
+    "planned_stop_loss": 3415.0,
+    "defined_risk_margin": 15000.0,
+    "marked_pnl": 105.0,
+    "marked_return_on_margin": 0.007,
+    "marked_return_on_margin_pct": 0.7,
+    "open_count": 2,
+    "marked_count": 2,
+    "mark_quality": "ok"
+  },
   "risk_history": [
+    {
+      "date": "2026-07-31",
+      "execution_type": "production_live",
+      "ts": "2026-07-31T16:00:00.436159",
+      "marked_pnl": -1200.0,
+      "defined_risk_margin": 98000.0,
+      "marked_return_on_margin_pct": -1.22,
+      "max_loss_no_stop": 94860.0
+    },
+    {
+      "date": "2026-08-03",
+      "execution_type": "production_live",
+      "ts": "2026-08-03T15:59:36.730884",
+      "marked_pnl": -5500.0,
+      "defined_risk_margin": 38000.0,
+      "marked_return_on_margin_pct": -14.47,
+      "max_loss_no_stop": 37290.0
+    },
     {
       "date": "2026-08-04",
       "execution_type": "production_live",
@@ -20,8 +48,20 @@
       "defined_risk_margin": 15000.0,
       "marked_return_on_margin_pct": -25.43,
       "max_loss_no_stop": 14650.0
+    },
+    {
+      "date": "2026-08-05",
+      "execution_type": "production_live",
+      "ts": "2026-08-05T09:49:29.138679",
+      "marked_pnl": 75.0,
+      "defined_risk_margin": 15000.0,
+      "marked_return_on_margin_pct": 0.5,
+      "max_loss_no_stop": 13945.0
     }
   ],
-  "last_event": null,
+  "last_event": {
+    "ts": "2026-08-05T09:47:02.640844",
+    "event": "entry"
+  },
   "note": "Sanitized status only. Full console is local to the trading host."
 }
