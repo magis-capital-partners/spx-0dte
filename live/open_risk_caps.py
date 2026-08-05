@@ -19,10 +19,18 @@ def open_risk_block_reason(
     max_open_contracts: int,
     max_open_per_side: int,
     max_open_same_strike: int,
+    max_open_same_strike_multiple: float = 0.0,
     max_open_side_cluster: int = 0,
     side_cluster_points: float = 0.0,
 ) -> str:
-    """Return a block reason if adding ``contracts`` would breach live caps."""
+    """Return a block reason if adding ``contracts`` would breach live caps.
+
+    ``max_open_same_strike_multiple`` (>0) makes the same-strike cap dynamic:
+    it scales with ``contracts`` — the size actually being traded on this
+    tranche right now, after VIX-elevated sizing / downsize-after-stop have
+    already been applied — instead of a lot count fixed at config time. When
+    set, it supersedes the static ``max_open_same_strike``.
+    """
     active = _active(open_spreads)
     open_contracts = sum(int(s.contracts) for s in active)
     if max_open_contracts > 0 and open_contracts + contracts > max_open_contracts:
@@ -37,7 +45,12 @@ def open_risk_block_reason(
         and float(s.candidate.short_strike) == float(candidate.short_strike)
     ]
     strike_contracts = sum(int(s.contracts) for s in same_strike)
-    if max_open_same_strike > 0 and strike_contracts + contracts > max_open_same_strike:
+    same_strike_cap = (
+        int(round(max_open_same_strike_multiple * contracts))
+        if max_open_same_strike_multiple > 0
+        else max_open_same_strike
+    )
+    if same_strike_cap > 0 and strike_contracts + contracts > same_strike_cap:
         return "max_open_same_strike"
     if max_open_side_cluster > 0 and side_cluster_points > 0:
         clustered = [

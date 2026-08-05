@@ -265,11 +265,21 @@ class LiveConfig:
     # side_cluster tripled 2026-08-05 (8/6/4 -> 24/18/12) at the account's
     # request after the book ran into the 8-contract cap same-side; kept
     # proportional so per_side/side_cluster don't bind before the raised
-    # aggregate cap does. max_open_same_strike is a same-strike concentration
-    # control, not an aggregate-exposure one, and was deliberately left at 2.
+    # aggregate cap does.
     max_open_contracts: int = 24
     max_open_per_side: int = 18
+    # Same-strike concentration cap. Static fallback only — see
+    # max_open_same_strike_multiple below, which is what actually governs
+    # this in production. Left intentionally tight (2) as the floor that
+    # applies if the dynamic multiplier is ever disabled (set to 0).
     max_open_same_strike: int = 2
+    # 2026-08-05: made same-strike dynamic at the account's request ("12x the
+    # current sell size") rather than a fixed lot count, so it scales with
+    # whatever size is actually being traded (VIX-elevated sizing,
+    # downsize-after-stop, etc.) instead of going stale as sizing changes.
+    # Effective cap = this x the tranche's sized contracts at the moment of
+    # the check, and supersedes max_open_same_strike above when > 0.
+    max_open_same_strike_multiple: float = 12.0
     max_open_side_cluster: int = 12
     side_cluster_points: float = 25.0
     # Live stop-count caps (production profile uses 999; tighten here).

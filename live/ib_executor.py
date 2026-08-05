@@ -2637,6 +2637,7 @@ def _process_tranche(
             max_open_contracts=live.max_open_contracts,
             max_open_per_side=live.max_open_per_side,
             max_open_same_strike=live.max_open_same_strike,
+            max_open_same_strike_multiple=live.max_open_same_strike_multiple,
             max_open_side_cluster=live.max_open_side_cluster,
             side_cluster_points=live.side_cluster_points,
         )
@@ -2773,6 +2774,7 @@ def _process_tranche(
                         max_open_contracts=live.max_open_contracts,
                         max_open_per_side=live.max_open_per_side,
                         max_open_same_strike=live.max_open_same_strike,
+                        max_open_same_strike_multiple=live.max_open_same_strike_multiple,
                         max_open_side_cluster=live.max_open_side_cluster,
                         side_cluster_points=live.side_cluster_points,
                     )

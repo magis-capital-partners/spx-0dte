@@ -51,6 +51,59 @@ class OpenRiskCapTests(unittest.TestCase):
         )
         self.assertEqual(reason, "")
 
+    def test_same_strike_static_cap_blocks(self) -> None:
+        reason = open_risk_block_reason(
+            _spread().candidate,
+            [_spread(contracts=2)],
+            contracts=2,
+            max_open_contracts=20,
+            max_open_per_side=20,
+            max_open_same_strike=2,
+        )
+        self.assertEqual(reason, "max_open_same_strike")
+
+    def test_same_strike_multiple_scales_with_current_tranche_size(self) -> None:
+        """Dynamic cap = multiple x contracts being traded right now, not a
+        fixed lot count — so it moves with VIX-elevated sizing or a
+        downsize-after-stop, instead of going stale."""
+        # Static cap (2) would block this, but the multiplier (12x current
+        # size=2 -> 24) supersedes it and allows the add.
+        reason = open_risk_block_reason(
+            _spread().candidate,
+            [_spread(contracts=2)],
+            contracts=2,
+            max_open_contracts=20,
+            max_open_per_side=20,
+            max_open_same_strike=2,
+            max_open_same_strike_multiple=12.0,
+        )
+        self.assertEqual(reason, "")
+
+    def test_same_strike_multiple_still_blocks_past_its_own_cap(self) -> None:
+        # 12x a downsized 1-contract tranche = 12; 12 existing + 1 new = 13 > 12.
+        reason = open_risk_block_reason(
+            _spread().candidate,
+            [_spread(contracts=12)],
+            contracts=1,
+            max_open_contracts=999,
+            max_open_per_side=999,
+            max_open_same_strike=2,
+            max_open_same_strike_multiple=12.0,
+        )
+        self.assertEqual(reason, "max_open_same_strike")
+
+    def test_same_strike_multiple_zero_falls_back_to_static(self) -> None:
+        reason = open_risk_block_reason(
+            _spread().candidate,
+            [_spread(contracts=2)],
+            contracts=2,
+            max_open_contracts=20,
+            max_open_per_side=20,
+            max_open_same_strike=2,
+            max_open_same_strike_multiple=0.0,
+        )
+        self.assertEqual(reason, "max_open_same_strike")
+
     def test_nearby_same_side_strikes_share_cluster_cap(self) -> None:
         reason = open_risk_block_reason(
             _spread(strike=7590.0).candidate,
