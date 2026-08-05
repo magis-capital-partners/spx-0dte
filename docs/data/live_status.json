@@ -1,16 +1,16 @@
 {
   "schema": 2,
   "source": "cloud",
-  "generated_at": "2026-08-05T12:49:53.636936",
+  "generated_at": "2026-08-05T12:59:43.145246",
   "date": "2026-08-05",
   "pid_alive": true,
-  "heartbeat_ts": "2026-08-05T12:49:53.582753",
+  "heartbeat_ts": "2026-08-05T12:59:41.107515",
   "entries_halted": false,
   "flattened": false,
   "open_count": 4,
-  "marked_pnl": 1650.0,
+  "marked_pnl": 1700.0,
   "closed_pnl": 1180.0,
-  "total_pnl": 2830.0,
+  "total_pnl": 2880.0,
   "credit_received": 6015.0,
   "contracts_traded": 12,
   "entry_count": 8,
@@ -69,7 +69,7 @@
     {
       "date": "2026-08-05",
       "execution_type": "production_live",
-      "ts": "2026-08-05T12:49:47.588046",
+      "ts": "2026-08-05T12:59:11.028216",
       "marked_pnl": 1730.0,
       "closed_pnl": 1180.0,
       "total_pnl": 2910.0,
@@ -80,7 +80,7 @@
     }
   ],
   "last_event": {
-    "ts": "2026-08-05T12:25:43.433376",
+    "ts": "2026-08-05T12:53:37.753522",
     "event": "account_guard_startup"
   },
   "note": "Sanitized status only. Full console is local to the trading host."
