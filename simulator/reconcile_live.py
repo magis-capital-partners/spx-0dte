@@ -58,67 +58,105 @@ def settlement_close(day: str) -> Optional[float]:
     return row.close if row else None
 
 
-def settlement_marked_pnl(entries: List[dict], events: List[dict], spot: float) -> float:
-    """True EOD P&L: realized closes (stops/flattens) plus settlement value of
-    whatever was still open at the close.
+def _settlement_value(side, short_strike, long_strike, spot: float) -> Optional[float]:
+    """Per-contract cash-settlement intrinsic value of a credit spread."""
+    if short_strike is None or long_strike is None:
+        return None
+    short_strike = float(short_strike)
+    long_strike = float(long_strike)
+    if side == "bear_call":
+        return max(0.0, spot - short_strike) - max(0.0, spot - long_strike)
+    if side == "bull_put":
+        return max(0.0, short_strike - spot) - max(0.0, long_strike - spot)
+    return None
 
-    Groups fills by (side, short_strike, long_strike). For each group, nets
-    out contracts actually closed early via ``stop`` or ``flatten_fill``
-    events against their real fill price (realized, not theoretical), and
-    only prices the *remaining* open contracts at 0DTE cash-settlement
-    intrinsic value using the official SPX close. Earlier versions of this
-    function valued every entry fill at settlement regardless of whether it
-    had already been bought back — double-counting any early close.
 
-    ``stop`` events only report the short leg's buyback price; the long leg
-    is assumed to ride to expiration with the rest of the group (typical for
-    a short-leg-only stop), so its settlement value is still included.
+def _close_debits_by_spread(events: List[dict]) -> Dict[tuple, List[list]]:
+    """Early-close debits per spread, oldest first.
+
+    ``flatten_fill`` records a negative ``fill_price`` (a debit paid to buy the
+    spread back); ``stop`` records the short-leg buyback in ``stop_fill``. Both
+    are normalized to a positive per-contract debit so entry attribution can
+    subtract them uniformly.
     """
-    groups: Dict[tuple, dict] = {}
+    closes: Dict[tuple, List[list]] = {}
+    for event in events:
+        kind = event.get("event")
+        if kind == "flatten_fill":
+            debit = -float(event.get("fill_price") or 0.0)
+        elif kind == "stop":
+            debit = float(event.get("stop_fill") or 0.0)
+        else:
+            continue
+        key = (event.get("side"), event.get("short_strike"), event.get("long_strike"))
+        closes.setdefault(key, []).append(
+            [str(event.get("ts") or ""), float(event.get("contracts") or 0.0), debit]
+        )
+    for rows in closes.values():
+        rows.sort(key=lambda row: row[0])
+    return closes
+
+
+def settlement_entry_pnl(
+    entries: List[dict], events: List[dict], spot: float,
+) -> List[Optional[float]]:
+    """Per-entry EOD P&L, aligned positionally with ``entries``.
+
+    Each entry's contracts are matched FIFO within their spread
+    (side, short_strike, long_strike) against any early closes — a stop or a
+    kill-switch flatten — and priced against that real fill. Whatever is left
+    over was still open at the bell, so it settles at 0DTE cash-settlement
+    intrinsic value off the official SPX close.
+
+    FIFO is a convention: the log records closes per spread, not per originating
+    tranche, so when two tranches sold the same strikes the attribution between
+    them is arbitrary. The day total is unaffected.
+
+    ``stop`` reports only the short leg's buyback, so the protective long is
+    treated as riding to expiration with the rest of the spread.
+    """
+    queues = {
+        key: [[contracts, debit] for _, contracts, debit in rows]
+        for key, rows in _close_debits_by_spread(events).items()
+    }
+    results: List[Optional[float]] = []
     for entry in entries:
-        key = (entry.get("side"), entry.get("short_strike"), entry.get("long_strike"))
-        g = groups.setdefault(key, {"contracts": 0.0, "credit_dollars": 0.0, "closed_contracts": 0.0, "realized_dollars": 0.0})
+        side = entry.get("side")
+        short_strike = entry.get("short_strike")
+        long_strike = entry.get("long_strike")
         contracts = float(entry.get("contracts") or 0.0)
         credit = float(entry.get("credit") or 0.0)
-        g["contracts"] += contracts
-        g["credit_dollars"] += credit * contracts * 100.0
 
-    for event in events:
-        if event.get("event") == "flatten_fill":
-            key = (event.get("side"), event.get("short_strike"), event.get("long_strike"))
-            g = groups.get(key)
-            if g is None:
+        pnl = 0.0
+        remaining = contracts
+        for slot in queues.get((side, short_strike, long_strike), []):
+            if remaining <= 0:
+                break
+            if slot[0] <= 0:
                 continue
-            contracts = float(event.get("contracts") or 0.0)
-            g["closed_contracts"] += contracts
-            g["realized_dollars"] += float(event.get("fill_price") or 0.0) * contracts * 100.0
-        elif event.get("event") == "stop":
-            key = (event.get("side"), event.get("short_strike"), event.get("long_strike"))
-            g = groups.get(key)
-            if g is None:
-                continue
-            contracts = float(event.get("contracts") or 0.0)
-            g["closed_contracts"] += contracts
-            g["realized_dollars"] -= float(event.get("stop_fill") or 0.0) * contracts * 100.0
+            take = min(remaining, slot[0])
+            pnl += (credit - slot[1]) * take * 100.0
+            slot[0] -= take
+            remaining -= take
 
-    total = 0.0
-    for (side, short_strike, long_strike), g in groups.items():
-        contracts = g["contracts"] or 1.0
-        avg_credit = g["credit_dollars"] / contracts
-        closed = min(g["closed_contracts"], g["contracts"])
-        remaining = g["contracts"] - closed
-        total += avg_credit * closed + g["realized_dollars"]
-        if remaining > 0 and short_strike is not None and long_strike is not None:
-            short_strike = float(short_strike)
-            long_strike = float(long_strike)
-            if side == "bear_call":
-                value = max(0.0, spot - short_strike) - max(0.0, spot - long_strike)
-            elif side == "bull_put":
-                value = max(0.0, short_strike - spot) - max(0.0, long_strike - spot)
-            else:
+        if remaining > 0:
+            value = _settlement_value(side, short_strike, long_strike, spot)
+            if value is None:
+                results.append(None)
                 continue
-            total += avg_credit * remaining - value * 100.0 * remaining
-    return round(total, 2)
+            pnl += (credit - value) * remaining * 100.0
+        results.append(round(pnl, 2))
+    return results
+
+
+def settlement_marked_pnl(entries: List[dict], events: List[dict], spot: float) -> float:
+    """Day EOD P&L: the sum of per-entry settlement P&L.
+
+    Derived from :func:`settlement_entry_pnl` so the headline number and the
+    per-entry column can never disagree.
+    """
+    per_entry = settlement_entry_pnl(entries, events, spot)
+    return round(sum(pnl for pnl in per_entry if pnl is not None), 2)
 
 
 def load_live_session(day: str) -> tuple:
@@ -424,13 +462,20 @@ def main() -> None:
     live_summary["settlement_price"] = spot
     if spot is not None:
         entries = [e for e in events if e.get("event") == "entry"]
-        theo = settlement_marked_pnl(entries, events, spot)
-        live_summary["settlement_marked_pnl"] = theo
+        per_entry = settlement_entry_pnl(entries, events, spot)
+        settled = round(sum(pnl for pnl in per_entry if pnl is not None), 2)
+        live_summary["settlement_marked_pnl"] = settled
+        # Keyed by fill timestamp so the dashboard can join without re-deriving.
+        live_summary["entry_pnl"] = [
+            {"ts": entry.get("ts"), "settlement_pnl": pnl}
+            for entry, pnl in zip(entries, per_entry)
+        ]
         if live_summary.get("marked_pnl") is not None:
-            live_summary["marked_pnl_vs_settlement"] = round(theo - live_summary["marked_pnl"], 2)
+            live_summary["marked_pnl_vs_settlement"] = round(settled - live_summary["marked_pnl"], 2)
     else:
         live_summary["settlement_marked_pnl"] = None
         live_summary["marked_pnl_vs_settlement"] = None
+        live_summary["entry_pnl"] = []
 
     paper_bt = replay_backtest(
         args.date, snapshot, processed, args.train_count, events=events,
