@@ -1,16 +1,16 @@
 {
   "schema": 2,
   "source": "cloud",
-  "generated_at": "2026-08-05T12:24:44.618786",
+  "generated_at": "2026-08-05T12:34:47.775105",
   "date": "2026-08-05",
   "pid_alive": true,
-  "heartbeat_ts": "2026-08-05T12:24:41.255389",
+  "heartbeat_ts": "2026-08-05T12:34:47.198400",
   "entries_halted": false,
   "flattened": false,
   "open_count": 4,
-  "marked_pnl": 550.0,
+  "marked_pnl": 610.0,
   "closed_pnl": 1180.0,
-  "total_pnl": 1730.0,
+  "total_pnl": 1790.0,
   "credit_received": 6015.0,
   "contracts_traded": 12,
   "entry_count": 8,
@@ -20,12 +20,14 @@
     "max_loss_no_stop": 71000.0,
     "planned_stop_loss": 8480.0,
     "defined_risk_margin": 75000.0,
-    "marked_pnl": 590.0,
-    "marked_return_on_margin": 0.007867,
-    "marked_return_on_margin_pct": 0.79,
+    "marked_pnl": 640.0,
+    "marked_return_on_margin": 0.008533,
+    "marked_return_on_margin_pct": 0.85,
     "open_count": 4,
     "marked_count": 4,
-    "mark_quality": "ok"
+    "mark_quality": "ok",
+    "stop_wake_count": 0,
+    "last_stop_wake": null
   },
   "risk_history": [
     {
@@ -67,19 +69,19 @@
     {
       "date": "2026-08-05",
       "execution_type": "production_live",
-      "ts": "2026-08-05T12:24:23.157448",
-      "marked_pnl": 620.0,
+      "ts": "2026-08-05T12:34:23.110120",
+      "marked_pnl": 680.0,
       "closed_pnl": 1180.0,
-      "total_pnl": 1800.0,
+      "total_pnl": 1860.0,
       "contracts_traded": 12,
       "defined_risk_margin": 75000.0,
-      "marked_return_on_margin_pct": 0.83,
+      "marked_return_on_margin_pct": 0.91,
       "max_loss_no_stop": 71000.0
     }
   ],
   "last_event": {
-    "ts": "2026-08-05T12:02:02.529510",
-    "event": "entry"
+    "ts": "2026-08-05T12:25:43.433376",
+    "event": "account_guard_startup"
   },
   "note": "Sanitized status only. Full console is local to the trading host."
 }
