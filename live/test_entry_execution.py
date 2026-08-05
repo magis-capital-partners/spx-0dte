@@ -91,7 +91,9 @@ class _FakeIB:
         self.cancel_calls += 1
 
     def sleep(self, _s):
-        return None
+        # The entry poll path runs while the book is short 0DTE gamma; blocking
+        # here blinds stop management. Cancels are awaited across polls instead.
+        raise AssertionError("blocking ib.sleep is forbidden on the entry poll path")
 
 
 def _pending(
@@ -241,23 +243,134 @@ class EntryExecutionTests(unittest.TestCase):
 
 class PollPendingEntryTests(unittest.TestCase):
     def test_quality_deterioration_cancels_working_order_before_ladder(self) -> None:
+        """Cancel is requested at once, then resolved on a later poll (no ib.sleep)."""
         now = datetime(2026, 7, 29, 9, 49, 0)
         ib = _FakeIB()
-        pending = _pending(_FakeTrade("Submitted"), now=now, next_ladder_in=-1.0)
+        trade = _FakeTrade("Submitted")
+        pending = _pending(trade, now=now, next_ladder_in=-1.0)
+        live = LiveConfig(entry_ladder_step=0.05)
+
         remaining, resolution = poll_pending_entry(
-            ib,
-            pending,
-            LiveConfig(entry_ladder_step=0.05),
-            "2026-07-29",
-            now,
+            ib, pending, live, "2026-07-29", now,
             log_event=lambda *_a, **_k: None,
             quality_block_reason="entry_quality_spot_drift",
         )
-        self.assertIsNone(remaining)
-        assert resolution is not None
-        self.assertEqual(resolution["reason"], "entry_quality_spot_drift")
+        # Phase 1: cancel sent, pending retained, nothing booked yet.
+        self.assertIsNotNone(remaining)
+        self.assertIsNone(resolution)
         self.assertEqual(ib.cancel_calls, 1)
         self.assertEqual(ib.place_calls, 0)
+        assert remaining is not None
+        self.assertEqual(remaining.cancel_reason, "entry_quality_spot_drift")
+
+        # Phase 2: IB confirms; the original block reason is what gets booked.
+        trade.orderStatus.status = "Cancelled"
+        remaining2, resolution2 = poll_pending_entry(
+            ib, remaining, live, "2026-07-29", now + timedelta(seconds=0.5),
+            log_event=lambda *_a, **_k: None,
+            quality_block_reason="entry_quality_spot_drift",
+        )
+        self.assertIsNone(remaining2)
+        assert resolution2 is not None
+        self.assertEqual(resolution2["reason"], "entry_quality_spot_drift")
+        # No second cancel and never a placeOrder while cancelling.
+        self.assertEqual(ib.cancel_calls, 1)
+        self.assertEqual(ib.place_calls, 0)
+
+    def test_awaited_cancel_resolves_on_grace_timeout(self) -> None:
+        """IB never confirms: resolve at the grace bound rather than hanging."""
+        now = datetime(2026, 7, 29, 9, 49, 0)
+        ib = _FakeIB()
+        pending = _pending(_FakeTrade("Submitted"), now=now, next_ladder_in=-1.0)
+        live = LiveConfig(entry_ladder_step=0.05, entry_cancel_grace_seconds=1.0)
+
+        remaining, _ = poll_pending_entry(
+            ib, pending, live, "2026-07-29", now,
+            log_event=lambda *_a, **_k: None,
+            quality_block_reason="entry_quality_spot_drift",
+        )
+        assert remaining is not None
+
+        # Still inside the grace window and still unconfirmed: keep waiting.
+        mid, res_mid = poll_pending_entry(
+            ib, remaining, live, "2026-07-29", now + timedelta(seconds=0.5),
+            log_event=lambda *_a, **_k: None,
+            quality_block_reason="entry_quality_spot_drift",
+        )
+        self.assertIsNotNone(mid)
+        self.assertIsNone(res_mid)
+
+        # Past the grace bound: book the reject.
+        assert mid is not None
+        final, res_final = poll_pending_entry(
+            ib, mid, live, "2026-07-29", now + timedelta(seconds=1.5),
+            log_event=lambda *_a, **_k: None,
+            quality_block_reason="entry_quality_spot_drift",
+        )
+        self.assertIsNone(final)
+        assert res_final is not None
+        self.assertEqual(res_final["event"], "order_rejected")
+        self.assertEqual(res_final["reason"], "entry_quality_spot_drift")
+        self.assertEqual(ib.cancel_calls, 1)
+
+    def test_fill_during_awaited_cancel_is_booked(self) -> None:
+        """A fill that lands while the cancel is in flight must still be booked."""
+        now = datetime(2026, 7, 29, 9, 49, 0)
+        ib = _FakeIB()
+        trade = _FakeTrade("Submitted")
+        pending = _pending(trade, now=now, next_ladder_in=-1.0)
+        live = LiveConfig(entry_ladder_step=0.05)
+
+        remaining, _ = poll_pending_entry(
+            ib, pending, live, "2026-07-29", now,
+            log_event=lambda *_a, **_k: None,
+            quality_block_reason="entry_quality_spot_drift",
+        )
+        assert remaining is not None
+
+        trade.orderStatus.status = "Filled"
+        trade.orderStatus.filled = 2.0
+        trade.orderStatus.avgFillPrice = -3.05
+        final, resolution = poll_pending_entry(
+            ib, remaining, live, "2026-07-29", now + timedelta(seconds=0.2),
+            log_event=lambda *_a, **_k: None,
+            quality_block_reason="entry_quality_spot_drift",
+        )
+        self.assertIsNone(final)
+        assert resolution is not None
+        self.assertEqual(resolution["event"], "entry")
+        self.assertEqual(resolution["contracts"], 2)
+
+    def test_partial_fill_during_awaited_cancel_is_booked(self) -> None:
+        """Deadline cancel with a partial fill books the partial, never orphans legs."""
+        now = datetime(2026, 7, 29, 9, 49, 0)
+        ib = _FakeIB()
+        trade = _FakeTrade("Submitted")
+        # work_until already passed -> deadline cancel path.
+        pending = _pending(trade, now=now, work_seconds=-1.0, next_ladder_in=600.0)
+        live = LiveConfig(entry_ladder_step=0.05)
+
+        remaining, resolution = poll_pending_entry(
+            ib, pending, live, "2026-07-29", now, log_event=lambda *_a, **_k: None,
+        )
+        self.assertIsNotNone(remaining)
+        self.assertIsNone(resolution)
+        self.assertEqual(ib.cancel_calls, 1)
+
+        assert remaining is not None
+        trade.orderStatus.status = "Cancelled"
+        trade.orderStatus.filled = 1.0
+        trade.orderStatus.avgFillPrice = -3.05
+        final, res = poll_pending_entry(
+            ib, remaining, live, "2026-07-29", now + timedelta(seconds=0.3),
+            log_event=lambda *_a, **_k: None,
+        )
+        self.assertIsNone(final)
+        assert res is not None
+        self.assertEqual(res["event"], "entry")
+        self.assertTrue(res["partial"])
+        self.assertEqual(res["contracts"], 1)
+        self.assertEqual(res["requested_contracts"], 2)
 
     def test_cancelled_rejects_without_place_order(self) -> None:
         now = datetime(2026, 7, 29, 9, 49, 0)
@@ -428,12 +541,28 @@ class PollPendingEntryTests(unittest.TestCase):
             ib, pending, live, "2026-07-29", now, log_event=lambda *_a, **_k: None,
         )
 
-        self.assertIsNone(remaining)
-        assert resolution is not None
-        self.assertEqual(resolution["event"], "order_rejected")
-        self.assertEqual(resolution["reason"], "entry_ladder_failed")
+        # Failed amend requests a cancel and defers; the step must not advance
+        # and the limit must be restored to its pre-amend value.
+        self.assertIsNotNone(remaining)
+        self.assertIsNone(resolution)
         self.assertEqual(pending.ladder_step, 0)
         self.assertAlmostEqual(pending.limit_credit, 3.20, places=2)
+        self.assertAlmostEqual(trade.order.lmtPrice, -3.0, places=2)
+        self.assertEqual(ib.place_calls, 1)
+        self.assertEqual(ib.cancel_calls, 1)
+
+        assert remaining is not None
+        trade.orderStatus.status = "Cancelled"
+        final, res = poll_pending_entry(
+            ib, remaining, live, "2026-07-29", now + timedelta(seconds=0.3),
+            log_event=lambda *_a, **_k: None,
+        )
+        self.assertIsNone(final)
+        assert res is not None
+        self.assertEqual(res["event"], "order_rejected")
+        self.assertEqual(res["reason"], "entry_ladder_failed")
+        self.assertEqual(pending.ladder_step, 0)
+        # No retry of the amend, no second cancel.
         self.assertEqual(ib.place_calls, 1)
         self.assertEqual(ib.cancel_calls, 1)
 

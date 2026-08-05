@@ -282,7 +282,7 @@ class DisarmBudgetTests(unittest.TestCase):
             sleeve="core",
             score=2.0,
         )
-        remaining = enforce_native_stop_disarm_budget(
+        remaining, booking = enforce_native_stop_disarm_budget(
             None,
             pending,
             open_spreads,
@@ -293,6 +293,8 @@ class DisarmBudgetTests(unittest.TestCase):
             config=config,
         )
         self.assertIsNone(remaining)
+        # dry run: nothing is ever booked from a teardown cancel.
+        self.assertEqual(booking.contracts, 0)
         self.assertIsNotNone(prior.stop_order_id)
 
     def test_keeps_pending_within_budget(self) -> None:
@@ -318,7 +320,7 @@ class DisarmBudgetTests(unittest.TestCase):
             sleeve="core",
             score=2.0,
         )
-        remaining = enforce_native_stop_disarm_budget(
+        remaining, booking = enforce_native_stop_disarm_budget(
             None,
             pending,
             [prior],
@@ -329,6 +331,7 @@ class DisarmBudgetTests(unittest.TestCase):
             config=config,
         )
         self.assertIs(remaining, pending)
+        self.assertEqual(booking.contracts, 0)
 
 
 if __name__ == "__main__":

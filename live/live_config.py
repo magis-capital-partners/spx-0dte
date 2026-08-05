@@ -111,6 +111,16 @@ class LiveConfig:
     signal_sample_poll_seconds: float = 0.25
     signal_max_feature_quote_age_seconds: float = 5.0
     signal_max_feature_timestamp_dispersion_seconds: float = 1.5
+    # Event-driven stop wake: the loop's idle sleep is cut short when a watched
+    # short leg ticks at or above its stop price, so an immediate-mode stop
+    # (severe breach / underlying cross) fires on the tick instead of waiting
+    # out poll_seconds_near_stop. Detection then floors at IB's ~250ms feed
+    # cadence rather than the poll interval. Slice bounds the check granularity.
+    use_stop_wake: bool = True
+    stop_wake_slice_seconds: float = 0.05
+    # Wake slightly before the stop price so the loop is already awake and has
+    # a fresh quote when the breach lands (fraction of stop_price).
+    stop_wake_arm_fraction: float = 0.95
 
     # --- Phase 4: stop execution ------------------------------------------ #
     stop_limit_slippage_pct: float = 0.05
@@ -171,6 +181,10 @@ class LiveConfig:
     entry_ladder_interval_seconds: float = 60.0
     entry_max_ladder_steps: int = 3
     entry_poll_seconds: float = 0.5
+    # Entry cancels are awaited across loop iterations instead of blocking on
+    # ib.sleep, so stop management keeps running while IB processes the cancel.
+    # Upper bound before a pending entry resolves without IB confirmation.
+    entry_cancel_grace_seconds: float = 1.0
     max_leg_quote_age_seconds: float = 5.0
     entry_max_signal_age_seconds: float = 75.0
     entry_max_spot_drift_points: float = 8.0

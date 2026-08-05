@@ -91,14 +91,17 @@ except Exception:  # pragma: no cover - import guard
 from live_config import ACTIVE, LiveConfig  # noqa: E402
 from combo_pricing import ComboQuote, protect_credit_limit  # noqa: E402
 from entry_execution import (  # noqa: E402
+    ENTRY_DONE_STATUSES,
     PendingEntry,
     evaluate_entry_quality,
     entry_limit_credit,
     entry_quote_block_reason,
     natural_credit,
+    pending_is_awaiting_cancel,
     pending_trade_is_active,
     poll_pending_entry,
     round_spx_premium,
+    teardown_fill_event,
     work_deadline,
 )
 from live_features import (  # noqa: E402
@@ -115,8 +118,10 @@ from feature_state_io import load_feature_state, save_feature_state  # noqa: E40
 from ib_market_data import IBStreamingMarketData  # noqa: E402
 from loop_timing import (  # noqa: E402
     adaptive_sleep_seconds,
+    interruptible_sleep,
     seconds_until_market_open,
     should_fire_tranche,
+    stop_wake_thresholds,
 )
 from risk_gates import apply_side_stop_cooldowns, side_stop_cooldown_block_reason  # noqa: E402
 from vix_session import (  # noqa: E402
@@ -157,7 +162,11 @@ from ib_connection import (  # noqa: E402
 from connection_health import ConnectionHealthMonitor  # noqa: E402
 from run_metadata import build_run_metadata  # noqa: E402
 from stale_quotes import StaleQuoteTracker, evaluate_stale_quotes  # noqa: E402
-from slack_notify import maybe_notify_safety_event  # noqa: E402
+from slack_notify import (  # noqa: E402
+    dropped_count as slack_dropped_count,
+    flush as flush_slack,
+    maybe_notify_safety_event,
+)
 from heartbeat import append_risk_snapshot, write_heartbeat  # noqa: E402
 from execution_type import execution_type  # noqa: E402
 from risk_ledger import build_risk_snapshot  # noqa: E402
@@ -508,6 +517,16 @@ class IBSignalProvider:
             self._stream.quote_update_time(candidate.short_type, candidate.short_strike),
             self._stream.quote_update_time(candidate.short_type, candidate.long_strike),
         ]
+
+    # --- event-driven stop wake (delegates to the streaming feed) ----------- #
+    def arm_stop_watch(self, thresholds) -> None:
+        self._stream.arm_stop_watch(thresholds)
+
+    def stop_wake_pending(self) -> bool:
+        return self._stream.stop_wake_pending()
+
+    def consume_stop_wake(self):
+        return self._stream.consume_stop_wake()
 
     def evaluate_candidate_quality(
         self,
@@ -1141,23 +1160,38 @@ def enforce_native_stop_disarm_budget(
     dry: bool,
     live: LiveConfig,
     config: StrategyConfig,
-) -> Optional[PendingEntry]:
-    """Cancel a same-strike add that has left existing shorts unprotected too long."""
+    sleeve_margin_used: Optional[dict] = None,
+) -> Tuple[Optional[PendingEntry], CancelBooking]:
+    """Cancel a same-strike add that has left existing shorts unprotected too long.
+
+    Returns (remaining pending, booking). A non-empty booking means the entry
+    filled before the cancel landed and is now in ``open_spreads``; the caller
+    must fold its credit/margin into the session totals.
+    """
     if (
         pending is None
         or not live.use_native_stop_replace
         or live.native_stop_disarm_max_seconds <= 0
     ):
-        return pending
+        return pending, CancelBooking()
     siblings = active_spreads_on_short(open_spreads, pending.candidate)
     if not siblings:
-        return pending
+        return pending, CancelBooking()
     disarmed = any(s.stop_order_id is None for s in siblings)
     age = (now - pending.submitted_at).total_seconds()
     if not disarmed or age < live.native_stop_disarm_max_seconds:
-        return pending
-    cancel_pending_entry(
-        ib, pending, today, reason="native_stop_disarm_timeout", dry=dry,
+        return pending, CancelBooking()
+    booking = cancel_pending_entry(
+        ib,
+        pending,
+        today,
+        reason="native_stop_disarm_timeout",
+        dry=dry,
+        # open_spreads is a list in every live caller; Sequence here is only a
+        # read-only annotation for the scanning logic above.
+        open_spreads=open_spreads if isinstance(open_spreads, list) else None,
+        config=config,
+        sleeve_margin_used=sleeve_margin_used,
     )
     place_or_replace_native_stop_for_short(
         ib,
@@ -1181,7 +1215,47 @@ def enforce_native_stop_disarm_budget(
         f"{pending.candidate.side} {pending.candidate.short_strike}/"
         f"{pending.candidate.long_strike} after {age:.0f}s"
     )
-    return None
+    return None, booking
+
+
+def _await_cancel_ack(ib: "IB", trade, *, live: LiveConfig) -> float:
+    """Wait for IB to acknowledge a cancel. Returns seconds waited.
+
+    Returns as soon as the trade reaches a terminal status, capped by
+    ``entry_cancel_grace_seconds``. Sleeps in small slices so the ib_insync
+    event loop keeps pumping (market data stays fresh throughout).
+    """
+    grace = float(getattr(live, "entry_cancel_grace_seconds", 1.0) or 0.0)
+    if grace <= 0:
+        return 0.0
+    slice_seconds = max(
+        float(getattr(live, "stop_wake_slice_seconds", 0.05) or 0.05), 0.01,
+    )
+    start = _time.monotonic()
+    deadline = start + grace
+    while _time.monotonic() < deadline:
+        try:
+            if (trade.orderStatus.status or "").lower() in ENTRY_DONE_STATUSES:
+                break
+        except Exception:
+            break
+        ib.sleep(min(slice_seconds, max(deadline - _time.monotonic(), 0.0)))
+    return max(_time.monotonic() - start, 0.0)
+
+
+@dataclass(frozen=True)
+class CancelBooking:
+    """What a teardown cancel actually left on the book.
+
+    ``contracts`` > 0 means IB filled (fully or partially) before the cancel
+    landed and the spread has been appended to ``open_spreads``; the caller must
+    fold ``credit_added`` / ``margin`` into its running totals.
+    """
+
+    contracts: int = 0
+    credit_added: float = 0.0
+    margin: float = 0.0
+    event: Optional[dict] = None
 
 
 def cancel_pending_entry(
@@ -1191,14 +1265,68 @@ def cancel_pending_entry(
     *,
     reason: str,
     dry: bool,
-) -> None:
+    open_spreads: Optional[List[OpenSpread]] = None,
+    config: Optional[StrategyConfig] = None,
+    sleeve_margin_used: Optional[dict] = None,
+) -> CancelBooking:
+    """Cancel a working entry during teardown, booking anything that filled.
+
+    Pass ``open_spreads``/``config``/``sleeve_margin_used`` so a fill that beat
+    the cancel is added to the local book — otherwise the loop would manage a
+    short leg it does not know about. Without them the fill is logged loudly but
+    left to ``run_flatten_audit`` / ``session_recovery`` to reconcile.
+    """
     if pending is None or dry or not HAS_IB:
-        return
+        return CancelBooking()
     try:
         ib.cancelOrder(pending.trade.order)
-        ib.sleep(0.25)
+        # Terminal teardown: the caller discards this pending, so we still wait
+        # for the cancel before a same-strike order can be placed. Wait on the
+        # acknowledgement rather than a flat 0.25s — usually far shorter, and
+        # bounded by entry_cancel_grace_seconds when IB is slow.
+        _await_cancel_ack(ib, pending.trade, live=ACTIVE)
     except Exception:
         pass
+    # The poll resolver never runs on this pending, so anything IB filled before
+    # the cancel has to be booked here or it becomes an unmanaged short leg.
+    fill_event = teardown_fill_event(pending)
+    filled_lots = int(fill_event.get("contracts") or 0) if fill_event else 0
+    booking = CancelBooking()
+    if fill_event is not None:
+        if open_spreads is not None and config is not None:
+            contracts, credit_added, margin = _book_filled_spread(
+                fill_event,
+                pending,
+                open_spreads=open_spreads,
+                config=config,
+                sleeve_margin_used=(
+                    sleeve_margin_used if sleeve_margin_used is not None else {}
+                ),
+            )
+            booking = CancelBooking(
+                contracts=contracts,
+                credit_added=credit_added,
+                margin=margin,
+                event=fill_event,
+            )
+            log_event(today, {**fill_event, "booked_at_cancel": reason})
+            print(
+                f"[{datetime.now().isoformat()}] ENTRY filled during "
+                f"{reason} cancel: {pending.candidate.side} "
+                f"{pending.candidate.short_strike}/{pending.candidate.long_strike} "
+                f"x{contracts} fill={pending.spread.fill_credit:.2f} "
+                f"stop={pending.spread.stop_price:.2f} — booked and managed."
+            )
+        else:
+            # No book to append to (caller could not supply one). Log loudly:
+            # the flatten audit is the backstop for the resulting residual.
+            log_event(today, {**fill_event, "booked_at_cancel": None})
+            print(
+                f"[{datetime.now().isoformat()}] WARN: entry filled "
+                f"{filled_lots}/{pending.contracts} during {reason} cancel "
+                f"({pending.candidate.side} {pending.candidate.short_strike}) "
+                f"but was NOT booked locally — audit will reconcile."
+            )
     log_event(today, {
         "event": "entry_cancelled",
         "tranche_time": (
@@ -1211,8 +1339,12 @@ def cancel_pending_entry(
         "long_strike": pending.candidate.long_strike,
         "reason": reason,
         "limit_credit": round(pending.limit_credit, 2),
+        "filled_lots": filled_lots,
+        "requested_contracts": pending.contracts,
     })
-    if reason in {
+    # An order that filled is not a rejection: emitting order_rejected here too
+    # would double-count the tranche against the credit/margin ledger.
+    if filled_lots == 0 and reason in {
         "new_tranche",
         "flatten",
         "error",
@@ -1238,7 +1370,9 @@ def cancel_pending_entry(
             "credit": round(pending.limit_credit, 2),
             "status": "Cancelled",
             "reason": f"entry_cancelled_{reason}",
+            "filled_lots": filled_lots,
         })
+    return booking
 
 
 def repair_session_after_entry_fault(
@@ -1251,10 +1385,16 @@ def repair_session_after_entry_fault(
     live: LiveConfig,
     config: StrategyConfig,
     error: str,
-) -> None:
-    """Clear a dangling pending entry and re-arm native STPs so the loop can continue."""
+    sleeve_margin_used: Optional[dict] = None,
+) -> CancelBooking:
+    """Clear a dangling pending entry and re-arm native STPs so the loop can continue.
+
+    Returns the teardown booking: non-empty when the faulted entry had actually
+    filled, in which case the spread is now in ``open_spreads`` and the caller
+    must fold its credit/margin into the session totals.
+    """
     if pending is None:
-        return
+        return CancelBooking()
     log_event(today, {
         "event": "entry_poll_error",
         "error": error,
@@ -1266,7 +1406,16 @@ def repair_session_after_entry_fault(
             getattr(pending.trade, "orderStatus", None), "status", None,
         ),
     }, live=live)
-    cancel_pending_entry(ib, pending, today, reason="poll_error", dry=dry)
+    booking = cancel_pending_entry(
+        ib,
+        pending,
+        today,
+        reason="poll_error",
+        dry=dry,
+        open_spreads=open_spreads if isinstance(open_spreads, list) else None,
+        config=config,
+        sleeve_margin_used=sleeve_margin_used,
+    )
     if native_stops_enabled(live):
         place_or_replace_native_stop_for_short(
             ib,
@@ -1278,6 +1427,7 @@ def repair_session_after_entry_fault(
             config=config,
             reason="post_poll_error",
         )
+    return booking
 
 
 def submit_spread_entry(
@@ -1564,6 +1714,42 @@ def submit_paired_condor_entry(
     return spreads, ""
 
 
+def _book_filled_spread(
+    event: dict,
+    pending: PendingEntry,
+    *,
+    open_spreads: List[OpenSpread],
+    config: StrategyConfig,
+    sleeve_margin_used: dict,
+) -> Tuple[int, float, float]:
+    """Append a filled (or partially filled) spread to the local book.
+
+    Shared by the poll resolver and by teardown cancels so the two paths cannot
+    drift on stop pricing, partial sizing, or margin accounting.
+    Returns (contracts, credit_added, margin).
+    """
+    spread = pending.spread
+    fill_credit = float(event.get("credit", pending.limit_credit))
+    spread.fill_credit = fill_credit
+    # Partial fills: shrink local book to filled qty.
+    filled_contracts = int(event.get("contracts") or pending.contracts)
+    if filled_contracts > 0:
+        spread.contracts = filled_contracts
+    # Synthetic stop always uses strategy stop_multiple × short premium.
+    # Native STP uses live.native_stop_multiple separately (wider backstop).
+    if spread.short_entry_sell > 0 and config.stop_multiple > 0:
+        spread.stop_price = _round_spx_premium(
+            spread.short_entry_sell * config.stop_multiple
+        )
+    open_spreads.append(spread)
+    contracts = spread.contracts
+    credit_added = fill_credit * contracts * config.multiplier
+    margin = candidate_margin_per_contract(pending.candidate, config) * contracts
+    sleeve = pending.sleeve or "core"
+    sleeve_margin_used[sleeve] = sleeve_margin_used.get(sleeve, 0.0) + margin
+    return contracts, credit_added, margin
+
+
 def apply_pending_resolution(
     event: dict,
     pending: PendingEntry,
@@ -1582,32 +1768,20 @@ def apply_pending_resolution(
     credit_added = 0.0
     margin = 0.0
     if event.get("event") == "entry":
-        spread = pending.spread
-        fill_credit = float(event.get("credit", pending.limit_credit))
-        spread.fill_credit = fill_credit
-        # Partial fills: shrink local book to filled qty.
-        filled_contracts = int(event.get("contracts") or pending.contracts)
-        if filled_contracts > 0:
-            spread.contracts = filled_contracts
-        # Synthetic stop always uses strategy stop_multiple × short premium.
-        # Native STP uses live.native_stop_multiple separately (wider backstop).
-        if spread.short_entry_sell > 0 and config.stop_multiple > 0:
-            spread.stop_price = _round_spx_premium(
-                spread.short_entry_sell * config.stop_multiple
-            )
-        open_spreads.append(spread)
-        contracts = spread.contracts
-        credit_added = fill_credit * contracts * config.multiplier
-        margin = candidate_margin_per_contract(pending.candidate, config) * contracts
-        sleeve = pending.sleeve or "core"
-        sleeve_margin_used[sleeve] = sleeve_margin_used.get(sleeve, 0.0) + margin
+        contracts, credit_added, margin = _book_filled_spread(
+            event,
+            pending,
+            open_spreads=open_spreads,
+            config=config,
+            sleeve_margin_used=sleeve_margin_used,
+        )
         filled = 1
         partial_note = " partial" if event.get("partial") else ""
         print(
             f"[{datetime.now().isoformat()}] ENTRY filled{partial_note} {pending.candidate.side} "
             f"{pending.candidate.short_strike}/{pending.candidate.long_strike} "
-            f"x{contracts} fill={fill_credit:.2f} "
-            f"stop={spread.stop_price:.2f} "
+            f"x{contracts} fill={pending.spread.fill_credit:.2f} "
+            f"stop={pending.spread.stop_price:.2f} "
             f"(natural={event.get('natural_credit')} slippage={event.get('fill_slippage')})"
         )
     else:
@@ -2329,10 +2503,27 @@ def _process_tranche(
     """Evaluate one entry tranche; log diagnostics; submit any selected spreads."""
     stop_counts = side_stop_counts if side_stop_counts is not None else {}
     cooldown_map = side_stop_cooldown_until if side_stop_cooldown_until is not None else {}
+    # Credit/margin booked by the abandoned-entry teardown below, folded into
+    # this tranche's totals so the caller's caps stay accurate.
+    carried_credit = 0.0
+    carried_margin = 0.0
     if pending_entry is not None and not dry:
         cancelled_cand = pending_entry.candidate
-        cancel_pending_entry(ib, pending_entry, today, reason="new_tranche", dry=dry)
-        # Re-arm STPs that were disarmed for the abandoned working entry.
+        carried = cancel_pending_entry(
+            ib,
+            pending_entry,
+            today,
+            reason="new_tranche",
+            dry=dry,
+            open_spreads=open_spreads,
+            config=config,
+            sleeve_margin_used=sleeve_margin_used,
+        )
+        carried_credit = carried.credit_added
+        carried_margin = carried.margin
+        # Re-arm STPs that were disarmed for the abandoned working entry. When
+        # the entry filled instead, the spread is now in open_spreads and this
+        # arms the STP for the real position.
         place_or_replace_native_stop_for_short(
             ib,
             cancelled_cand,
@@ -2388,8 +2579,8 @@ def _process_tranche(
             records.extend(condor_records)
 
     executed = 0
-    credit_added = 0.0
-    margin_added = 0.0
+    credit_added = carried_credit
+    margin_added = carried_margin
     order_rejected = False
     entry_working = False
     new_pending: Optional[PendingEntry] = None
@@ -3034,6 +3225,11 @@ def run(live: LiveConfig = ACTIVE) -> None:
             portfolio_margin_used += mpc
         traded_tranches: set = set()
         pending_entry = None
+        # Stop-wake observability: session count of idles cut short by a short
+        # leg ticking into its stop band. Surfaced in the risk snapshot so the
+        # event-driven path can be verified without per-wake log spam.
+        stop_wake_count = 0
+        last_stop_wake: Optional[Tuple[str, float, float]] = None
         last_quotes = []
         last_marked_pnl = 0.0
         last_native_stop_verify_at = datetime.now()
@@ -3049,11 +3245,36 @@ def run(live: LiveConfig = ACTIVE) -> None:
         if isinstance(provider, IBSignalProvider):
             ib_provider = provider
 
+        def _cancel_pending(pending_obj, reason: str) -> CancelBooking:
+            """Tear down a working entry, booking anything that filled first.
+
+            A fill can beat the cancel; booking it here puts the spread under
+            stop management (and inside the flatten set) instead of leaving an
+            unmanaged short leg for the audit to discover.
+            """
+            nonlocal gross_credit_sold, portfolio_margin_used
+            booking = cancel_pending_entry(
+                ib,
+                pending_obj,
+                today,
+                reason=reason,
+                dry=dry,
+                open_spreads=open_spreads,
+                config=config,
+                sleeve_margin_used=sleeve_margin_used,
+            )
+            if booking.contracts:
+                gross_credit_sold += booking.credit_added
+                portfolio_margin_used += booking.margin
+            return booking
+
         def _trigger_flatten(reason: str, marked_pnl: float) -> FlattenResult:
             nonlocal pending_entry, flattened, entries_halted
             flattened = True
             entries_halted = True
-            cancel_pending_entry(ib, pending_entry, today, reason=reason, dry=dry)
+            # Book before flatten_all so a fill that beat the cancel is included
+            # in the flatten set rather than surviving the flatten.
+            _cancel_pending(pending_entry, reason)
             pending_entry = None
             fres = flatten_all(
                 ib, [s for s in open_spreads if not s.closed], today, dry, live=live,
@@ -3109,7 +3330,7 @@ def run(live: LiveConfig = ACTIVE) -> None:
                     entries_halted = True
                     print(f"[{now.isoformat()}] IB DISCONNECTED — halting entries, reconnecting…")
                     log_event(today, {"event": "ib_disconnected"}, live=live)
-                    cancel_pending_entry(ib, pending_entry, today, reason="disconnect", dry=dry)
+                    _cancel_pending(pending_entry, "disconnect")
                     pending_entry = None
                     if ib_provider is not None:
                         try:
@@ -3211,10 +3432,7 @@ def run(live: LiveConfig = ACTIVE) -> None:
                                 "ib_error_code": transition.code,
                             }, live=live)
                             lost_pending = pending_entry
-                            cancel_pending_entry(
-                                ib, lost_pending, today,
-                                reason="ib_upstream_lost", dry=dry,
-                            )
+                            _cancel_pending(lost_pending, "ib_upstream_lost")
                             pending_entry = None
                             if lost_pending is not None and native_stops_enabled(live):
                                 # Best-effort re-arm; verify_native_stops
@@ -3310,10 +3528,7 @@ def run(live: LiveConfig = ACTIVE) -> None:
                 ):
                     entries_halted = True
                     active_pending = pending_entry
-                    cancel_pending_entry(
-                        ib, active_pending, today,
-                        reason="stale_underlying", dry=dry,
-                    )
+                    _cancel_pending(active_pending, "stale_underlying")
                     pending_entry = None
                     if active_pending is not None and native_stops_enabled(live):
                         place_or_replace_native_stop_for_short(
@@ -3351,7 +3566,7 @@ def run(live: LiveConfig = ACTIVE) -> None:
                         **ib_provider.last_signal_diagnostics,
                     }, live=live)
 
-                pending_entry = enforce_native_stop_disarm_budget(
+                pending_entry, disarm_booking = enforce_native_stop_disarm_budget(
                     ib,
                     pending_entry,
                     open_spreads,
@@ -3360,7 +3575,11 @@ def run(live: LiveConfig = ACTIVE) -> None:
                     dry=dry,
                     live=live,
                     config=config,
+                    sleeve_margin_used=sleeve_margin_used,
                 )
+                if disarm_booking.contracts:
+                    gross_credit_sold += disarm_booking.credit_added
+                    portfolio_margin_used += disarm_booking.margin
 
                 if pending_entry is not None and ib is not None and not dry:
                     active_pending = pending_entry
@@ -3398,11 +3617,14 @@ def run(live: LiveConfig = ACTIVE) -> None:
                             log_event=log_event,
                             quality_block_reason=quality_block,
                         )
-                        # Belt-and-suspenders: never keep a non-active trade as pending.
+                        # Belt-and-suspenders: never keep a non-active trade as
+                        # pending. A cancel awaiting IB acknowledgement is the
+                        # one legitimate inactive-but-pending state.
                         if (
                             pending_entry is not None
                             and resolution is None
                             and not pending_trade_is_active(pending_entry)
+                            and not pending_is_awaiting_cancel(pending_entry)
                         ):
                             raise RuntimeError(
                                 "pending_entry_inactive "
@@ -3413,7 +3635,7 @@ def run(live: LiveConfig = ACTIVE) -> None:
                             f"[{now.isoformat()}] ENTRY poll fault recovered: "
                             f"{poll_exc!r} — clearing pending, re-arming STP"
                         )
-                        repair_session_after_entry_fault(
+                        fault_booking = repair_session_after_entry_fault(
                             ib,
                             active_pending,
                             open_spreads,
@@ -3422,7 +3644,11 @@ def run(live: LiveConfig = ACTIVE) -> None:
                             live=live,
                             config=config,
                             error=repr(poll_exc),
+                            sleeve_margin_used=sleeve_margin_used,
                         )
+                        if fault_booking.contracts:
+                            gross_credit_sold += fault_booking.credit_added
+                            portfolio_margin_used += fault_booking.margin
                         pending_entry = None
                         resolution = None
                     if resolution is not None:
@@ -3527,6 +3753,22 @@ def run(live: LiveConfig = ACTIVE) -> None:
                     risk = build_risk_snapshot(
                         open_spreads, quotes, multiplier=config.multiplier,
                     )
+                    # Cheap stop-wake telemetry: a session counter plus the last
+                    # breaching quote. Zero while flat; rising only when a short
+                    # leg trades into its stop band.
+                    risk = {
+                        **risk,
+                        "stop_wake_count": stop_wake_count,
+                        "last_stop_wake": (
+                            {
+                                "option_type": last_stop_wake[0],
+                                "strike": last_stop_wake[1],
+                                "ask": last_stop_wake[2],
+                            }
+                            if last_stop_wake is not None
+                            else None
+                        ),
+                    }
                     write_heartbeat(
                         today,
                         open_count=open_n,
@@ -3689,15 +3931,63 @@ def run(live: LiveConfig = ACTIVE) -> None:
                     sleep_for = min(sleep_for, live.entry_poll_seconds)
                 if sleep_for > 0:
                     self_sleep = sleep_for
-                    if HAS_IB and ib is not None and ib_is_connected(ib):
-                        ib.sleep(self_sleep)
-                    else:
-                        _time.sleep(self_sleep)
+                    live_sleep = HAS_IB and ib is not None and ib_is_connected(ib)
+                    sleep_fn = ib.sleep if live_sleep else _time.sleep
+                    should_wake = None
+                    if (
+                        getattr(live, "use_stop_wake", True)
+                        and ib_provider is not None
+                        and live_sleep
+                    ):
+                        # Arm the open short legs so a tick at/near a stop price
+                        # cuts the idle short: immediate-mode stops then fire on
+                        # the tick rather than a poll interval later.
+                        try:
+                            ib_provider.arm_stop_watch(
+                                stop_wake_thresholds(open_spreads, live)
+                            )
+                            # Deliberately not consumed here: a tick that
+                            # breached while the loop body was running has not
+                            # been evaluated yet, so it must cut this sleep too.
+                            should_wake = ib_provider.stop_wake_pending
+                        except Exception:
+                            should_wake = None
+                    interruptible_sleep(
+                        self_sleep,
+                        sleep_fn=sleep_fn,
+                        should_wake=should_wake,
+                        slice_seconds=float(
+                            getattr(live, "stop_wake_slice_seconds", 0.05) or 0.05
+                        ),
+                    )
+                    if should_wake is not None:
+                        # Latch consumed only after the sleep it shortened, so
+                        # the next iteration starts clean instead of spinning.
+                        try:
+                            woken = ib_provider.consume_stop_wake()
+                        except Exception:
+                            woken = None
+                        if woken is not None:
+                            stop_wake_count += 1
+                            last_stop_wake = woken
         except SystemExit:
             raise
         except Exception as exc:
             open_risk = [s for s in open_spreads if not s.closed]
-            if not open_risk:
+            # A working entry that filled before the cancel IS open risk, so it
+            # must steer this decision — otherwise a partial gets treated as a
+            # flat book and is left unmanaged to settle.
+            try:
+                pending_fill = (
+                    teardown_fill_event(pending_entry)
+                    if pending_entry is not None
+                    else None
+                )
+            except Exception:
+                # Never raise a second exception out of the handler; assume the
+                # worst (risk present) so we take the flatten path.
+                pending_fill = {"event": "entry", "contracts": 0}
+            if not open_risk and pending_fill is None:
                 # Pending-entry / loop faults with a flat book must not sticky-halt
                 # the session via error_flatten (today's AssertionError path).
                 print(
@@ -3709,9 +3999,7 @@ def run(live: LiveConfig = ACTIVE) -> None:
                     "error": repr(exc),
                     "had_pending": pending_entry is not None,
                 }, live=live)
-                cancel_pending_entry(
-                    ib, pending_entry, today, reason="entry_fault", dry=dry,
-                )
+                _cancel_pending(pending_entry, "entry_fault")
                 pending_entry = None
                 # Fall through to session_end / finally — do not re-raise.
             else:
@@ -3722,10 +4010,18 @@ def run(live: LiveConfig = ACTIVE) -> None:
                 log_event(
                     today, {"event": "error_flatten", "error": repr(exc)}, live=live,
                 )
-                cancel_pending_entry(ib, pending_entry, today, reason="error", dry=dry)
+                _cancel_pending(pending_entry, "error")
                 pending_entry = None
                 if not dry:
-                    flatten_all(ib, open_risk, today, dry, live=live)
+                    # Re-read after booking so a fill that beat the cancel is
+                    # included in the flatten set.
+                    flatten_all(
+                        ib,
+                        [s for s in open_spreads if not s.closed],
+                        today,
+                        dry,
+                        live=live,
+                    )
                     run_flatten_audit(ib, today, dry=dry, live=live)
                 raise
 
@@ -3758,6 +4054,22 @@ def run(live: LiveConfig = ACTIVE) -> None:
                 ib.disconnect()
             except Exception:
                 pass
+        # Slack delivery is off-loop and its worker is a daemon thread: drain
+        # the backlog here so the final flatten / kill_switch page is not lost
+        # at process exit.
+        try:
+            if not flush_slack(timeout_sec=10.0):
+                print(
+                    f"[{datetime.now().isoformat()}] WARN: Slack backlog did not "
+                    f"drain; dropped={slack_dropped_count()}"
+                )
+            elif slack_dropped_count():
+                print(
+                    f"[{datetime.now().isoformat()}] WARN: Slack alerts dropped "
+                    f"(queue full): {slack_dropped_count()}"
+                )
+        except Exception:
+            pass
         release_executor_lock(lock_path)
 
 

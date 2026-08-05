@@ -179,6 +179,13 @@ class IBStreamingMarketData:
         self._last_spx_value = 0.0
         self._effective_market_data_type = live.market_data_type
         self._delayed_fallback = live.delayed_quote_fallback and live.market_data_type != 1
+        # Event-driven stop wake. arm_stop_watch() installs (type, strike) ->
+        # ask threshold; a streaming tick at or above it latches _stop_wake so
+        # the executor's idle sleep returns immediately instead of waiting out
+        # poll_seconds_near_stop. Latch is cleared by consume_stop_wake().
+        self._stop_watch: Dict[Tuple[str, float], float] = {}
+        self._stop_wake = False
+        self._stop_wake_reason: Optional[Tuple[str, float, float]] = None
 
     def _probe_spx_snapshot(self, wait_sec: float = 2.0) -> float:
         # ib_insync keys ticker instances by Python contract identity.  Probe
@@ -897,12 +904,53 @@ class IBStreamingMarketData:
     def _on_option_update(self, contract: Contract, ticker) -> None:
         self._update_cache_from_ticker(contract, ticker)
 
+    def arm_stop_watch(self, thresholds) -> None:
+        """Install the short legs whose ticks should wake the executor loop.
+
+        ``thresholds`` is an iterable of (option_type, strike, ask_threshold).
+        Replaces any previous arming; an empty iterable disarms. Does not clear
+        an already-latched wake — the loop consumes that.
+        """
+        if not hasattr(self, "_stop_wake"):
+            self._stop_wake = False
+            self._stop_wake_reason = None
+        self._stop_watch = {
+            (str(opt_type), float(strike)): float(threshold)
+            for opt_type, strike, threshold in thresholds
+            if float(threshold) > 0
+        }
+
+    def stop_wake_pending(self) -> bool:
+        """True once a watched leg has ticked at or above its threshold."""
+        return bool(getattr(self, "_stop_wake", False))
+
+    def consume_stop_wake(self) -> Optional[Tuple[str, float, float]]:
+        """Clear the latch and return (option_type, strike, ask) that set it."""
+        reason = getattr(self, "_stop_wake_reason", None)
+        self._stop_wake = False
+        self._stop_wake_reason = None
+        return reason
+
+    def _check_stop_wake(self, opt_type: str, strike: float, ask: float) -> None:
+        # getattr defaults: recovery/test paths build streams via object.__new__
+        # and never run __init__ (same reason _unqualified_specs is guarded).
+        if ask <= 0 or getattr(self, "_stop_wake", False):
+            return
+        watch = getattr(self, "_stop_watch", None)
+        if not watch:
+            return
+        threshold = watch.get((opt_type, float(strike)))
+        if threshold is not None and ask >= threshold:
+            self._stop_wake = True
+            self._stop_wake_reason = (opt_type, float(strike), float(ask))
+
     def _update_cache_from_ticker(self, contract: Contract, ticker) -> None:
         opt_type = "CALL" if contract.right == "C" else "PUT"
         key: QuoteKey = (self.expiry_0dte_iso, opt_type, float(contract.strike))
         bid, ask = _ticker_bid_ask(ticker, delayed_fallback=self._delayed_fallback)
         delta, iv = _ticker_greeks(ticker)
         self._cache[key] = CachedQuote(bid=bid, ask=ask, delta=delta, iv=iv, updated_at=_time.time())
+        self._check_stop_wake(opt_type, float(contract.strike), ask)
 
     def _log_chain_health(self, spot: float, quotes: Sequence[OptionQuote]) -> None:
         now_ts = _time.time()

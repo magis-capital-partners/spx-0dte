@@ -13,6 +13,8 @@ from mbh_simulator import CandidateRecord, OptionQuote
 # PendingCancel is terminal for ladder purposes — never amend while IB is cancelling.
 _DONE_STATUSES = frozenset({"filled", "cancelled", "apicancelled", "pendingcancel"})
 _ACTIVE_STATUSES = frozenset({"apipending", "presubmitted", "submitted", "pendingsubmit"})
+# Public alias: ib_executor waits on these when awaiting a cancel acknowledgement.
+ENTRY_DONE_STATUSES = _DONE_STATUSES
 
 
 def round_spx_premium(price: float) -> float:
@@ -150,6 +152,11 @@ class PendingEntry:
     work_until: datetime
     next_ladder_at: datetime
     ladder_step: int = 0
+    # Cancel is awaited across loop iterations rather than by blocking on
+    # ib.sleep, so stop management keeps running while IB processes it.
+    # Set => the order is being cancelled and must not be laddered or amended.
+    cancel_requested_at: Optional[datetime] = None
+    cancel_reason: str = ""
     tranche_time: Optional[datetime] = None
     sleeve: str = "core"
     score: float = 0.0
@@ -171,6 +178,79 @@ def _is_active_status(trade) -> bool:
 def pending_trade_is_active(pending: PendingEntry) -> bool:
     """True when the working entry order is still amendable/cancellable."""
     return _is_active_status(pending.trade)
+
+
+def pending_is_awaiting_cancel(pending: Optional[PendingEntry]) -> bool:
+    """True while a requested cancel has not yet been confirmed by IB.
+
+    Such a pending is legitimately not ``pending_trade_is_active`` — the loop's
+    inactive-pending guard must allow it.
+    """
+    return pending is not None and pending.cancel_requested_at is not None
+
+
+def request_pending_cancel(
+    ib,
+    pending: PendingEntry,
+    *,
+    reason: str,
+    now: datetime,
+) -> Tuple[Optional[PendingEntry], Optional[dict]]:
+    """Ask IB to cancel, then return without blocking.
+
+    Resolution happens on a later poll via ``_resolve_awaited_cancel`` once IB
+    confirms or the grace window expires. If the order is already inactive
+    there is nothing to cancel, so resolve immediately.
+    """
+    if not _is_active_status(pending.trade):
+        return _resolve_terminal_or_reject(pending, reason=reason)
+    try:
+        ib.cancelOrder(pending.trade.order)
+    except Exception:
+        # Cancel could not be sent (status flipped under us). Resolve now
+        # rather than waiting out a grace window for a cancel IB never got.
+        return _resolve_terminal_or_reject(pending, reason=reason)
+    pending.cancel_requested_at = now
+    pending.cancel_reason = reason
+    return pending, None
+
+
+def _resolve_awaited_cancel(
+    pending: PendingEntry,
+    live: LiveConfig,
+    now: datetime,
+) -> Tuple[Optional[PendingEntry], Optional[dict]]:
+    """Advance a cancel-in-flight pending. Returns (pending, event).
+
+    Keeps the pending alive until IB reports a terminal status or the grace
+    window expires, so no ``ib.sleep`` is needed and any fill or partial that
+    lands during the cancel is still booked.
+    """
+    reason = pending.cancel_reason or "entry_cancelled"
+    if _order_status(pending.trade) in _DONE_STATUSES:
+        return _resolve_terminal_or_reject(pending, reason=reason)
+    grace = float(getattr(live, "entry_cancel_grace_seconds", 1.0) or 0.0)
+    elapsed = (now - pending.cancel_requested_at).total_seconds()
+    if elapsed >= grace:
+        # IB never confirmed within the window; book what filled and move on.
+        return _resolve_terminal_or_reject(pending, reason=reason)
+    return pending, None
+
+
+def teardown_fill_event(pending: PendingEntry) -> Optional[dict]:
+    """Fill event for whatever filled before a teardown cancel, else None.
+
+    Teardown paths (``new_tranche``, ``flatten``, ``disconnect``, faults)
+    discard the pending without running the poll resolver. Anything IB already
+    filled is a real position and must still be booked, or the loop manages a
+    short leg it does not know about. Same event shape as the poll path.
+    """
+    filled = _filled_qty(pending.trade)
+    if filled <= 0:
+        return None
+    return _entry_fill_event(
+        pending, contracts=filled, partial=filled < pending.contracts,
+    )
 
 
 def _hard_rejection_reason(trade) -> str:
@@ -299,6 +379,11 @@ def poll_pending_entry(
     if _is_filled(trade, pending.contracts):
         return None, _entry_fill_event(pending, contracts=pending.contracts)
 
+    # A cancel already in flight owns this pending: never ladder or re-cancel,
+    # just wait for IB (a late fill is still booked by the check above).
+    if pending.cancel_requested_at is not None:
+        return _resolve_awaited_cancel(pending, live, now)
+
     hard = _hard_rejection_reason(trade)
     if hard:
         return _resolve_terminal_or_reject(pending, reason=hard)
@@ -311,22 +396,15 @@ def poll_pending_entry(
         )
 
     if quality_block_reason:
-        if _is_active_status(trade):
-            ib.cancelOrder(trade.order)
-            ib.sleep(0.25)
-        return _resolve_terminal_or_reject(pending, reason=quality_block_reason)
+        return request_pending_cancel(
+            ib, pending, reason=quality_block_reason, now=now,
+        )
 
     if now >= pending.work_until:
-        filled = _filled_qty(trade)
-        if 0 < filled < pending.contracts:
-            # Book the partial before cancelling the remainder — never orphan IB legs.
-            ib.cancelOrder(trade.order)
-            ib.sleep(0.25)
-            return None, _entry_fill_event(pending, contracts=filled, partial=True)
-        ib.cancelOrder(trade.order)
-        ib.sleep(0.25)
-        return None, _entry_reject_event(
-            pending, reason="entry_unfilled", status="Cancelled",
+        # Partials are booked when the cancel resolves, so the remainder is
+        # never orphaned regardless of which side wins the race.
+        return request_pending_cancel(
+            ib, pending, reason="entry_unfilled", now=now,
         )
 
     if (
@@ -368,16 +446,10 @@ def poll_pending_entry(
                 ib.placeOrder(trade.contract, trade.order)
             except Exception:
                 trade.order.lmtPrice = old_price
-                try:
-                    if _is_active_status(trade):
-                        ib.cancelOrder(trade.order)
-                        ib.sleep(0.25)
-                except Exception:
-                    pass
-                return None, _entry_reject_event(
-                    pending,
-                    reason="entry_ladder_failed",
-                    status=trade.orderStatus.status or "unknown",
+                # Await the cancel across polls instead of blocking the loop;
+                # a fill that lands during it is still booked.
+                return request_pending_cancel(
+                    ib, pending, reason="entry_ladder_failed", now=now,
                 )
             pending.ladder_step = next_step
             pending.limit_credit = new_limit

@@ -5,6 +5,7 @@ import sys
 import unittest
 from datetime import datetime, time as dt_time
 from pathlib import Path
+from types import SimpleNamespace
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "live"))
@@ -13,9 +14,11 @@ sys.path.insert(0, str(ROOT / "simulator"))
 from live_config import LiveConfig  # noqa: E402
 from loop_timing import (  # noqa: E402
     adaptive_sleep_seconds,
+    interruptible_sleep,
     next_entry_datetime,
     seconds_until_market_open,
     seconds_until_next_tranche,
+    stop_wake_thresholds,
 )
 from profiles import build_p3_trend_skew_config  # noqa: E402
 
@@ -98,6 +101,109 @@ class PreOpenWaitTests(unittest.TestCase):
             seconds_until_market_open(now, session_open=SESSION_OPEN, lead_seconds=0.0),
             0.0,
         )
+
+
+class StopWakeTests(unittest.TestCase):
+    """Event-driven stop wake: a breaching tick must cut the idle sleep short."""
+
+    @staticmethod
+    def _spread(short_type: str, strike: float, stop_price: float, **kw):
+        return SimpleNamespace(
+            candidate=SimpleNamespace(short_type=short_type, short_strike=strike),
+            stop_price=stop_price,
+            stopped=kw.get("stopped", False),
+            closed=kw.get("closed", False),
+        )
+
+    def test_thresholds_arm_live_short_legs_just_below_stop(self) -> None:
+        live = LiveConfig(stop_wake_arm_fraction=0.95)
+        spreads = [
+            self._spread("CALL", 7545.0, 9.60),
+            self._spread("PUT", 7400.0, 6.00),
+        ]
+        armed = stop_wake_thresholds(spreads, live)
+        self.assertEqual(len(armed), 2)
+        self.assertEqual(armed[0][0], "CALL")
+        self.assertAlmostEqual(armed[0][2], 9.60 * 0.95, places=6)
+        self.assertAlmostEqual(armed[1][2], 6.00 * 0.95, places=6)
+
+    def test_thresholds_skip_closed_stopped_and_unpriced(self) -> None:
+        live = LiveConfig(stop_wake_arm_fraction=0.95)
+        spreads = [
+            self._spread("CALL", 7545.0, 9.60, closed=True),
+            self._spread("PUT", 7400.0, 6.00, stopped=True),
+            self._spread("PUT", 7300.0, 0.0),
+        ]
+        self.assertEqual(stop_wake_thresholds(spreads, live), [])
+
+    def test_interruptible_sleep_returns_early_on_wake(self) -> None:
+        clock = {"t": 0.0}
+        slept = []
+
+        def fake_sleep(seconds: float) -> None:
+            slept.append(seconds)
+            clock["t"] += seconds
+
+        # Wake trips after three slices.
+        def should_wake() -> bool:
+            return len(slept) >= 3
+
+        elapsed = interruptible_sleep(
+            1.5,
+            sleep_fn=fake_sleep,
+            should_wake=should_wake,
+            slice_seconds=0.05,
+            monotonic=lambda: clock["t"],
+        )
+        self.assertEqual(len(slept), 3)
+        self.assertAlmostEqual(elapsed, 0.15, places=6)
+
+    def test_interruptible_sleep_runs_full_duration_without_wake(self) -> None:
+        clock = {"t": 0.0}
+
+        def fake_sleep(seconds: float) -> None:
+            clock["t"] += seconds
+
+        elapsed = interruptible_sleep(
+            0.5,
+            sleep_fn=fake_sleep,
+            should_wake=lambda: False,
+            slice_seconds=0.05,
+            monotonic=lambda: clock["t"],
+        )
+        self.assertAlmostEqual(elapsed, 0.5, places=6)
+
+    def test_interruptible_sleep_skips_sleep_when_already_woken(self) -> None:
+        """A tick during the loop body must not cost a full slice of latency."""
+        slept = []
+        elapsed = interruptible_sleep(
+            1.0,
+            sleep_fn=lambda s: slept.append(s),
+            should_wake=lambda: True,
+            slice_seconds=0.05,
+            monotonic=lambda: 0.0,
+        )
+        self.assertEqual(slept, [])
+        self.assertEqual(elapsed, 0.0)
+
+    def test_interruptible_sleep_without_wake_fn_matches_plain_sleep(self) -> None:
+        clock = {"t": 0.0}
+
+        def fake_sleep(seconds: float) -> None:
+            clock["t"] += seconds
+
+        elapsed = interruptible_sleep(
+            0.2, sleep_fn=fake_sleep, slice_seconds=0.05,
+            monotonic=lambda: clock["t"],
+        )
+        self.assertAlmostEqual(elapsed, 0.2, places=6)
+
+    def test_interruptible_sleep_ignores_nonpositive_duration(self) -> None:
+        slept = []
+        self.assertEqual(
+            interruptible_sleep(0.0, sleep_fn=lambda s: slept.append(s)), 0.0,
+        )
+        self.assertEqual(slept, [])
 
 
 def main() -> None:

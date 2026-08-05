@@ -1,8 +1,9 @@
 """Adaptive polling and tranche scheduling for the live executor loop."""
 from __future__ import annotations
 
+import time as _time
 from datetime import datetime, time as dt_time, timedelta
-from typing import List, Optional, Sequence
+from typing import Callable, List, Optional, Sequence
 
 from live_config import LiveConfig
 from mbh_simulator import OptionQuote, StrategyConfig, effective_entry_end, is_entry_time
@@ -118,6 +119,67 @@ def adaptive_sleep_seconds(
         live.poll_seconds_max_idle,
         sample_cap,
     )
+
+
+def stop_wake_thresholds(
+    open_spreads: Sequence,
+    live: LiveConfig,
+) -> List[tuple]:
+    """(option_type, strike, ask_threshold) for legs worth waking the loop on.
+
+    One entry per live short leg. The threshold sits just below the stop price
+    so the loop is already awake with a fresh quote when the breach lands.
+    """
+    fraction = float(getattr(live, "stop_wake_arm_fraction", 0.95) or 0.95)
+    out: List[tuple] = []
+    for spread in open_spreads:
+        if spread.stopped or spread.closed:
+            continue
+        stop_price = float(getattr(spread, "stop_price", 0.0) or 0.0)
+        if stop_price <= 0:
+            continue
+        out.append((
+            spread.candidate.short_type,
+            float(spread.candidate.short_strike),
+            stop_price * fraction,
+        ))
+    return out
+
+
+def interruptible_sleep(
+    total_seconds: float,
+    *,
+    sleep_fn: Callable[[float], None],
+    should_wake: Optional[Callable[[], bool]] = None,
+    slice_seconds: float = 0.05,
+    monotonic: Callable[[], float] = _time.monotonic,
+) -> float:
+    """Sleep up to ``total_seconds``, returning early once ``should_wake`` trips.
+
+    Sleeps in slices so a market-data tick that breaches a watched stop cuts the
+    idle short instead of waiting out the full poll interval. ``sleep_fn`` is
+    ``ib.sleep`` in live runs, which pumps the ib_insync event loop — that is
+    what lets tick handlers run (and set the wake flag) mid-sleep.
+
+    Returns the seconds actually slept.
+    """
+    if total_seconds <= 0:
+        return 0.0
+    slice_seconds = max(float(slice_seconds), 0.001)
+    start = monotonic()
+    deadline = start + total_seconds
+    # Check before sleeping: a tick may have already breached while the loop
+    # body was running.
+    if should_wake is not None and should_wake():
+        return 0.0
+    while True:
+        remaining = deadline - monotonic()
+        if remaining <= 0:
+            break
+        sleep_fn(min(slice_seconds, remaining))
+        if should_wake is not None and should_wake():
+            break
+    return max(monotonic() - start, 0.0)
 
 
 def should_fire_tranche(

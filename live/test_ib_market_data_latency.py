@@ -112,6 +112,78 @@ class TrancheMarketDataLatencyTests(unittest.TestCase):
         self.assertEqual(len(stream._next_expiry_quotes), 2)
         self.assertEqual(len(stream.ib.cancelled), 2)
 
+    def test_breaching_tick_latches_stop_wake(self) -> None:
+        """A watched short leg ticking at its threshold must latch the wake."""
+        stream = _stream()
+        stream.arm_stop_watch([("PUT", 7500.0, 9.50)])
+
+        # Below threshold: no wake.
+        stream._update_cache_from_ticker(
+            SimpleNamespace(right="P", strike=7500.0),
+            SimpleNamespace(bid=9.0, ask=9.20, modelGreeks=None),
+        )
+        self.assertFalse(stream.stop_wake_pending())
+
+        # At/above threshold: latched, with the breaching quote recorded.
+        stream._update_cache_from_ticker(
+            SimpleNamespace(right="P", strike=7500.0),
+            SimpleNamespace(bid=9.4, ask=9.60, modelGreeks=None),
+        )
+        self.assertTrue(stream.stop_wake_pending())
+        self.assertEqual(stream.consume_stop_wake(), ("PUT", 7500.0, 9.60))
+        # Consumed latches are cleared so the next idle starts clean.
+        self.assertFalse(stream.stop_wake_pending())
+
+    def test_unwatched_leg_never_wakes_the_loop(self) -> None:
+        stream = _stream()
+        stream.arm_stop_watch([("PUT", 7500.0, 9.50)])
+        # Same strike, wrong side.
+        stream._update_cache_from_ticker(
+            SimpleNamespace(right="C", strike=7500.0),
+            SimpleNamespace(bid=40.0, ask=41.0, modelGreeks=None),
+        )
+        self.assertFalse(stream.stop_wake_pending())
+
+    def test_disarming_stops_waking(self) -> None:
+        stream = _stream()
+        stream.arm_stop_watch([("PUT", 7500.0, 9.50)])
+        stream.arm_stop_watch([])
+        stream._update_cache_from_ticker(
+            SimpleNamespace(right="P", strike=7500.0),
+            SimpleNamespace(bid=9.4, ask=9.60, modelGreeks=None),
+        )
+        self.assertFalse(stream.stop_wake_pending())
+
+    def test_wake_latch_counts_once_per_consume(self) -> None:
+        """Telemetry: the executor increments its counter once per consumed wake."""
+        stream = _stream()
+        stream.arm_stop_watch([("PUT", 7500.0, 9.50)])
+        breach = (
+            SimpleNamespace(right="P", strike=7500.0),
+            SimpleNamespace(bid=9.4, ask=9.60, modelGreeks=None),
+        )
+        # Repeated breaching ticks inside one idle latch once, not per tick.
+        stream._update_cache_from_ticker(*breach)
+        stream._update_cache_from_ticker(*breach)
+        stream._update_cache_from_ticker(*breach)
+        self.assertTrue(stream.stop_wake_pending())
+        self.assertIsNotNone(stream.consume_stop_wake())
+        self.assertIsNone(stream.consume_stop_wake())
+
+        # A fresh breach after the consume latches again.
+        stream._update_cache_from_ticker(*breach)
+        self.assertIsNotNone(stream.consume_stop_wake())
+
+    def test_missing_ask_never_wakes(self) -> None:
+        """No quote is not a breach — a -1 ask must not fire a stop."""
+        stream = _stream()
+        stream.arm_stop_watch([("PUT", 7500.0, 9.50)])
+        stream._update_cache_from_ticker(
+            SimpleNamespace(right="P", strike=7500.0),
+            SimpleNamespace(bid=-1.0, ask=-1.0, modelGreeks=None),
+        )
+        self.assertFalse(stream.stop_wake_pending())
+
     def test_entry_leg_refresh_reads_existing_stream_cache(self) -> None:
         stream = _stream()
         stream._cache = {
