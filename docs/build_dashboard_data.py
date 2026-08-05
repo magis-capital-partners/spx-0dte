@@ -685,8 +685,24 @@ def build_live(live_dir: Path, account_equity: float) -> dict:
                     "settlement_marked_pnl": raw.get("live", {}).get("settlement_marked_pnl"),
                     "marked_pnl_vs_settlement": raw.get("live", {}).get("marked_pnl_vs_settlement"),
                 }
+                # Per-entry settlement P&L, joined onto the fills by timestamp.
+                by_ts = {
+                    row.get("ts"): row.get("settlement_pnl")
+                    for row in (raw.get("live", {}).get("entry_pnl") or [])
+                }
+                for row in entry_rows:
+                    row["settlement_pnl"] = by_ts.get(row["ts"])
             except json.JSONDecodeError:
                 reconcile = None
+
+        # The executor's session_end mark is a live-quote snapshot taken at the
+        # bell and has been observed to be badly wrong (2026-08-05 reported
+        # -$7,890 on a day that actually settled +$5,365). Prefer the
+        # settlement-derived figure, which is reconciled against the official
+        # SPX close and each recorded fill, and keep the raw mark for contrast.
+        settlement_pnl = (reconcile or {}).get("settlement_marked_pnl")
+        resolved_pnl = settlement_pnl if settlement_pnl is not None else marked
+        pnl_source = "settlement" if settlement_pnl is not None else "executor_mark"
 
         days[d] = {
             "date": d,
@@ -700,15 +716,19 @@ def build_live(live_dir: Path, account_equity: float) -> dict:
             "flattened": any(e.get("event") == "flatten" for e in events),
             "halted": any(e.get("event") == "halt_entries" for e in events),
             "gross_credit_sold": gross,
-            "marked_pnl": marked,
+            "marked_pnl": resolved_pnl,
+            "reported_marked_pnl": marked,
+            "pnl_source": pnl_source,
             "reconcile": reconcile,
         }
-        if marked is not None:
+        if resolved_pnl is not None:
             history.append({
                 "date": d,
                 "execution_type": execution,
                 "execution_label": execution_type_label(execution),
-                "marked_pnl": marked,
+                "marked_pnl": resolved_pnl,
+                "reported_marked_pnl": marked,
+                "pnl_source": pnl_source,
                 "entries": len(entry_rows),
                 "stops": len(stops),
             })
