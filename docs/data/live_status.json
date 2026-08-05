@@ -1,30 +1,30 @@
 {
   "schema": 2,
   "source": "cloud",
-  "generated_at": "2026-08-05T10:59:42.917905",
+  "generated_at": "2026-08-05T11:04:44.002900",
   "date": "2026-08-05",
   "pid_alive": true,
-  "heartbeat_ts": "2026-08-05T10:59:32.110259",
+  "heartbeat_ts": "2026-08-05T11:04:42.753563",
   "entries_halted": false,
   "flattened": false,
-  "open_count": 0,
-  "marked_pnl": 0.0,
+  "open_count": 1,
+  "marked_pnl": 20.0,
   "closed_pnl": 1180.0,
-  "total_pnl": 1180.0,
-  "credit_received": 2015.0,
-  "contracts_traded": 4,
-  "entry_count": 4,
-  "open_contracts": 0,
+  "total_pnl": 1200.0,
+  "credit_received": 3035.0,
+  "contracts_traded": 6,
+  "entry_count": 5,
+  "open_contracts": 2,
   "execution_type": "production_live",
   "risk": {
-    "max_loss_no_stop": 0.0,
-    "planned_stop_loss": 0.0,
-    "defined_risk_margin": 0.0,
-    "marked_pnl": 0.0,
-    "marked_return_on_margin": 0.0,
-    "marked_return_on_margin_pct": 0.0,
-    "open_count": 0,
-    "marked_count": 0,
+    "max_loss_no_stop": 13980.0,
+    "planned_stop_loss": 2220.0,
+    "defined_risk_margin": 15000.0,
+    "marked_pnl": 40.0,
+    "marked_return_on_margin": 0.002667,
+    "marked_return_on_margin_pct": 0.27,
+    "open_count": 1,
+    "marked_count": 1,
     "mark_quality": "ok"
   },
   "risk_history": [
@@ -67,19 +67,19 @@
     {
       "date": "2026-08-05",
       "execution_type": "production_live",
-      "ts": "2026-08-05T10:59:32.112262",
-      "marked_pnl": 0.0,
+      "ts": "2026-08-05T11:04:12.575204",
+      "marked_pnl": 30.0,
       "closed_pnl": 1180.0,
-      "total_pnl": 1180.0,
-      "contracts_traded": 4,
-      "defined_risk_margin": 0.0,
-      "marked_return_on_margin_pct": 0.0,
-      "max_loss_no_stop": 0.0
+      "total_pnl": 1210.0,
+      "contracts_traded": 6,
+      "defined_risk_margin": 15000.0,
+      "marked_return_on_margin_pct": 0.2,
+      "max_loss_no_stop": 13980.0
     }
   ],
   "last_event": {
-    "ts": "2026-08-05T10:53:19.785542",
-    "event": "account_guard_startup"
+    "ts": "2026-08-05T11:02:06.746613",
+    "event": "entry"
   },
   "note": "Sanitized status only. Full console is local to the trading host."
 }
