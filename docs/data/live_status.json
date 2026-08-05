@@ -1,45 +1,17 @@
 {
   "schema": 2,
   "source": "cloud",
-  "generated_at": "2026-08-05T09:42:11.149123",
+  "generated_at": "2026-08-05T09:44:51.072067",
   "date": "2026-08-05",
-  "pid_alive": true,
-  "heartbeat_ts": "2026-08-05T09:42:11.094845",
+  "pid_alive": false,
+  "heartbeat_ts": null,
   "entries_halted": false,
   "flattened": false,
-  "open_count": 1,
-  "marked_pnl": -85.0,
-  "execution_type": "production_live",
-  "risk": {
-    "max_loss_no_stop": 6915.0,
-    "planned_stop_loss": 1935.0,
-    "defined_risk_margin": 7500.0,
-    "marked_pnl": -85.0,
-    "marked_return_on_margin": -0.011333,
-    "marked_return_on_margin_pct": -1.13,
-    "open_count": 1,
-    "marked_count": 1,
-    "mark_quality": "ok"
-  },
+  "open_count": 0,
+  "marked_pnl": 0.0,
+  "execution_type": "unknown",
+  "risk": {},
   "risk_history": [
-    {
-      "date": "2026-07-31",
-      "execution_type": "production_live",
-      "ts": "2026-07-31T16:00:00.436159",
-      "marked_pnl": -1200.0,
-      "defined_risk_margin": 98000.0,
-      "marked_return_on_margin_pct": -1.22,
-      "max_loss_no_stop": 94860.0
-    },
-    {
-      "date": "2026-08-03",
-      "execution_type": "production_live",
-      "ts": "2026-08-03T15:59:36.730884",
-      "marked_pnl": -5500.0,
-      "defined_risk_margin": 38000.0,
-      "marked_return_on_margin_pct": -14.47,
-      "max_loss_no_stop": 37290.0
-    },
     {
       "date": "2026-08-04",
       "execution_type": "production_live",
@@ -48,20 +20,8 @@
       "defined_risk_margin": 15000.0,
       "marked_return_on_margin_pct": -25.43,
       "max_loss_no_stop": 14650.0
-    },
-    {
-      "date": "2026-08-05",
-      "execution_type": "production_live",
-      "ts": "2026-08-05T09:42:05.059695",
-      "marked_pnl": -80.0,
-      "defined_risk_margin": 7500.0,
-      "marked_return_on_margin_pct": -1.07,
-      "max_loss_no_stop": 6915.0
     }
   ],
-  "last_event": {
-    "ts": "2026-08-05T09:32:04.413188",
-    "event": "entry"
-  },
+  "last_event": null,
   "note": "Sanitized status only. Full console is local to the trading host."
 }
