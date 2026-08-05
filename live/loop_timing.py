@@ -1,7 +1,7 @@
 """Adaptive polling and tranche scheduling for the live executor loop."""
 from __future__ import annotations
 
-from datetime import datetime, timedelta
+from datetime import datetime, time as dt_time, timedelta
 from typing import List, Optional, Sequence
 
 from live_config import LiveConfig
@@ -13,6 +13,23 @@ def _entry_minutes(config: StrategyConfig, *, entry_end) -> List[int]:
     end = entry_end.hour * 60 + entry_end.minute
     interval = config.entry_interval_minutes
     return list(range(start, end + 1, interval))
+
+
+def seconds_until_market_open(
+    now: datetime,
+    *,
+    session_open: dt_time,
+    lead_seconds: float = 0.0,
+) -> float:
+    """Seconds to idle before market data is worth starting; 0 once inside the window.
+
+    Only today's open is considered, so a session launched after the close does
+    not park the executor until tomorrow.
+    """
+    target = datetime.combine(now.date(), session_open) - timedelta(
+        seconds=max(lead_seconds, 0.0)
+    )
+    return max((target - now).total_seconds(), 0.0)
 
 
 def next_entry_datetime(now: datetime, config: StrategyConfig) -> Optional[datetime]:

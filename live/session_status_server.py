@@ -79,6 +79,7 @@ def _recent_events(today: str, limit: int = 12) -> List[dict]:
     out: List[dict] = []
     interesting = {
         "session_start",
+        "pre_open_wait",
         "entry_submitted",
         "entry",
         "entry_ladder",

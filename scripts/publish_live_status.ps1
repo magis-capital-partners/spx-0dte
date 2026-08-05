@@ -35,6 +35,31 @@ if ($LASTEXITCODE -ne 0) {
 if ($LASTEXITCODE -ne 0) { throw "write-status failed (exit $LASTEXITCODE)" }
 
 $statusPath = Join-Path $Root "docs\data\live_status.json"
+
+# Both trading PCs run this task, but only the host that actually ran today's
+# executor has anything to say. Without this guard a bystander publishes
+# execution_type=unknown/open_count=0 over a live session (2026-08-05: the
+# dashboard showed zeros while an open spread was being managed here).
+$statusDoc = $null
+try {
+    $statusDoc = Get-Content $statusPath -Raw | ConvertFrom-Json
+} catch {
+    throw "could not read $statusPath after --write-status: $($_.Exception.Message)"
+}
+$hasLocalSession = (
+    ($statusDoc.execution_type -and $statusDoc.execution_type -ne "unknown") -or
+    $statusDoc.heartbeat_ts -or
+    $statusDoc.pid_alive
+)
+if (-not $hasLocalSession) {
+    Write-Host (
+        "Skipping publish: no local session for $($statusDoc.date) " +
+        "(execution_type=$($statusDoc.execution_type), heartbeat_ts=$($statusDoc.heartbeat_ts)) " +
+        "- refusing to overwrite another host's status."
+    )
+    exit 0
+}
+
 $stampDir = Join-Path $Root "data\live\supervisor"
 $stampPath = Join-Path $stampDir "last_live_status_deploy.json"
 New-Item -ItemType Directory -Force -Path $stampDir | Out-Null
@@ -77,7 +102,11 @@ if (-not $status) {
 if ($LASTEXITCODE -ne 0) { throw "git commit failed (exit $LASTEXITCODE)" }
 
 # Status Publish often races other machines' status commits; rebase then push.
-& $Git -C $Root pull --rebase origin HEAD
+# --autostash is required, not cosmetic: any unrelated dirty file (an edited
+# script, or data/calendar/vix_daily.csv refreshed by the 09:00 preflight) makes
+# plain `pull --rebase` refuse with "You have unstaged changes", which silently
+# stopped every status push for an hour on 2026-08-05.
+& $Git -C $Root pull --rebase --autostash origin HEAD
 if ($LASTEXITCODE -ne 0) {
     # Live status JSON conflicts are expected; take our freshly written file.
     $conflicted = & $Git -C $Root diff --name-only --diff-filter=U

@@ -62,6 +62,20 @@ class LiveConfig:
     chain_points_above: float = 150.0
     delayed_quote_fallback: bool = False
 
+    # --- Pre-open launch ---------------------------------------------------- #
+    # Launching before 09:30 used to abort on "Could not obtain SPX spot from IB":
+    # TWS reports "market data farm is connecting" (IB 2119) for several seconds
+    # after connect, and the cash index publishes no prints pre-open, so the very
+    # first snapshot legitimately comes back empty on a healthy session.
+    # Idle until shortly before the open, then probe with a retry budget.
+    wait_for_market_open: bool = True
+    # Start the stream this far ahead of 09:30 so the chain is warm at the open.
+    market_data_lead_seconds: float = 180.0
+    # Total budget for the startup SPX probe before giving up (subscription
+    # problems still fail loud, just not on the first empty snapshot).
+    market_data_probe_timeout_seconds: float = 120.0
+    market_data_probe_retry_seconds: float = 3.0
+
     # --- Phase 2: streaming market data ------------------------------------- #
     use_streaming_quotes: bool = True
     streaming_generic_ticks: str = "106"

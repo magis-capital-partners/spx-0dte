@@ -169,7 +169,8 @@ try {
     if ($FullExport) { $exportArgs = @() }
 
     Write-Log "=== Dashboard run export (production presets) ==="
-    foreach ($preset in @("p3_poststop_cooldown_120", "p3_trend_bc_085")) {
+    # p3_poststop_compounding_f1 is published by sync_dashboard.ps1, so it must stay current here too.
+    foreach ($preset in @("p3_poststop_cooldown_120", "p3_trend_bc_085", "p3_poststop_compounding_f1")) {
         Invoke-Py -PyArgs (@(
             (Join-Path $Root "simulator\export_dashboard_run.py"),
             "--preset", $preset

@@ -189,6 +189,36 @@ class IBStreamingMarketData:
         self.ib.sleep(wait_sec)
         return _spot_from_ticker(ticker)
 
+    def _probe_spx_spot(self, *, timeout_seconds: float, wait_sec: float = 2.0) -> float:
+        """Retry the SPX snapshot until it returns a spot or the budget expires.
+
+        One snapshot is not a verdict at startup: TWS answers with "market data
+        farm is connecting" (IB 2119) for the first seconds after connect, and
+        the cash index has no prints before 09:30. Both resolve on their own, so
+        only a sustained empty probe indicates a real subscription problem.
+        """
+        retry_sec = max(float(getattr(self.live, "market_data_probe_retry_seconds", 3.0)), 0.5)
+        deadline = _time.monotonic() + max(timeout_seconds, 0.0)
+        attempts = 0
+        last_report = _time.monotonic()
+        while True:
+            attempts += 1
+            spot = self._probe_spx_snapshot(wait_sec=wait_sec)
+            if spot > 0:
+                if attempts > 1:
+                    print(f"[market] SPX spot available after {attempts} probes")
+                return spot
+            if _time.monotonic() >= deadline:
+                return 0.0
+            if _time.monotonic() - last_report >= 15.0:
+                remaining = max(deadline - _time.monotonic(), 0.0)
+                print(
+                    f"[market] waiting for SPX spot ({attempts} empty probes, "
+                    f"{remaining:.0f}s budget left) — market data farm may still be connecting"
+                )
+                last_report = _time.monotonic()
+            self.ib.sleep(retry_sec)
+
     def _resolve_market_data_access(self) -> None:
         """Probe SPX quote; optionally auto-fallback live (1) -> delayed (3).
 
@@ -204,7 +234,8 @@ class IBStreamingMarketData:
             self.live.delayed_quote_fallback and self._effective_market_data_type != 1
         )
 
-        if self._probe_spx_snapshot() > 0:
+        probe_timeout = float(getattr(self.live, "market_data_probe_timeout_seconds", 120.0))
+        if self._probe_spx_spot(timeout_seconds=probe_timeout) > 0:
             print(
                 f"[market] SPX spot OK with market_data_type={self._effective_market_data_type} "
                 f"({'live' if self._effective_market_data_type == 1 else 'delayed'})"
@@ -217,7 +248,8 @@ class IBStreamingMarketData:
                 + "\n"
                 f"Probe failed with market_data_type={requested} and "
                 f"auto_fallback_delayed=False"
-                + (" (forced for live mode)." if getattr(self.live, "mode", "") == "live" else ".")
+                + (" (forced for live mode)" if getattr(self.live, "mode", "") == "live" else "")
+                + f" after retrying for {probe_timeout:.0f}s."
             )
 
         if requested != 3:
@@ -232,7 +264,7 @@ class IBStreamingMarketData:
             self._delayed_fallback = True
             self.live.delayed_quote_fallback = True
             self.live.entry_require_live_nbbo = False
-            if self._probe_spx_snapshot(wait_sec=3.0) > 0:
+            if self._probe_spx_spot(timeout_seconds=probe_timeout, wait_sec=3.0) > 0:
                 print(
                     "[market] using delayed quotes (type 3); entry_require_live_nbbo=False "
                     "and delayed_quote_fallback=True applied for this session."
@@ -271,7 +303,12 @@ class IBStreamingMarketData:
             self._last_spx_value = spot
             self._last_spx_update_at = _time.monotonic()
             return spot
-        return self._probe_spx_snapshot(wait_sec=1.0)
+        return self._probe_spx_spot(
+            timeout_seconds=float(
+                getattr(self.live, "market_data_probe_timeout_seconds", 120.0)
+            ),
+            wait_sec=1.0,
+        )
 
     @property
     def expiry_0dte_iso(self) -> str:

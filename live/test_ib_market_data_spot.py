@@ -40,6 +40,67 @@ class _SnapshotIB:
         return None
 
 
+class _EmptyTicker:
+    """What IB returns while a market data farm is still connecting (IB 2119)."""
+
+    last = 0.0
+    close = 0.0
+    bid = 0.0
+    ask = 0.0
+    bidSize = 0
+    askSize = 0
+
+    def marketPrice(self):
+        return 0.0
+
+
+class _WarmingIB:
+    def __init__(self, empty_probes: int) -> None:
+        self._empty_probes = empty_probes
+        self.probes = 0
+        self.slept = 0.0
+
+    def reqTickers(self, contract):
+        self.probes += 1
+        if self.probes <= self._empty_probes:
+            return [_EmptyTicker()]
+        return [_ContaminatedTicker()]
+
+    def sleep(self, seconds):
+        self.slept += seconds or 0.0
+
+
+class ProbeRetryTests(unittest.TestCase):
+    """2026-08-05: a 09:11 launch aborted on the first empty snapshot."""
+
+    @staticmethod
+    def _stream(ib) -> IBStreamingMarketData:
+        stream = object.__new__(IBStreamingMarketData)
+        stream.ib = ib
+        stream._spx = SimpleNamespace(symbol="SPX", conId=416904)
+        stream.live = SimpleNamespace(
+            market_data_probe_retry_seconds=0.0,
+            market_data_probe_timeout_seconds=120.0,
+        )
+        return stream
+
+    def test_probe_retries_while_the_data_farm_connects(self) -> None:
+        ib = _WarmingIB(empty_probes=3)
+        stream = self._stream(ib)
+        self.assertGreater(
+            stream._probe_spx_spot(timeout_seconds=120.0, wait_sec=0), 0
+        )
+        self.assertEqual(ib.probes, 4)
+
+    def test_probe_still_gives_up_once_the_budget_expires(self) -> None:
+        ib = _WarmingIB(empty_probes=10_000)
+        stream = self._stream(ib)
+        self.assertEqual(
+            stream._probe_spx_spot(timeout_seconds=0.0, wait_sec=0), 0.0
+        )
+        self.assertEqual(ib.probes, 1)
+
+
 class SpotRegressionTests(unittest.TestCase):
     def test_live_index_last_wins_over_stale_snapshot_midpoint(self) -> None:
         self.assertEqual(_spot_from_ticker(_ContaminatedTicker()), 7567.09)

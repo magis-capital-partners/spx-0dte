@@ -138,6 +138,7 @@ Also cancels orphan working SPXW/BAG orders from a crashed prior run. Do **not**
 | **Flatten confirm + audit** | MKT close waits for fill; `flatten_audit` checks IB flat afterward. |
 | **Stop confirm** | After synthetic stop fill, verify IB short qty dropped; else `stop_unconfirmed` and keep managing. |
 | **Live mode data** | `mode=live` forces `auto_fallback_delayed=False` (no silent delayed downgrade). |
+| **Pre-open launch** | Launching before 09:30 is supported: the executor connects, runs account guards and book recovery, then idles until `market_data_lead_seconds` (180s) before the open to subscribe. The startup SPX probe retries for `market_data_probe_timeout_seconds` (120s) rather than aborting on the first empty snapshot — TWS reports "market data farm is connecting" (IB 2119) for seconds after connect and the cash index has no pre-open prints (09:11 launch aborted on 2026-08-05). A genuine missing subscription still fails loud. |
 
 ### Slack + supervised auto-heal (Magis workspace)
 

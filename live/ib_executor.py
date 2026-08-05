@@ -113,7 +113,11 @@ from live_features import (  # noqa: E402
 )
 from feature_state_io import load_feature_state, save_feature_state  # noqa: E402
 from ib_market_data import IBStreamingMarketData  # noqa: E402
-from loop_timing import adaptive_sleep_seconds, should_fire_tranche  # noqa: E402
+from loop_timing import (  # noqa: E402
+    adaptive_sleep_seconds,
+    seconds_until_market_open,
+    should_fire_tranche,
+)
 from risk_gates import apply_side_stop_cooldowns, side_stop_cooldown_block_reason  # noqa: E402
 from vix_session import (  # noqa: E402
     check_vix_session_allowed,
@@ -171,6 +175,49 @@ LIVE_DIR = ROOT / "data" / "live"
 # points the backtest baselines never saw, producing degenerate z-scores at
 # the first tranche (2026-08-04: realized_vs_implied_z = -1.29M at 09:32).
 SESSION_OPEN = dt_time(9, 30)
+
+
+def wait_for_market_open(live: LiveConfig, today: str, *, ib=None) -> None:
+    """Idle until shortly before the open so a session can be launched early.
+
+    Nothing useful happens pre-open: the first tranche is after 09:30, feature
+    state deliberately ignores pre-open quotes, and the cash index publishes no
+    prints for the SPX probe to read. Idling through ``ib.sleep`` keeps the
+    ib_insync event loop servicing the socket and its error handlers.
+    """
+    if not getattr(live, "wait_for_market_open", True):
+        return
+    lead_seconds = float(getattr(live, "market_data_lead_seconds", 0.0))
+    remaining = seconds_until_market_open(
+        datetime.now(), session_open=SESSION_OPEN, lead_seconds=lead_seconds
+    )
+    if remaining <= 0:
+        return
+    resume_at = datetime.now() + timedelta(seconds=remaining)
+    print(
+        f"[{datetime.now().isoformat()}] pre-open: idling {remaining / 60:.1f} min until "
+        f"{resume_at.strftime('%H:%M:%S')} before starting market data "
+        f"(open {SESSION_OPEN.strftime('%H:%M')}, lead {lead_seconds:.0f}s)"
+    )
+    log_event(today, {
+        "event": "pre_open_wait",
+        "resume_at": resume_at.isoformat(),
+        "wait_seconds": round(remaining, 1),
+        "session_open": SESSION_OPEN.strftime("%H:%M"),
+        "lead_seconds": lead_seconds,
+    })
+    while True:
+        remaining = (resume_at - datetime.now()).total_seconds()
+        if remaining <= 0:
+            break
+        chunk = min(remaining, 30.0)
+        if ib is not None:
+            ib.sleep(chunk)
+        else:
+            _time.sleep(chunk)
+    print(
+        f"[{datetime.now().isoformat()}] pre-open wait complete — starting market data"
+    )
 
 
 def gates_require_signals(config: StrategyConfig) -> bool:
@@ -2801,6 +2848,7 @@ def run(live: LiveConfig = ACTIVE) -> None:
         # leg is reserved inside the market-data budget before the first mark.
         missing_recovery_quotes: Optional[List[Tuple[str, float]]] = None
         if isinstance(provider, IBSignalProvider):
+            wait_for_market_open(live, today, ib=ib)
             provider.set_open_spread_legs(open_spreads)
             provider.start()
             missing_recovery_quotes = []
