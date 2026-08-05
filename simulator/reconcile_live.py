@@ -58,30 +58,66 @@ def settlement_close(day: str) -> Optional[float]:
     return row.close if row else None
 
 
-def settlement_marked_pnl(entries: List[dict], spot: float) -> float:
-    """Theoretical P&L if every entry fill were held to 0DTE settlement at ``spot``.
+def settlement_marked_pnl(entries: List[dict], events: List[dict], spot: float) -> float:
+    """True EOD P&L: realized closes (stops/flattens) plus settlement value of
+    whatever was still open at the close.
 
-    Groups fills by (side, short_strike, long_strike) so repeat tranches into
-    the same spread net together, then values each group's residual credit
-    spread by cash-settlement intrinsic value at the official close. This is
-    a *reference* figure — it assumes nothing was bought back early, so it
-    will disagree with the executor's reported marked_pnl whenever a stop or
-    a flatten actually closed a leg before expiration.
+    Groups fills by (side, short_strike, long_strike). For each group, nets
+    out contracts actually closed early via ``stop`` or ``flatten_fill``
+    events against their real fill price (realized, not theoretical), and
+    only prices the *remaining* open contracts at 0DTE cash-settlement
+    intrinsic value using the official SPX close. Earlier versions of this
+    function valued every entry fill at settlement regardless of whether it
+    had already been bought back — double-counting any early close.
+
+    ``stop`` events only report the short leg's buyback price; the long leg
+    is assumed to ride to expiration with the rest of the group (typical for
+    a short-leg-only stop), so its settlement value is still included.
     """
-    total = 0.0
+    groups: Dict[tuple, dict] = {}
     for entry in entries:
-        side = entry.get("side")
-        short_strike = float(entry.get("short_strike") or 0.0)
-        long_strike = float(entry.get("long_strike") or 0.0)
+        key = (entry.get("side"), entry.get("short_strike"), entry.get("long_strike"))
+        g = groups.setdefault(key, {"contracts": 0.0, "credit_dollars": 0.0, "closed_contracts": 0.0, "realized_dollars": 0.0})
         contracts = float(entry.get("contracts") or 0.0)
         credit = float(entry.get("credit") or 0.0)
-        if side == "bear_call":
-            value = max(0.0, spot - short_strike) - max(0.0, spot - long_strike)
-        elif side == "bull_put":
-            value = max(0.0, short_strike - spot) - max(0.0, long_strike - spot)
-        else:
-            continue
-        total += (credit - value) * contracts * 100.0
+        g["contracts"] += contracts
+        g["credit_dollars"] += credit * contracts * 100.0
+
+    for event in events:
+        if event.get("event") == "flatten_fill":
+            key = (event.get("side"), event.get("short_strike"), event.get("long_strike"))
+            g = groups.get(key)
+            if g is None:
+                continue
+            contracts = float(event.get("contracts") or 0.0)
+            g["closed_contracts"] += contracts
+            g["realized_dollars"] += float(event.get("fill_price") or 0.0) * contracts * 100.0
+        elif event.get("event") == "stop":
+            key = (event.get("side"), event.get("short_strike"), event.get("long_strike"))
+            g = groups.get(key)
+            if g is None:
+                continue
+            contracts = float(event.get("contracts") or 0.0)
+            g["closed_contracts"] += contracts
+            g["realized_dollars"] -= float(event.get("stop_fill") or 0.0) * contracts * 100.0
+
+    total = 0.0
+    for (side, short_strike, long_strike), g in groups.items():
+        contracts = g["contracts"] or 1.0
+        avg_credit = g["credit_dollars"] / contracts
+        closed = min(g["closed_contracts"], g["contracts"])
+        remaining = g["contracts"] - closed
+        total += avg_credit * closed + g["realized_dollars"]
+        if remaining > 0 and short_strike is not None and long_strike is not None:
+            short_strike = float(short_strike)
+            long_strike = float(long_strike)
+            if side == "bear_call":
+                value = max(0.0, spot - short_strike) - max(0.0, spot - long_strike)
+            elif side == "bull_put":
+                value = max(0.0, short_strike - spot) - max(0.0, long_strike - spot)
+            else:
+                continue
+            total += avg_credit * remaining - value * 100.0 * remaining
     return round(total, 2)
 
 
@@ -388,7 +424,7 @@ def main() -> None:
     live_summary["settlement_price"] = spot
     if spot is not None:
         entries = [e for e in events if e.get("event") == "entry"]
-        theo = settlement_marked_pnl(entries, spot)
+        theo = settlement_marked_pnl(entries, events, spot)
         live_summary["settlement_marked_pnl"] = theo
         if live_summary.get("marked_pnl") is not None:
             live_summary["marked_pnl_vs_settlement"] = round(theo - live_summary["marked_pnl"], 2)
