@@ -681,6 +681,9 @@ def build_live(live_dir: Path, account_equity: float) -> dict:
                         k: raw.get("backtest_normalized_13m", {}).get(k)
                         for k in ("available", "entries", "contracts", "stops", "net_pnl", "bear_call_pct")
                     },
+                    "settlement_price": raw.get("live", {}).get("settlement_price"),
+                    "settlement_marked_pnl": raw.get("live", {}).get("settlement_marked_pnl"),
+                    "marked_pnl_vs_settlement": raw.get("live", {}).get("marked_pnl_vs_settlement"),
                 }
             except json.JSONDecodeError:
                 reconcile = None

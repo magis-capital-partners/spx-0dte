@@ -657,9 +657,20 @@ function Daily({data}) {
                 <div className="card"><div className="k">Rejected</div><div className="v">{liveDay.order_rejected||0}</div></div>
                 <div className="card"><div className="k">Credit sold</div><div className="v">{fmt$(liveDay.gross_credit_sold)}</div></div>
                 <div className="card"><div className="k">Marked P&L</div><div className={"v "+cls(liveDay.marked_pnl)}>{liveDay.marked_pnl==null?"—":fmt$(liveDay.marked_pnl)}</div></div>
+                {recon?.settlement_marked_pnl!=null && (
+                  <div className="card"><div className="k">Settlement P&L</div><div className={"v "+cls(recon.settlement_marked_pnl)}>{fmt$(recon.settlement_marked_pnl)}</div></div>
+                )}
                 <div className="card"><div className="k">Flattened</div><div className="v">{liveDay.flattened?<span className="pill halt">Yes</span>:"No"}</div></div>
                 <div className="card"><div className="k">Halted</div><div className="v">{liveDay.halted?<span className="pill halt">Yes</span>:"No"}</div></div>
               </div>
+              {recon?.settlement_marked_pnl!=null && (
+                <p className="sub" style={{marginTop:0}}>
+                  Settlement P&L uses the official SPX close ({recon.settlement_price}) held-to-expiry on the recorded fills — a reference figure, not a replacement for the executor's reported mark.
+                  {recon.marked_pnl_vs_settlement!=null && Math.abs(recon.marked_pnl_vs_settlement)>500 && (
+                    <> <span className="pill halt">variance {fmt$(recon.marked_pnl_vs_settlement)}</span> vs reported mark — check for early stops/flatten fills before trusting either number alone.</>
+                  )}
+                </p>
+              )}
               {diffPaper?.available && (
                 <p className="sub" style={{marginTop:0}}>
                   Reconcile vs paper-scale backtest:{" "}
