@@ -40,6 +40,7 @@ def evaluate_watchdog(
     today: str,
     *,
     max_heartbeat_age: float = 30.0,
+    startup_grace_seconds: float = 120.0,
     live_dir: Path = LIVE_DIR,
     now: Optional[datetime] = None,
 ) -> Optional[str]:
@@ -49,9 +50,13 @@ def evaluate_watchdog(
     hb = read_heartbeat(today, live_dir=live_dir)
 
     lock_pid = None
+    lock_started_at: Optional[datetime] = None
     if lock.is_file():
         try:
-            lock_pid = int(json.loads(lock.read_text(encoding="utf-8")).get("pid", -1))
+            lock_payload = json.loads(lock.read_text(encoding="utf-8"))
+            lock_pid = int(lock_payload.get("pid", -1))
+            if lock_payload.get("started_at"):
+                lock_started_at = datetime.fromisoformat(lock_payload["started_at"])
         except Exception:
             lock_pid = -1
 
@@ -60,11 +65,28 @@ def evaluate_watchdog(
 
     open_count = int((hb or {}).get("open_count") or 0)
     age = heartbeat_age_seconds(hb, now=clock) if hb else None
+    heartbeat_pid = int((hb or {}).get("pid") or -1)
 
     if lock_pid is not None and lock_pid > 0 and not _pid_alive(lock_pid):
         if open_count > 0 or hb is None:
             return f"executor_pid_dead pid={lock_pid} open_count={open_count}"
         return None
+
+    # During a controlled restart, the new process acquires the lock before its
+    # first heartbeat. The prior heartbeat can still report open risk and become
+    # stale while IB book recovery and quote warmup run. Treat an alive, newly
+    # started lock with a different PID as startup—not as a stalled old process.
+    # Without this grace the watchdog wrote KILL during recovery on 2026-08-05,
+    # causing an unintended flatten.
+    if (
+        lock_pid is not None
+        and lock_pid > 0
+        and heartbeat_pid != lock_pid
+        and lock_started_at is not None
+    ):
+        lock_age = max((clock - lock_started_at).total_seconds(), 0.0)
+        if lock_age <= startup_grace_seconds:
+            return None
 
     if open_count > 0 and age is not None and age > max_heartbeat_age:
         return f"heartbeat_stale age={age:.0f}s open_count={open_count}"

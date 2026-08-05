@@ -18,9 +18,9 @@ class LiveDefaultSizeTests(unittest.TestCase):
         live = LiveConfig()
         config, _schedule = resolve_strategy_config(live)
 
-        self.assertEqual(live.contracts_per_tranche, 1)
-        self.assertEqual(live.max_contracts_per_tranche, 1)
-        self.assertEqual(config.baseline_contracts, 1)
+        self.assertEqual(live.contracts_per_tranche, 2)
+        self.assertEqual(live.max_contracts_per_tranche, 2)
+        self.assertEqual(config.baseline_contracts, 2)
 
 
 if __name__ == "__main__":

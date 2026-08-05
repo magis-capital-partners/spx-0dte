@@ -75,6 +75,71 @@ class HeartbeatWatchdogTests(unittest.TestCase):
             self.assertIsNotNone(reason)
             self.assertIn("heartbeat_stale", reason or "")
 
+    def test_new_executor_pid_gets_recovery_grace_before_first_heartbeat(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            live_dir = Path(tmp)
+            day = "2026-08-05"
+            day_dir = live_dir / day
+            day_dir.mkdir(parents=True)
+            now = datetime.now()
+            (day_dir / "heartbeat.json").write_text(
+                json.dumps({
+                    "ts": (now - timedelta(seconds=60)).isoformat(),
+                    "pid": 999_999,
+                    "open_count": 4,
+                }),
+                encoding="utf-8",
+            )
+            (day_dir / "executor.lock").write_text(
+                json.dumps({
+                    "pid": os.getpid(),
+                    "date": day,
+                    "started_at": (now - timedelta(seconds=20)).isoformat(),
+                }),
+                encoding="utf-8",
+            )
+            reason = evaluate_watchdog(
+                day,
+                max_heartbeat_age=30.0,
+                startup_grace_seconds=120.0,
+                live_dir=live_dir,
+                now=now,
+            )
+            self.assertIsNone(reason)
+
+    def test_restart_grace_expires_if_new_process_never_heartbeats(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            live_dir = Path(tmp)
+            day = "2026-08-05"
+            day_dir = live_dir / day
+            day_dir.mkdir(parents=True)
+            now = datetime.now()
+            (day_dir / "heartbeat.json").write_text(
+                json.dumps({
+                    "ts": (now - timedelta(seconds=180)).isoformat(),
+                    "pid": 999_999,
+                    "open_count": 4,
+                }),
+                encoding="utf-8",
+            )
+            (day_dir / "executor.lock").write_text(
+                json.dumps({
+                    "pid": os.getpid(),
+                    "date": day,
+                    "started_at": (now - timedelta(seconds=121)).isoformat(),
+                }),
+                encoding="utf-8",
+            )
+            reason = evaluate_watchdog(
+                day,
+                max_heartbeat_age=30.0,
+                startup_grace_seconds=120.0,
+                live_dir=live_dir,
+                now=now,
+            )
+            self.assertIsNotNone(reason)
+            self.assertIn("heartbeat_stale", reason or "")
+
     def test_healthy(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             live_dir = Path(tmp)
