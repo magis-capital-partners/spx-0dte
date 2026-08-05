@@ -662,7 +662,7 @@ function Daily({data}) {
               </div>
               {liveDay.pnl_source==="settlement" && (
                 <p className="sub" style={{marginTop:0}}>
-                  P&L is settled against the official SPX close ({recon.settlement_price}): each fill closed early is valued at its real stop/flatten fill, and whatever was still open at the bell at cash-settlement intrinsic value.
+                  P&L is settled against the official SPX close ({recon?.settlement_price}): each fill closed early is valued at its real stop/flatten fill, and whatever was still open at the bell at cash-settlement intrinsic value.
                   {recon?.marked_pnl_vs_settlement!=null && Math.abs(recon.marked_pnl_vs_settlement)>500 && (
                     <> The executor's own end-of-session mark reported {fmt$(liveDay.reported_marked_pnl)} <span className="pill halt">off by {fmt$(recon.marked_pnl_vs_settlement)}</span> — that mark is a live-quote snapshot and is not used here.</>
                   )}
