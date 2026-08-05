@@ -19,7 +19,7 @@ import time
 from datetime import date, datetime, time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Sequence
 from urllib.parse import parse_qs, urlparse
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -31,6 +31,7 @@ STATUS_ROLLOVER_EXIT_CODE = 75
 sys.path.insert(0, str(ROOT / "live"))
 from session_recovery import _pid_alive, load_fills_events  # noqa: E402
 from execution_type import execution_type  # noqa: E402
+from session_pnl import session_pnl_summary  # noqa: E402
 
 
 def _today() -> str:
@@ -124,10 +125,13 @@ def _recent_events(today: str, limit: int = 12) -> List[dict]:
     return out
 
 
-def _execution_type_for_day(day: str) -> str:
+def _execution_type_for_day(
+    day: str, events: Optional[Sequence[dict]] = None
+) -> str:
     """Read the persisted session label, with a mode-derived legacy fallback."""
+    source = load_fills_events(day) if events is None else events
     starts = [
-        event for event in load_fills_events(day)
+        event for event in source
         if event.get("event") == "session_start"
     ]
     if not starts:
@@ -137,7 +141,11 @@ def _execution_type_for_day(day: str) -> str:
 
 
 def _risk_history(limit: int = 30) -> List[dict]:
-    """Latest compact return-on-margin point from each recorded session."""
+    """Latest compact return-on-margin point from each recorded session.
+
+    The snapshot only marks the open book, so a day that ended flat reads 0.0.
+    Each row therefore carries the day's realized ``closed_pnl`` alongside it.
+    """
     rows: List[dict] = []
     if not LIVE_DIR.is_dir():
         return rows
@@ -149,13 +157,22 @@ def _risk_history(limit: int = 30) -> List[dict]:
             raw = json.loads(lines[-1])
         except json.JSONDecodeError:
             continue
+        events = load_fills_events(day_dir.name)
+        pnl = session_pnl_summary(events)
+        marked = raw.get("marked_pnl")
+        marked_value = float(marked) if marked is not None else 0.0
         rows.append({
             "date": day_dir.name,
             "execution_type": execution_type(
-                None, raw.get("execution_type") or _execution_type_for_day(day_dir.name),
+                None,
+                raw.get("execution_type")
+                or _execution_type_for_day(day_dir.name, events),
             ),
             "ts": raw.get("ts"),
-            "marked_pnl": raw.get("marked_pnl"),
+            "marked_pnl": marked,
+            "closed_pnl": round(pnl.closed_pnl, 2),
+            "total_pnl": round(marked_value + pnl.closed_pnl, 2),
+            "contracts_traded": pnl.contracts_traded,
             "defined_risk_margin": raw.get("defined_risk_margin"),
             "marked_return_on_margin_pct": raw.get("marked_return_on_margin_pct"),
             "max_loss_no_stop": raw.get("max_loss_no_stop"),
@@ -172,9 +189,12 @@ def build_status(*, today: Optional[str] = None) -> Dict[str, Any]:
     lock = _read_json(day_dir / "executor.lock") or {}
     pid = int(hb.get("pid") or lock.get("pid") or 0)
     alive = _pid_alive(pid) if pid else False
+    events = load_fills_events(day)
     session_execution_type = execution_type(
-        None, hb.get("execution_type") or _execution_type_for_day(day),
+        None, hb.get("execution_type") or _execution_type_for_day(day, events),
     )
+    marked_pnl = float(hb.get("marked_pnl") or 0.0)
+    pnl = session_pnl_summary(events)
     return {
         "schema": 2,
         "source": "local",
@@ -186,7 +206,15 @@ def build_status(*, today: Optional[str] = None) -> Dict[str, Any]:
         "entries_halted": bool(hb.get("entries_halted", False)),
         "flattened": bool(hb.get("flattened", False)),
         "open_count": int(hb.get("open_count") or 0),
-        "marked_pnl": float(hb.get("marked_pnl") or 0.0),
+        "marked_pnl": marked_pnl,
+        # marked_pnl covers only the open book; closed_pnl covers spreads a
+        # flatten removed from it. Every spread lands in exactly one term.
+        "closed_pnl": round(pnl.closed_pnl, 2),
+        "total_pnl": round(marked_pnl + pnl.closed_pnl, 2),
+        "credit_received": round(pnl.credit_received, 2),
+        "contracts_traded": pnl.contracts_traded,
+        "entry_count": pnl.entry_count,
+        "open_contracts": pnl.open_contracts,
         "execution_type": session_execution_type,
         "risk": hb.get("risk") or {},
         "risk_history": _risk_history(),
@@ -210,6 +238,12 @@ def build_sanitized_cloud_status(*, today: Optional[str] = None) -> Dict[str, An
         "flattened": full["flattened"],
         "open_count": full["open_count"],
         "marked_pnl": round(full["marked_pnl"], 2),
+        "closed_pnl": full["closed_pnl"],
+        "total_pnl": full["total_pnl"],
+        "credit_received": full["credit_received"],
+        "contracts_traded": full["contracts_traded"],
+        "entry_count": full["entry_count"],
+        "open_contracts": full["open_contracts"],
         "execution_type": full.get("execution_type", "unknown"),
         "risk": {
             key: value for key, value in (full.get("risk") or {}).items()

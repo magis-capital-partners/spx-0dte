@@ -184,7 +184,10 @@ function SessionNow() {
             <div className="card"><div className="k">Executor</div><div className="v" style={{fontSize:16}}>{alive ? "alive" : "down"}</div></div>
             <div className="card"><div className="k">Execution</div><div className="v" style={{fontSize:16}}>{executionLabel(src.execution_type)}</div></div>
             <div className="card"><div className="k">Open</div><div className="v">{src.open_count ?? "–"}</div></div>
-            <div className="card"><div className="k">Marked P&amp;L</div><div className={"v " + cls(src.marked_pnl)}>{fmt$(src.marked_pnl || 0)}</div></div>
+            <div className="card"><div className="k">Contracts traded</div><div className="v">{src.contracts_traded ?? MISSING}</div></div>
+            <div className="card"><div className="k">Session P&amp;L</div><div className={"v " + cls(src.total_pnl)}>{src.total_pnl==null?MISSING:fmt$(src.total_pnl)}</div></div>
+            <div className="card"><div className="k">Realized (closed)</div><div className={"v " + cls(src.closed_pnl)}>{src.closed_pnl==null?MISSING:fmt$(src.closed_pnl)}</div></div>
+            <div className="card"><div className="k">Marked (open book)</div><div className={"v " + cls(src.marked_pnl)}>{fmt$(src.marked_pnl || 0)}</div></div>
             <div className="card"><div className="k">Max loss (no stop)</div><div className="v neg">{risk.max_loss_no_stop==null?MISSING:fmt$(risk.max_loss_no_stop)}</div></div>
             <div className="card"><div className="k">Planned stop loss*</div><div className="v neg">{risk.planned_stop_loss==null?MISSING:fmt$(risk.planned_stop_loss)}</div></div>
             <div className="card"><div className="k">Defined-risk margin</div><div className="v">{risk.defined_risk_margin==null?MISSING:fmt$(risk.defined_risk_margin)}</div></div>
@@ -202,13 +205,16 @@ function SessionNow() {
           </p>}
           {riskHistory.length > 0 && <div style={{marginBottom:12}}>
             <div className="muted" style={{marginBottom:6, fontSize:11, textTransform:"uppercase"}}>Daily marked return on margin</div>
-            <table><thead><tr><th>Date</th><th>Execution</th><th>Marked P&amp;L</th><th>Margin</th><th>ROM</th><th>Max loss</th></tr></thead>
+            <table><thead><tr><th>Date</th><th>Execution</th><th>Session P&amp;L</th><th>Realized</th><th>Marked</th><th>Margin</th><th>ROM</th><th>Max loss</th></tr></thead>
               <tbody>{riskHistory.slice(-10).reverse().map((row,i)=><tr key={i}>
-                <td>{row.date}</td><td><span className="pill">{executionLabel(row.execution_type)}</span></td><td className={cls(row.marked_pnl)}>{fmt$(row.marked_pnl)}</td><td>{fmt$(row.defined_risk_margin)}</td>
+                <td>{row.date}</td><td><span className="pill">{executionLabel(row.execution_type)}</span></td>
+                <td className={cls(row.total_pnl)}>{row.total_pnl==null?MISSING:fmt$(row.total_pnl)}</td>
+                <td className={cls(row.closed_pnl)}>{row.closed_pnl==null?MISSING:fmt$(row.closed_pnl)}</td>
+                <td className={cls(row.marked_pnl)}>{fmt$(row.marked_pnl)}</td><td>{fmt$(row.defined_risk_margin)}</td>
                 <td className={cls(row.marked_return_on_margin_pct)}>{fmtPct(row.marked_return_on_margin_pct)}</td><td className="neg">{fmt$(row.max_loss_no_stop)}</td>
               </tr>)}</tbody>
             </table>
-            <p className="sub" style={{margin:"8px 0 0"}}>Historical values are the final available mark and risk at that session's last snapshot; 0DTE positions settle after the session.</p>
+            <p className="sub" style={{margin:"8px 0 0"}}>Session P&amp;L = realized on spreads closed out + mark on whatever is still open. Marked-only columns read 0 for a day that ended flat, which is why realized is shown separately; 0DTE positions settle after the session.</p>
           </div>}
           {usingLocal && local?.recent_events?.length ? (
             <p className="sub" style={{margin:"0 0 10px"}}>

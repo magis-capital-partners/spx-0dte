@@ -43,6 +43,12 @@ class LiveStatusTests(unittest.TestCase):
             "flattened": False,
             "open_count": 1,
             "marked_pnl": -12.5,
+            "closed_pnl": 400.0,
+            "total_pnl": 387.5,
+            "credit_received": 1000.0,
+            "contracts_traded": 3,
+            "entry_count": 2,
+            "open_contracts": 1,
             "recent_events": [
                 {
                     "ts": "2026-07-29T14:00:00",
@@ -61,6 +67,11 @@ class LiveStatusTests(unittest.TestCase):
         self.assertEqual(cloud["last_event"]["event"], "entry")
         self.assertNotIn("short_strike", cloud["last_event"])
         self.assertEqual(cloud["open_count"], 1)
+        # Realized P&L must survive sanitization, otherwise a flattened session
+        # publishes marked_pnl=0.0 and the day's result disappears.
+        self.assertEqual(cloud["closed_pnl"], 400.0)
+        self.assertEqual(cloud["total_pnl"], 387.5)
+        self.assertEqual(cloud["contracts_traded"], 3)
 
     def test_write_cloud_status_roundtrip(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

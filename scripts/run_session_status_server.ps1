@@ -29,20 +29,31 @@ if ($LASTEXITCODE -ne 0) {
 
 Write-Host ("session_status_server: python={0} writeInterval={1}s stopAt={2}" -f $Python, $WriteInterval, $StopAt)
 
-# Evict accidental `python -m http.server <port>` squatters. They bind with
-# SO_REUSEADDR and silently serve 404 for /status + /logs, which is exactly how
-# the dashboard loses executor stdout while the Status API task still looks up.
+# Evict whatever already holds the port. `python -m http.server <port>`
+# squatters bind with SO_REUSEADDR and silently serve 404 for /status + /logs,
+# which is how the dashboard loses executor stdout while the task still looks
+# up. An orphaned session_status_server.py is now just as fatal: the server
+# binds exclusively, and Stop-ScheduledTask kills this wrapper while leaving its
+# python child on the port, so a task "restart" kept serving the 09:00 process's
+# stale code all session (2026-08-05). Nothing is listening for us yet at this
+# point, so any owner here is by definition a previous run.
 $listeners = Get-NetTCPConnection -LocalPort $Port -State Listen -ErrorAction SilentlyContinue
 foreach ($conn in $listeners) {
+    if ($conn.OwningProcess -eq $PID) { continue }
     $owner = Get-CimInstance Win32_Process -Filter ("ProcessId = {0}" -f $conn.OwningProcess) -ErrorAction SilentlyContinue
     if (-not $owner -or -not $owner.CommandLine) { continue }
-    if ($owner.CommandLine -match "session_status_server\.py") { continue }
-    if ($owner.CommandLine -match "http\.server") {
-        Write-Warning ("Killing port-{0} squatter pid={1}: {2}" -f $Port, $owner.ProcessId, $owner.CommandLine)
+    if ($owner.CommandLine -match "session_status_server\.py" -or $owner.CommandLine -match "http\.server") {
+        Write-Warning ("Evicting stale port-{0} listener pid={1}: {2}" -f $Port, $owner.ProcessId, $owner.CommandLine)
         Stop-Process -Id $owner.ProcessId -Force -ErrorAction SilentlyContinue
     } else {
         Write-Warning ("Port {0} owned by unexpected pid={1}: {2}" -f $Port, $owner.ProcessId, $owner.CommandLine)
     }
+}
+
+# The exclusive bind fails if the evicted socket has not been released yet.
+for ($i = 0; $i -lt 40; $i++) {
+    if (-not (Get-NetTCPConnection -LocalPort $Port -State Listen -ErrorAction SilentlyContinue)) { break }
+    Start-Sleep -Milliseconds 250
 }
 
 while ($true) {
