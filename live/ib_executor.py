@@ -140,6 +140,10 @@ from clear_stale_halt import (  # noqa: E402
     consume_clear_stale_halt,
     filter_cleared_stale_reasons,
 )
+from clear_flatten_halt import (  # noqa: E402
+    consume_clear_flatten_halt,
+    filter_cleared_flatten_reasons,
+)
 from account_guards import (  # noqa: E402
     check_loop_account_guard,
     check_startup_account_guard,
@@ -2895,6 +2899,63 @@ def run(live: LiveConfig = ACTIVE) -> None:
                 "reason": "recovery_quotes_ready",
                 "cleared_reasons": cleared_reasons,
             }, live=live)
+        clear_flatten_path = consume_clear_flatten_halt(today)
+        if clear_flatten_path is not None:
+            flatten_to_clear = filter_cleared_flatten_reasons(governor.halt_reasons)
+            kept_reasons = [
+                r for r in governor.halt_reasons if r not in set(flatten_to_clear)
+            ]
+            residual_ib_lots = 0
+            ib_check_error: Optional[str] = None
+            if ib is not None and HAS_IB and not dry:
+                try:
+                    nets = fetch_ib_spxw_positions(ib, today, account=live.ib_account)
+                except Exception as exc:
+                    ib_check_error = repr(exc)
+                else:
+                    residual_ib_lots = sum(abs(v) for v in nets.values())
+            if not flatten_to_clear:
+                print(
+                    f"[{datetime.now().isoformat()}] CLEAR_FLATTEN_HALT ignored — "
+                    f"no flatten halt to clear (reasons={governor.halt_reasons})"
+                )
+            elif open_spreads:
+                print(
+                    f"[{datetime.now().isoformat()}] CLEAR_FLATTEN_HALT ignored — "
+                    f"recovered book still holds {len(open_spreads)} open spread(s)"
+                )
+            elif ib_check_error is not None:
+                print(
+                    f"[{datetime.now().isoformat()}] CLEAR_FLATTEN_HALT ignored — "
+                    f"could not verify IB is flat: {ib_check_error}"
+                )
+            elif residual_ib_lots:
+                print(
+                    f"[{datetime.now().isoformat()}] CLEAR_FLATTEN_HALT ignored — "
+                    f"IB still shows {residual_ib_lots} same-day SPXW lot(s)"
+                )
+            else:
+                print(
+                    f"[{datetime.now().isoformat()}] governor clear — "
+                    f"operator CLEAR_FLATTEN_HALT removed {flatten_to_clear} "
+                    "after confirming a flat book"
+                    + (f" (kept {kept_reasons})" if kept_reasons else "")
+                )
+                log_event(today, {
+                    "event": "governor_clear",
+                    "reason": "operator_clear_flatten",
+                    "cleared_reasons": flatten_to_clear,
+                    "kept_reasons": kept_reasons,
+                }, live=live)
+                flattened = False
+                entries_halted = bool(kept_reasons)
+            try:
+                clear_flatten_path.unlink()
+            except OSError as exc:
+                print(
+                    f"[{datetime.now().isoformat()}] WARN could not remove "
+                    f"{clear_flatten_path}: {exc!r}"
+                )
         clear_stale_path = consume_clear_stale_halt(today)
         if clear_stale_path is not None:
             stale_to_clear = filter_cleared_stale_reasons(governor.halt_reasons)

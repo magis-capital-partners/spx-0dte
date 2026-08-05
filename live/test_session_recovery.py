@@ -408,6 +408,51 @@ class RecoverGovernorTests(unittest.TestCase):
         self.assertFalse(gov.entries_halted)
         self.assertEqual(gov.halt_reasons, [])
 
+    def test_operator_clear_flatten_resumes_entries(self) -> None:
+        events = [
+            {"event": "kill_switch"},
+            {"event": "flatten"},
+            {"event": "flatten_incomplete", "residual_ib_lots": 1},
+            {
+                "event": "governor_clear",
+                "reason": "operator_clear_flatten",
+                "cleared_reasons": ["flatten", "flatten_incomplete", "kill_switch"],
+            },
+        ]
+        gov = recover_governor_state(events)
+        self.assertFalse(gov.flattened)
+        self.assertFalse(gov.entries_halted)
+        self.assertEqual(gov.halt_reasons, [])
+
+    def test_operator_clear_flatten_keeps_daily_loss_halt(self) -> None:
+        events = [
+            {"event": "halt_entries", "reason": "daily_loss", "marked_pnl": -12000},
+            {"event": "flatten", "marked_pnl": -17000},
+            {
+                "event": "governor_clear",
+                "reason": "operator_clear_flatten",
+                "cleared_reasons": ["flatten", "daily_loss"],
+            },
+        ]
+        gov = recover_governor_state(events)
+        self.assertFalse(gov.flattened)
+        self.assertTrue(gov.entries_halted)
+        self.assertEqual(gov.halt_reasons, ["daily_loss"])
+
+    def test_operator_clear_flatten_does_not_cover_a_later_flatten(self) -> None:
+        events = [
+            {"event": "flatten"},
+            {
+                "event": "governor_clear",
+                "reason": "operator_clear_flatten",
+                "cleared_reasons": ["flatten"],
+            },
+            {"event": "flatten", "marked_pnl": -17000},
+        ]
+        gov = recover_governor_state(events)
+        self.assertTrue(gov.flattened)
+        self.assertTrue(gov.entries_halted)
+
     def test_halt_and_flatten(self) -> None:
         events = [
             {"event": "halt_entries", "marked_pnl": -12000},

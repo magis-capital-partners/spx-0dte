@@ -17,6 +17,15 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 ROOT = Path(__file__).resolve().parents[1]
 LIVE_DIR = ROOT / "data" / "live"
 
+# Fill events that mean "the book was force-closed"; each one also records its
+# own name as a halt reason, so ``flattened`` is derivable from halt_reasons.
+FLATTEN_HALT_REASONS = frozenset({
+    "flatten",
+    "error_flatten",
+    "kill_switch",
+    "flatten_incomplete",
+})
+
 
 @dataclass(frozen=True)
 class LegKey:
@@ -217,6 +226,8 @@ def recover_governor_state(
     - Any ``flatten`` / ``error_flatten`` / ``kill_switch`` → flattened + halted.
     - ``entry_fault`` / ``entry_poll_error`` / ``entry_ladder_failed`` do **not**
       sticky-halt (flat-book recoveries).
+    - A validated ``operator_clear_flatten`` removes flatten-family reasons only,
+      so an unintended flatten can be resumed once IB is confirmed flat.
     - ``side_stop_cooldown_start`` restores ``until`` when still in the future.
     - Bare ``stop`` events derive cooldown as ``ts + cooldown_minutes`` when no
       explicit cooldown event was logged (older sessions).
@@ -235,7 +246,7 @@ def recover_governor_state(
                 reason = "daily_loss" if event.get("marked_pnl") is not None else "unspecified"
             halt_reasons.add(reason)
             continue
-        if name in {"flatten", "error_flatten", "kill_switch", "flatten_incomplete"}:
+        if name in FLATTEN_HALT_REASONS:
             flattened = True
             halt_reasons.add(str(name))
             continue
@@ -249,6 +260,15 @@ def recover_governor_state(
             for reason in event.get("cleared_reasons") or []:
                 if str(reason) == "stale_quotes":
                     halt_reasons.discard("stale_quotes")
+            continue
+        if name == "governor_clear" and event.get("reason") == "operator_clear_flatten":
+            # Explicit operator resume after confirming IB holds no same-day risk.
+            # Only flatten-family reasons may be removed — P&L, account, stale and
+            # stop-count halts survive and keep entries blocked.
+            for reason in event.get("cleared_reasons") or []:
+                if str(reason) in FLATTEN_HALT_REASONS:
+                    halt_reasons.discard(str(reason))
+            flattened = bool(halt_reasons & FLATTEN_HALT_REASONS)
             continue
         if name == "side_stop_cooldown_start":
             side = str(event.get("side") or "")
