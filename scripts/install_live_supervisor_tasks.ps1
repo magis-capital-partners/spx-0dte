@@ -12,11 +12,24 @@
 param(
     [switch]$StartNow,
     [switch]$Uninstall,
-    [string]$DailyAt = "09:00"
+    # Re-registering a Running task stops it, and these two only re-trigger at
+    # $DailyAt or logon — so applying them mid-session would leave the watchdog
+    # and status API down for the rest of the day. Use this to retime the rest
+    # during a live session and pick the services up after the close.
+    [switch]$SkipServices,
+    [string]$DailyAt = "09:25",
+    [string]$PublishStart = "09:30",
+    [int]$PublishRepeatMinutes = 5,
+    # 09:30 -> 16:05, so the window covers the session and the first post-close
+    # publish. The 16:15 daily data update owns the final reconcile + deploy.
+    [int]$PublishWindowMinutes = 395,
+    [string]$SessionCheckAt = "09:35"
 )
 
 $ErrorActionPreference = "Stop"
 $Root = Split-Path -Parent $PSScriptRoot
+
+$Weekdays = @("Monday", "Tuesday", "Wednesday", "Thursday", "Friday")
 
 $tasks = @(
     @{
@@ -27,11 +40,19 @@ $tasks = @(
         LimitHours = 1
     },
     @{
+        Name = "Magis SPX 0DTE Session Hygiene"
+        Script = "run_session_hygiene.ps1"
+        ExtraArgs = @()
+        Description = "Report KILL/CLEAR control files before the open and prune past-date KILL files."
+        LimitHours = 1
+    },
+    @{
         Name = "Magis SPX 0DTE Watchdog"
         Script = "run_live_watchdog_supervised.ps1"
         ExtraArgs = @("-WriteKill")
         Description = "SPX 0DTE heartbeat watchdog with Magis Slack + WriteKill."
         LimitHours = 14
+        IsService = $true
     },
     @{
         Name = "Magis SPX 0DTE Status API"
@@ -39,14 +60,31 @@ $tasks = @(
         ExtraArgs = @()
         Description = "Local dashboard status API on 127.0.0.1:8765; writes sanitized live_status.json."
         LimitHours = 14
+        IsService = $true
+    },
+    @{
+        # The executor is manual by design, so a forgotten start is a silent
+        # no-trade day. Nothing else notices; this does.
+        Name = "Magis SPX 0DTE Session Start Check"
+        Script = "run_session_hygiene.ps1"
+        ExtraArgs = @("-CheckStarted")
+        Description = "Alert if the manual IB executor recorded no session_start shortly after the open."
+        LimitHours = 1
+        At = $SessionCheckAt
+        WeekdaysOnly = $true
+        NoLogonTrigger = $true
     },
     @{
         Name = "Magis SPX 0DTE Status Publish"
         Script = "publish_live_status.ps1"
-        ExtraArgs = @("-Deploy", "-MinMinutes", "2")
-        Description = "Push sanitized live_status.json to GitHub Pages (~every 2 min when changed)."
+        ExtraArgs = @("-Deploy", "-MinMinutes", "5")
+        Description = "Push sanitized live_status.json to GitHub Pages every 5 min during market hours only."
         LimitHours = 1
-        RepeatMinutes = 2
+        At = $PublishStart
+        WeekdaysOnly = $true
+        NoLogonTrigger = $true
+        RepeatMinutes = $PublishRepeatMinutes
+        WindowMinutes = $PublishWindowMinutes
     }
 )
 
@@ -80,15 +118,33 @@ function Register-SpxTask($spec) {
         -Argument $arg `
         -WorkingDirectory $Root
 
-    $triggers = @(
-        (New-ScheduledTaskTrigger -Daily -At $DailyAt),
-        (New-ScheduledTaskTrigger -AtLogOn -User $env:USERNAME)
-    )
+    $at = if ($spec.ContainsKey("At") -and $spec.At) { $spec.At } else { $DailyAt }
+
+    if ($spec.ContainsKey("WeekdaysOnly") -and $spec.WeekdaysOnly) {
+        $primary = New-ScheduledTaskTrigger -Weekly -DaysOfWeek $Weekdays -At $at
+    } else {
+        $primary = New-ScheduledTaskTrigger -Daily -At $at
+    }
+
+    # A bounded repetition window keeps a polling task inside market hours. The
+    # previous 3650-day duration meant the publisher fired every few minutes
+    # around the clock, all weekend, churning live_status.json commits on main.
     if ($spec.ContainsKey("RepeatMinutes") -and $spec.RepeatMinutes) {
-        $rep = New-ScheduledTaskTrigger -Once -At (Get-Date).AddMinutes(1) `
+        $windowMinutes = if ($spec.ContainsKey("WindowMinutes") -and $spec.WindowMinutes) {
+            $spec.WindowMinutes
+        } else {
+            390
+        }
+        $template = New-ScheduledTaskTrigger -Once -At (Get-Date) `
             -RepetitionInterval (New-TimeSpan -Minutes $spec.RepeatMinutes) `
-            -RepetitionDuration (New-TimeSpan -Days 3650)
-        $triggers = @($rep) + $triggers
+            -RepetitionDuration (New-TimeSpan -Minutes $windowMinutes)
+        $primary.Repetition = $template.Repetition
+    }
+
+    $triggers = @($primary)
+    if (-not ($spec.ContainsKey("NoLogonTrigger") -and $spec.NoLogonTrigger)) {
+        # Long-running services and preflight should come back after a reboot.
+        $triggers += (New-ScheduledTaskTrigger -AtLogOn -User $env:USERNAME)
     }
     $settings = New-ScheduledTaskSettingsSet `
         -AllowStartIfOnBatteries `
@@ -110,15 +166,24 @@ function Register-SpxTask($spec) {
     Write-Host "Registered: $($spec.Name)"
 }
 
-foreach ($t in $tasks) { Register-SpxTask $t }
+foreach ($t in $tasks) {
+    if ($SkipServices -and $t.ContainsKey("IsService") -and $t.IsService) {
+        Write-Host "Skipped (service, -SkipServices): $($t.Name)"
+        continue
+    }
+    Register-SpxTask $t
+}
 
 if ($StartNow) {
-    foreach ($name in @(
+    $startNames = @(
         "Magis SPX 0DTE Daily Preflight",
-        "Magis SPX 0DTE Status API",
-        "Magis SPX 0DTE Status Publish",
-        "Magis SPX 0DTE Watchdog"
-    )) {
+        "Magis SPX 0DTE Session Hygiene",
+        "Magis SPX 0DTE Status Publish"
+    )
+    if (-not $SkipServices) {
+        $startNames += @("Magis SPX 0DTE Status API", "Magis SPX 0DTE Watchdog")
+    }
+    foreach ($name in $startNames) {
         $st = Get-ScheduledTask -TaskName $name -ErrorAction SilentlyContinue
         if ($st -and $st.State -ne "Running") {
             Start-ScheduledTask -TaskName $name

@@ -302,7 +302,42 @@ class OpenSpread:
 # IB market data implementation (skeleton)
 # --------------------------------------------------------------------------- #
 # IB codes that are normal on paper (delayed data, farm OK messages) — file only.
-_QUIET_IB_ERROR_CODES = frozenset({10090, 10167, 10197, 202, 2104, 2106, 2158})
+# 10275 fires once per reqPositions for any account in the gateway login whose
+# application is unapproved. reqPositions is account-agnostic and ib_insync 0.9.86
+# has no reqPositionsMulti to scope it, so an unrelated account in the same login
+# emits this on every poll. Orders, fills, and position math are all scoped to
+# live.ib_account, so it is noise here — but see _POSITIONS_UNAVAILABLE_ACCOUNTS:
+# if it ever names the *traded* account, a zero position read is not proof of flat.
+_QUIET_IB_ERROR_CODES = frozenset({10090, 10167, 10197, 202, 2104, 2106, 2158, 10275})
+
+# Accounts IB has told us it cannot serve positions for, harvested from 10275.
+# A "flat" read for one of these is unverified, not confirmed flat.
+_POSITIONS_UNAVAILABLE_ACCOUNTS: set = set()
+
+
+def _note_positions_unavailable(error_string: str) -> None:
+    """Record accounts named in an IB 10275 positions-unavailable error."""
+    marker = "account(s):"
+    lowered = error_string.lower()
+    if marker not in lowered:
+        return
+    tail = error_string[lowered.index(marker) + len(marker):]
+    # "U27250667 until the application is finished and approved."
+    for token in tail.replace(",", " ").split():
+        if token[:1].upper() == "U" and token[1:].isdigit():
+            _POSITIONS_UNAVAILABLE_ACCOUNTS.add(token)
+
+
+def positions_unavailable_for(account: Optional[str]) -> bool:
+    """True when IB has reported it cannot serve positions for ``account``.
+
+    Guards the CLEAR_FLATTEN_HALT flat-book check: ``fetch_ib_spxw_positions``
+    returns no rows both for a genuinely flat account and for one IB refuses to
+    report on, and those must not be treated the same way.
+    """
+    if not account:
+        return False
+    return str(account) in _POSITIONS_UNAVAILABLE_ACCOUNTS
 
 
 def setup_ib_logging(today: str, live: LiveConfig) -> Path:
@@ -379,6 +414,8 @@ def register_ib_error_handler(
         errors_path.parent.mkdir(parents=True, exist_ok=True)
         with errors_path.open("a", encoding="utf-8") as handle:
             handle.write(json.dumps(record) + "\n")
+        if errorCode == 10275:
+            _note_positions_unavailable(errorString)
         if health is not None:
             health.on_ib_error(errorCode)
         if errorCode not in _QUIET_IB_ERROR_CODES:
@@ -3136,6 +3173,14 @@ def run(live: LiveConfig = ACTIVE) -> None:
                 print(
                     f"[{datetime.now().isoformat()}] CLEAR_FLATTEN_HALT ignored — "
                     f"could not verify IB is flat: {ib_check_error}"
+                )
+            elif positions_unavailable_for(live.ib_account):
+                # An empty position read is ambiguous when IB has refused to
+                # report on the traded account; never call that flat.
+                print(
+                    f"[{datetime.now().isoformat()}] CLEAR_FLATTEN_HALT ignored — "
+                    f"IB reports positions unavailable for {live.ib_account} "
+                    "(error 10275); a zero read is not proof of a flat book"
                 )
             elif residual_ib_lots:
                 print(
