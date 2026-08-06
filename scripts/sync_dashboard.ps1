@@ -56,38 +56,65 @@ function Push-WithRebase {
 }
 
 function Invoke-PagesBuildRequest {
-  param([string]$Repository)
-  Write-Host "Requesting GitHub Pages build for $Repository ..."
-  $resp = & $Gh api -X POST "repos/$Repository/pages/builds" 2>&1
-  if ($LASTEXITCODE -ne 0) {
-    throw "Pages build request failed: $resp"
+  # Pages allows exactly one in-flight deployment. main also receives pushes from
+  # the Status Publish task every few minutes, so a build request can collide with
+  # one already running and come back 400/409 "due to in progress deployment"
+  # (2026-08-06 run 31108752748). Back off and retry rather than failing the job.
+  param(
+    [string]$Repository,
+    [int]$Attempts = 4,
+    [int]$BackoffSeconds = 20
+  )
+  for ($i = 1; $i -le $Attempts; $i++) {
+    Write-Host "Requesting GitHub Pages build for $Repository (attempt $i/$Attempts) ..."
+    $resp = & $Gh api -X POST "repos/$Repository/pages/builds" 2>&1
+    if ($LASTEXITCODE -eq 0) {
+      if ($resp) { Write-Host $resp }
+      return
+    }
+    $text = "$resp"
+    if ($text -notmatch "in progress deployment|already in progress|HTTP 40") {
+      throw "Pages build request failed: $resp"
+    }
+    if ($i -eq $Attempts) {
+      Write-Warning "Pages build still busy after $Attempts attempts; the branch tip will deploy on the next build."
+      return
+    }
+    Write-Host "  another deployment is in flight; retrying in ${BackoffSeconds}s"
+    Start-Sleep -Seconds $BackoffSeconds
   }
-  if ($resp) { Write-Host $resp }
 }
 
 function Wait-PagesBuild {
   param(
     [string]$Repository,
-    [int]$TimeoutSeconds = 120
+    [int]$TimeoutSeconds = 120,
+    # When set, only a build whose .commit matches this SHA counts as done.
+    # Without this, polling immediately after a push can see the *previous*
+    # build still reporting "built" before GitHub has even enqueued a run for
+    # what we just pushed, and return early having verified nothing.
+    [string]$ExpectCommit = ""
   )
   $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
   Write-Host "Waiting for Pages build (up to ${TimeoutSeconds}s) ..."
   while ((Get-Date) -lt $deadline) {
-    $build = & $Gh api "repos/$Repository/pages/builds" --jq ".[0]" 2>&1
+    $build = & $Gh api "repos/$Repository/pages/builds/latest" 2>&1
     if ($LASTEXITCODE -ne 0) {
       Write-Warning "Could not poll Pages build status: $build"
       return
     }
-    $status = (& $Gh api "repos/$Repository/pages/builds" --jq ".[0].status")
-    $updated = (& $Gh api "repos/$Repository/pages/builds" --jq ".[0].updated_at")
-    Write-Host "  Pages build status: $status (updated $updated)"
-    if ($status -eq "built") {
+    $parsed = $build | ConvertFrom-Json
+    $status = $parsed.status
+    $commit = $parsed.commit
+    Write-Host "  Pages build status: $status commit=$commit (updated $($parsed.updated_at))"
+    if ($ExpectCommit -and $commit -ne $ExpectCommit) {
+      Write-Host "  (still the prior build; waiting for $ExpectCommit to start building)"
+    } elseif ($status -eq "built") {
       $site = (& $Gh api "repos/$Repository/pages" --jq ".html_url")
       Write-Host "Pages deployment complete: $site"
       return
-    }
-    if ($status -eq "errored") {
-      throw "GitHub Pages build failed. Check repo Settings -> Pages and recent builds."
+    } elseif ($status -eq "errored") {
+      throw "GitHub Pages build failed for commit ${commit}. Check repo Settings -> Pages and recent builds."
     }
     Start-Sleep -Seconds 5
   }
@@ -108,6 +135,7 @@ if ($doBuild) {
   if ($LASTEXITCODE -ne 0) { throw "build_dashboard_data.py failed (exit $LASTEXITCODE); refusing to deploy stale data." }
 }
 
+$justPushed = $false
 if ($doDeploy -or $DeployOnly) {
   Push-Location $Root
   try {
@@ -131,6 +159,7 @@ if ($doDeploy -or $DeployOnly) {
       & $Git -c user.name="Drew Goldman" -c user.email="dag5wd@virginia.edu" commit -m "dashboard: refresh backtest data and deploy"
       if ($LASTEXITCODE -ne 0) { throw "git commit failed (exit $LASTEXITCODE)" }
       Push-WithRebase
+      $justPushed = $true
     } else {
       Write-Host "No dashboard changes to commit; continuing with Pages build trigger."
     }
@@ -140,8 +169,19 @@ if ($doDeploy -or $DeployOnly) {
 }
 
 if ($doTriggerPages) {
-  Invoke-PagesBuildRequest -Repository $Repo
-  Wait-PagesBuild -Repository $Repo -TimeoutSeconds $PagesPollSeconds
+  $expectCommit = (& $Git -C $Root rev-parse HEAD).Trim()
+  if ($justPushed) {
+    # This is legacy "Deploy from a branch" Pages: the push above already
+    # auto-triggers a pages-build-deployment run for this commit. Requesting a
+    # second build here raced that automatic one and failed with "in progress
+    # deployment" (2026-08-06 run 31108752748). Only ask for an explicit build
+    # when nothing was just pushed, i.e. -TriggerPagesBuild alone or a -Deploy
+    # run with no dashboard changes to commit.
+    Write-Host "Skipping explicit Pages build request: the push above already triggers one."
+  } else {
+    Invoke-PagesBuildRequest -Repository $Repo
+  }
+  Wait-PagesBuild -Repository $Repo -TimeoutSeconds $PagesPollSeconds -ExpectCommit $expectCommit
 }
 
 if (-not $doDeploy -and -not $DeployOnly -and -not $TriggerPagesBuild) {
