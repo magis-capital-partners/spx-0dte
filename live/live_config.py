@@ -23,11 +23,12 @@ class LiveConfig:
 
     # --- Deployment sizing -------------------------------------------------- #
     account_equity: float = 500_000.0
-    # Live deployment: two contracts per submitted spread. The per-entry cap
-    # prevents time-of-day or elevated-VIX sizing from increasing this.
-    contracts_per_tranche: int = 2
+    # Live deployment: 4 contracts per submitted spread (2x the prior 2-lot
+    # baseline, set 2026-08-06 for the next session). Per-entry cap allows the
+    # 1.25x elevated-VIX band (round(4*1.25)=5) but nothing above that.
+    contracts_per_tranche: int = 4
     contract_scale: float = 1.0
-    max_contracts_per_tranche: int = 2
+    max_contracts_per_tranche: int = 5
 
     # --- Execution mode ----------------------------------------------------- #
     mode: str = "live"
@@ -277,13 +278,11 @@ class LiveConfig:
     stale_quote_confirm_polls: int = 3
     stale_quote_halt_seconds: float = 20.0
     stale_quote_near_stop_seconds: float = 10.0
-    # Production-live concentration limits. max_open_contracts / per_side /
-    # side_cluster tripled 2026-08-05 (8/6/4 -> 24/18/12) at the account's
-    # request after the book ran into the 8-contract cap same-side; kept
-    # proportional so per_side/side_cluster don't bind before the raised
-    # aggregate cap does.
-    max_open_contracts: int = 24
-    max_open_per_side: int = 18
+    # Production-live concentration limits. Scaled with the 4-lot baseline
+    # (2026-08-06: 24/18/12 at 2-lot -> 48/36/24 at 4-lot) so concentration
+    # caps stay proportional and don't bind before the aggregate cap.
+    max_open_contracts: int = 48
+    max_open_per_side: int = 36
     # Same-strike concentration cap. Static fallback only — see
     # max_open_same_strike_multiple below, which is what actually governs
     # this in production. Left intentionally tight (2) as the floor that
@@ -296,7 +295,7 @@ class LiveConfig:
     # Effective cap = this x the tranche's sized contracts at the moment of
     # the check, and supersedes max_open_same_strike above when > 0.
     max_open_same_strike_multiple: float = 12.0
-    max_open_side_cluster: int = 12
+    max_open_side_cluster: int = 24
     side_cluster_points: float = 25.0
     # Live stop-count caps (production profile uses 999; tighten here).
     live_max_stops_per_side: int = 2

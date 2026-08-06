@@ -42,7 +42,7 @@ At startup the executor reads **same-day VIX open** from `data/calendar/vix_dail
 | Rule | Default | Behavior |
 |------|---------|----------|
 | **Skip session** | VIX open **> 35** | `SystemExit` before IB connect — no trading |
-| **Elevated sizing** | VIX **25–35** | Contract count × **1.25** (cap **3** at 2-contract baseline) |
+| **Elevated sizing** | VIX **25–35** | Contract count × **1.25** (cap **5** at 4-contract baseline) |
 
 Configure in `live/live_config.py` (`use_vix_session_gate`, `vix_skip_open_above`,
 `use_vix_elevated_sizing`, `vix_elevated_scale`, `max_contracts_per_tranche`, etc.).
@@ -134,7 +134,7 @@ Also cancels orphan working SPXW/BAG orders from a crashed prior run. Do **not**
 | **Signal cold-start** | No feature-state advancement before 09:30 (pre-open spot history poisoned realized-vol z-scores: −1.29M on 2026-08-04); z-scores beyond the sanity bound are discarded and logged with their values. |
 | **Mark integrity** | Missing quotes on open risk → halt entries (never treat as $0 PnL). Unavailable marks for 60s → flatten. |
 | **Stale quotes** | 3 consecutive polls with short-leg age >20s (10s near stop) → **halt entries only** (never flatten on stale alone). |
-| **Open-risk caps** | Paper-fidelity backstop: max 40 open contracts / 40 per side / 25 at one short strike. Calibrated just above reconstructed pilot-scale historical maxima; per-entry size remains capped at 3. |
+| **Open-risk caps** | Live concentration caps: max **48** open contracts / **36** per side / same-strike **12×** current sell size / **24** side-cluster. Per-entry size capped at **5** (4-lot baseline; 1.25× elevated VIX). |
 | **Live stop caps** | Max 2 stops/side and 4/day via `entry_risk_block_reason` (profile 999 overridden). |
 | **Flatten confirm + audit** | MKT close waits for fill; `flatten_audit` checks IB flat afterward. |
 | **Stop confirm** | After synthetic stop fill, verify IB short qty dropped; else `stop_unconfirmed` and keep managing. |
@@ -234,7 +234,7 @@ touch data/live/KILL
 Configure in the brokerage UI on every machine you trade from:
 
 1. **API** — enable socket clients; trusted IP `127.0.0.1`; read-only API **off** for the trading user.
-2. **Precautionary** — max order size ≥ pilot (e.g. 5); max daily loss aligned with flatten (~3.25% of configured equity); outside RTH **off** for SPXW.
+2. **Precautionary** — max order size ≥ **5** (4-lot baseline + 1.25× elevated VIX); max daily loss aligned with flatten (~3.25% of configured equity); outside RTH **off** for SPXW.
 3. **Market data** — OPRA + US index for live; paper may use delayed only if you accept weaker entry guards.
 4. Confirm paper vs live port (7497 / 7496) matches `LiveConfig.mode`.
 

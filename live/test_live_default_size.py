@@ -1,4 +1,4 @@
-"""Production defaults must retain the explicitly requested one-lot cap."""
+"""Production defaults must retain the explicitly requested 4-lot baseline."""
 from __future__ import annotations
 
 import sys
@@ -14,13 +14,16 @@ from strategy_profiles import resolve_strategy_config  # noqa: E402
 
 
 class LiveDefaultSizeTests(unittest.TestCase):
-    def test_production_default_and_hard_cap_are_one_lot(self) -> None:
+    def test_production_default_and_hard_cap_are_four_lot(self) -> None:
         live = LiveConfig()
         config, _schedule = resolve_strategy_config(live)
 
-        self.assertEqual(live.contracts_per_tranche, 2)
-        self.assertEqual(live.max_contracts_per_tranche, 2)
-        self.assertEqual(config.baseline_contracts, 2)
+        self.assertEqual(live.contracts_per_tranche, 4)
+        self.assertEqual(live.max_contracts_per_tranche, 5)
+        self.assertEqual(config.baseline_contracts, 4)
+        self.assertEqual(live.max_open_contracts, 48)
+        self.assertEqual(live.max_open_per_side, 36)
+        self.assertEqual(live.max_open_side_cluster, 24)
 
 
 if __name__ == "__main__":
