@@ -10,6 +10,8 @@ The interactive site is deployed from the **`docs/`** folder on **`main`** (GitH
 
 > Layer 2 is a UI gate; JSON files remain fetchable if someone bypasses login. For stronger control, use org repo ACLs or a custom domain with Cloudflare Access.
 
+**Live Session-now (cloud):** sanitized status is **not** deployed via Pages. Trading PCs upload `live_status.json` to a public gist; the dashboard reads the URL in [`docs/data/live_status_url.json`](docs/data/live_status_url.json). See [`live/README.md`](live/README.md) → Dashboard Session now.
+
 ## GitHub Pages settings
 
 **Settings → Pages → Build and deployment:**

@@ -34,9 +34,8 @@ $doTriggerPages = $TriggerPagesBuild -or $doDeploy -or $DeployOnly
 $doBuild = -not $SkipBuild -and -not $DeployOnly
 
 function Push-WithRebase {
-  # Two machines publish live_status.json to main every few minutes, so a plain
-  # push is frequently rejected as non-fast-forward. Autostash keeps an in-flight
-  # live_status.json edit from blocking the rebase.
+  # Multi-machine dashboard deploys can still race; rebase+retry with autostash
+  # so unrelated dirty files don't block the pull.
   param([int]$Attempts = 3)
   for ($i = 1; $i -le $Attempts; $i++) {
     & $Git push origin main
@@ -56,10 +55,9 @@ function Push-WithRebase {
 }
 
 function Invoke-PagesBuildRequest {
-  # Pages allows exactly one in-flight deployment. main also receives pushes from
-  # the Status Publish task every few minutes, so a build request can collide with
-  # one already running and come back 400/409 "due to in progress deployment"
-  # (2026-08-06 run 31108752748). Back off and retry rather than failing the job.
+  # Pages allows exactly one in-flight deployment. A concurrent push (or a
+  # previous build still finishing) can return 400/409 "due to in progress
+  # deployment". Back off and retry rather than failing the job.
   param(
     [string]$Repository,
     [int]$Attempts = 4,
@@ -143,16 +141,18 @@ if ($doDeploy -or $DeployOnly) {
     foreach ($artifact in @(
       "docs/data/dashboard_data.json",
       "docs/data/build_stamp.txt",
+      "docs/data/live_status_url.json",
       "docs/index.html",
       "docs/build_dashboard_data.py",
-      "docs/data/investors.json"
+      "docs/data/investors.json",
       "scripts/sync_dashboard.ps1"
     )) {
       if (Test-Path (Join-Path $Root $artifact)) {
         & $Git add -- $artifact
       }
     }
-    # Also stage any other tracked files already under docs/data/ that changed.
+    # Stage other tracked docs/data/ changes, but never live_status.json
+    # (gitignored; cloud status publishes to a gist, not Pages).
     & $Git add -- "docs/data/"
     $staged = & $Git diff --cached --name-only
     if ($staged) {

@@ -89,6 +89,37 @@ const MISSING = "\u2014";
 const executionLabel = (value) => ({paper:"Paper trading",dry_run:"Dry run",production_live:"Production live"}[value] || "Unknown");
 
 const LOCAL_STATUS = "http://127.0.0.1:8765";
+// Cloud path B: gist raw URL from live_status_url.json (not same-origin Pages).
+let CLOUD_STATUS_URL = null;
+let cloudStatusUrlPromise = null;
+
+function loadCloudStatusUrl() {
+  if (CLOUD_STATUS_URL) return Promise.resolve(CLOUD_STATUS_URL);
+  if (cloudStatusUrlPromise) return cloudStatusUrlPromise;
+  cloudStatusUrlPromise = fetch("data/live_status_url.json", { cache: "no-store" })
+    .then(r => r.ok ? r.json() : null)
+    .then(j => {
+      if (j && j.url) CLOUD_STATUS_URL = j.url;
+      return CLOUD_STATUS_URL;
+    })
+    .catch(() => null);
+  return cloudStatusUrlPromise;
+}
+
+function fetchCloudStatus() {
+  return loadCloudStatusUrl().then(url => {
+    const primary = url
+      ? fetch(url, { cache: "no-store", mode: "cors" }).then(r => r.ok ? r.json() : null)
+      : Promise.resolve(null);
+    return primary.catch(() => null).then(j => {
+      if (j) return j;
+      // Local serve / offline fallback when gist is unset or unreachable.
+      return fetch("data/live_status.json", { cache: "no-store" })
+        .then(r => r.ok ? r.json() : null)
+        .catch(() => null);
+    });
+  });
+}
 
 function ageLabel(ts) {
   if (!ts) return "–";
@@ -121,8 +152,7 @@ function SessionNow() {
         .then(r => r.ok ? r.json() : null)
         .then(j => { if (!cancelled && j?.lines) setLogs(j.lines); })
         .catch(() => {});
-      fetch("data/live_status.json", { cache: "no-store" })
-        .then(r => r.ok ? r.json() : null)
+      fetchCloudStatus()
         .then(j => { if (!cancelled) setCloud(j); })
         .catch(() => { if (!cancelled) setCloud(null); });
     };
@@ -171,7 +201,7 @@ function SessionNow() {
       )}
       {src && !usingLocal && cloud && (
         <p className="sub" style={{margin:"0 0 10px"}}>
-          Viewing published cloud metrics (refreshed about every 2 minutes from the trading PC).
+          Viewing published cloud metrics (gist; refreshed about every 5 minutes from the trading PC).
           {" "}Status age: <code>{ageLabel(src.generated_at || src.heartbeat_ts)}</code>.
           {" "}Full executor stdout is only on the trading PC at <code>http://127.0.0.1:5500/</code>.
           {localErr && isHttpsPage ? <> Local API unreachable from this browser ({localErr}).</> : null}

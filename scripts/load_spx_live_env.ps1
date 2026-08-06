@@ -33,3 +33,12 @@ if ($env:SPX_PYTHON) {
 if (-not $env:SPX_SLACK_WEBHOOK_URL) {
     Write-Warning "SPX_SLACK_WEBHOOK_URL unset. Run: .\scripts\set_spx_slack_webhook.ps1 -UseMagisWorkspaceWebhook"
 }
+
+# Cloud live status (path B) publishes to a public gist — not GitHub Pages.
+# Optional SPX_LIVE_STATUS_URL overrides the default raw gist URL built from GIST_ID.
+if (-not $env:SPX_LIVE_STATUS_GIST_ID -and -not $env:SPX_LIVE_STATUS_URL) {
+    Write-Warning 'SPX_LIVE_STATUS_GIST_ID unset. Run: .\scripts\set_spx_live_status_gist.ps1 -GistId <gist-id>'
+} elseif ($env:SPX_LIVE_STATUS_GIST_ID -and -not $env:SPX_LIVE_STATUS_URL) {
+    $owner = if ($env:SPX_LIVE_STATUS_GIST_OWNER) { $env:SPX_LIVE_STATUS_GIST_OWNER } else { "GoldmanDrew" }
+    $env:SPX_LIVE_STATUS_URL = "https://gist.githubusercontent.com/$owner/$($env:SPX_LIVE_STATUS_GIST_ID)/raw/live_status.json"
+}

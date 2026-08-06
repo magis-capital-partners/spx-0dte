@@ -1,10 +1,14 @@
-# Publish sanitized live_status.json to GitHub Pages (cloud path B).
-# Rate-limited: skips push if file unchanged or last deploy < MinMinutes ago.
+# Publish sanitized live_status.json to a public GitHub Gist (cloud path B).
+# Does NOT commit to main or trigger GitHub Pages rebuilds.
+# Rate-limited: skips upload if file unchanged or last deploy < MinMinutes ago.
 #
 # Usage:
 #   .\scripts\publish_live_status.ps1
 #   .\scripts\publish_live_status.ps1 -Deploy
-#   .\scripts\publish_live_status.ps1 -Deploy -MinMinutes 2
+#   .\scripts\publish_live_status.ps1 -Deploy -MinMinutes 5
+#
+# Requires SPX_LIVE_STATUS_GIST_ID in ~/.magis-spx-0dte-secrets.ps1
+# (see scripts/set_spx_live_status_gist.ps1).
 
 param(
     [switch]$Deploy,
@@ -20,8 +24,10 @@ $Python = $env:SPX_PYTHON
 if (-not $Python -or -not (Test-Path $Python)) {
     $Python = "python"
 }
-$Git = "C:\Program Files\Git\bin\git.exe"
-if (-not (Test-Path $Git)) { $Git = "git" }
+$Gh = "gh"
+if (-not (Get-Command $Gh -ErrorAction SilentlyContinue)) {
+    $Gh = "gh"
+}
 
 Write-Host ("publish_live_status: python={0} deploy={1} minMinutes={2}" -f $Python, [bool]$Deploy, $MinMinutes)
 
@@ -42,7 +48,7 @@ $statusPath = Join-Path $Root "docs\data\live_status.json"
 # dashboard showed zeros while an open spread was being managed here).
 $statusDoc = $null
 try {
-    $statusDoc = Get-Content $statusPath -Raw | ConvertFrom-Json
+    $statusDoc = Get-Content $statusPath -Raw -Encoding UTF8 | ConvertFrom-Json
 } catch {
     throw "could not read $statusPath after --write-status: $($_.Exception.Message)"
 }
@@ -69,11 +75,16 @@ if (-not $Deploy) {
     return
 }
 
+$gistId = $env:SPX_LIVE_STATUS_GIST_ID
+if (-not $gistId) {
+    throw 'SPX_LIVE_STATUS_GIST_ID unset. Run: .\scripts\set_spx_live_status_gist.ps1 -GistId <gist-id>'
+}
+
 $now = Get-Date
 $currentHash = (Get-FileHash $statusPath -Algorithm SHA256).Hash
 if (Test-Path $stampPath) {
     try {
-        $prev = Get-Content $stampPath -Raw | ConvertFrom-Json
+        $prev = Get-Content $stampPath -Raw -Encoding UTF8 | ConvertFrom-Json
         $last = [datetime]$prev.ts
         $ageMin = ($now - $last).TotalMinutes
         if ($ageMin -lt $MinMinutes) {
@@ -89,46 +100,32 @@ if (Test-Path $stampPath) {
     }
 }
 
-& $Git -C $Root add -- "docs/data/live_status.json"
-$status = & $Git -C $Root status --porcelain -- "docs/data/live_status.json"
-if (-not $status) {
-    Write-Host "Nothing to commit"
-    @{ ts = $now.ToString("o"); hash = $currentHash } | ConvertTo-Json |
-        Set-Content -Path $stampPath -Encoding UTF8
-    return
-}
-
-& $Git -C $Root commit -m "chore: refresh sanitized live session status"
-if ($LASTEXITCODE -ne 0) { throw "git commit failed (exit $LASTEXITCODE)" }
-
-# Status Publish often races other machines' status commits; rebase then push.
-# --autostash is required, not cosmetic: any unrelated dirty file (an edited
-# script, or data/calendar/vix_daily.csv refreshed by the 09:00 preflight) makes
-# plain `pull --rebase` refuse with "You have unstaged changes", which silently
-# stopped every status push for an hour on 2026-08-05.
-& $Git -C $Root pull --rebase --autostash origin HEAD
-if ($LASTEXITCODE -ne 0) {
-    # Live status JSON conflicts are expected; take our freshly written file.
-    $conflicted = & $Git -C $Root diff --name-only --diff-filter=U
-    if ($conflicted -match "docs/data/live_status.json") {
-        & $Python live/session_status_server.py --write-status
-        if ($LASTEXITCODE -ne 0) { throw "rewrite-status after conflict failed" }
-        & $Git -C $Root add -- "docs/data/live_status.json"
-        $env:GIT_EDITOR = "true"
-        & $Git -C $Root -c core.editor=true rebase --continue
-        if ($LASTEXITCODE -ne 0) {
-            & $Git -C $Root rebase --abort
-            throw "git pull --rebase failed after live_status conflict"
-        }
-    } else {
-        & $Git -C $Root rebase --abort
-        throw "git pull --rebase failed (exit $LASTEXITCODE); conflicts=$conflicted"
+# PATCH gists/{id}. Build JSON with Python so nested content is not mangled by
+# ConvertTo-Json (PS nested hashtables previously produced invalid payloads).
+$tmpBody = Join-Path $env:TEMP ("spx-gist-patch-" + [guid]::NewGuid().ToString("n") + ".json")
+try {
+    & $Python -c @"
+import json
+from pathlib import Path
+status = Path(r'''$statusPath''').read_text(encoding='utf-8')
+payload = {'files': {'live_status.json': {'content': status}}}
+Path(r'''$tmpBody''').write_text(json.dumps(payload), encoding='utf-8')
+"@
+    if ($LASTEXITCODE -ne 0) { throw "failed to build gist PATCH body (exit $LASTEXITCODE)" }
+    Write-Host "Uploading live_status.json to gist $gistId ..."
+    & $Gh api -X PATCH "gists/$gistId" --input $tmpBody | Out-Null
+    if ($LASTEXITCODE -ne 0) {
+        throw "gh api PATCH gists/$gistId failed (exit $LASTEXITCODE)"
     }
+} finally {
+    Remove-Item -Force $tmpBody -ErrorAction SilentlyContinue
 }
 
-& $Git -C $Root push origin HEAD
-if ($LASTEXITCODE -ne 0) { throw "git push failed (exit $LASTEXITCODE)" }
-
-@{ ts = $now.ToString("o"); hash = $currentHash } | ConvertTo-Json |
+@{ ts = $now.ToString("o"); hash = $currentHash; gist_id = $gistId } | ConvertTo-Json |
     Set-Content -Path $stampPath -Encoding UTF8
-Write-Host "Deployed live_status.json to origin"
+
+$rawUrl = $env:SPX_LIVE_STATUS_URL
+if (-not $rawUrl) {
+    $rawUrl = "https://gist.githubusercontent.com/GoldmanDrew/$gistId/raw/live_status.json"
+}
+Write-Host "Deployed live_status.json to gist: $rawUrl"

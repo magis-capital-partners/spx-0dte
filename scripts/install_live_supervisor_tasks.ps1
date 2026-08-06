@@ -78,7 +78,7 @@ $tasks = @(
         Name = "Magis SPX 0DTE Status Publish"
         Script = "publish_live_status.ps1"
         ExtraArgs = @("-Deploy", "-MinMinutes", "5")
-        Description = "Push sanitized live_status.json to GitHub Pages every 5 min during market hours only."
+        Description = "Upload sanitized live_status.json to the status gist every 5 min during market hours only (does not trigger GitHub Pages)."
         LimitHours = 1
         At = $PublishStart
         WeekdaysOnly = $true
@@ -128,7 +128,7 @@ function Register-SpxTask($spec) {
 
     # A bounded repetition window keeps a polling task inside market hours. The
     # previous 3650-day duration meant the publisher fired every few minutes
-    # around the clock, all weekend, churning live_status.json commits on main.
+    # around the clock, all weekend (wasted gist uploads / API calls).
     if ($spec.ContainsKey("RepeatMinutes") -and $spec.RepeatMinutes) {
         $windowMinutes = if ($spec.ContainsKey("WindowMinutes") -and $spec.WindowMinutes) {
             $spec.WindowMinutes

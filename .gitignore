@@ -20,6 +20,10 @@ data/logs/
 # Dashboard data blob IS tracked (it is the Pages deploy artifact): see
 # dashboard/data/dashboard_data.json (not under data/, so not ignored).
 
+# Cloud live status is published to a public gist (not Pages). Keep a local
+# copy for Status API / local serve, but do not commit churn to main.
+docs/data/live_status.json
+
 # --- Python ---
 __pycache__/
 *.py[cod]

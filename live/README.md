@@ -161,20 +161,38 @@ Secrets live in `%USERPROFILE%\.magis-spx-0dte-secrets.ps1` (not git). Logs: `da
 | Path | What | Where |
 |------|------|--------|
 | **A local** | Heartbeat + stdout console | `http://127.0.0.1:8765` polled by dashboard |
-| **B cloud** | Sanitized alive/halted/open/PnL | `docs/data/live_status.json` on GitHub Pages |
+| **B cloud** | Sanitized alive/halted/open/PnL | Public gist (`docs/data/live_status_url.json`); **not** GitHub Pages |
+
+Cloud status must **not** be committed to `main` — that forced a Pages rebuild every few minutes and cancelled/stalled deployments. The Status Publish task uploads JSON to a gist via `gh`; the dashboard fetches the raw gist URL.
 
 ```powershell
-# Status API (also writes live_status.json every 60s)
+# One-time per trading PC (shared gist id; already created for Magis):
+.\scripts\set_spx_live_status_gist.ps1 -GistId eb3c0aba82982a05b8bb430b380c808a -SkipUrlFile
+# Or create a new public gist from local JSON:
+# .\scripts\set_spx_live_status_gist.ps1 -Create
+
+# Status API (also writes local docs/data/live_status.json every 60s)
 .\scripts\run_session_status_server.ps1
 
-# Optional: publish sanitized status to Pages (rate-limited)
+# Publish sanitized status to the gist (rate-limited; no git / no Pages)
 .\scripts\publish_live_status.ps1 -Deploy
 
-# Best local UX (HTTP↔HTTP, full console): 
+# Best local UX (HTTP↔HTTP, full console):
 .\scripts\serve_dashboard_local.ps1   # http://127.0.0.1:5500/
 ```
 
-On the public Pages site you get cloud status (B). Full command-prompt stream needs the trading PC + Status API (A); Chrome often allows `127.0.0.1` from HTTPS Pages, otherwise use the local serve script.
+Verify: `gh gist view eb3c0aba82982a05b8bb430b380c808a` and open the raw URL in `docs/data/live_status_url.json`.
+
+On the public Pages site you get cloud status (B) from the gist. Full command-prompt stream needs the trading PC + Status API (A); Chrome often allows `127.0.0.1` from HTTPS Pages, otherwise use the local serve script.
+
+#### Cutover checklist (both trading PCs)
+
+1. Pull latest `main` (publisher + dashboard URL pointer).
+2. `.\scripts\set_spx_live_status_gist.ps1 -GistId eb3c0aba82982a05b8bb430b380c808a -SkipUrlFile` (secrets only on the second PC).
+3. Re-register tasks: `.\scripts\install_live_supervisor_tasks.ps1` (use `-SkipServices` mid-session).
+4. Smoke: `.\scripts\publish_live_status.ps1 -Deploy` — confirm gist raw URL updates; **no** new `pages-build-deployment` from this step.
+5. Once: `.\scripts\sync_dashboard.ps1 -Deploy` so Pages serves the gist-aware `index.html`.
+6. Confirm Actions only rebuilds on real dashboard deploys; cancel any stuck Pages run if still queued.
 
 Manual / second terminal (loads the same Magis secrets):
 
