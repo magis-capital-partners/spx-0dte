@@ -63,6 +63,60 @@ class LiveEntryRiskTests(unittest.TestCase):
         )
         self.assertEqual(reason, "side_stop_limit")
 
+    def test_same_strike_multiplier_supersedes_static_floor(self) -> None:
+        # 2026-08-06: max_open_same_strike_multiple=12 (intended cap 12x2=24)
+        # was set, but this static field still fed max_open_contracts_same_strike,
+        # and that gate ran ahead of open_risk_caps' multiplier-aware one — so a
+        # tranche was blocked at 4 contracts against an intended cap of 24.
+        cfg = StrategyConfig(max_open_contracts_same_strike=999)
+        live = LiveConfig(max_open_same_strike=2, max_open_same_strike_multiple=12.0)
+        out = apply_live_risk_overlays(cfg, live)
+        self.assertEqual(out.max_open_contracts_same_strike, 0)
+
+    def test_static_floor_applies_when_multiplier_disabled(self) -> None:
+        cfg = StrategyConfig(max_open_contracts_same_strike=999)
+        live = LiveConfig(max_open_same_strike=2, max_open_same_strike_multiple=0.0)
+        out = apply_live_risk_overlays(cfg, live)
+        self.assertEqual(out.max_open_contracts_same_strike, 2)
+
+    def test_todays_blocked_tranche_now_passes_gate_one(self) -> None:
+        # The exact 2026-08-06 10:17 candidate: 2 open at the strike, 2 more
+        # sized, against a static floor of 2 and an intended dynamic cap of 24.
+        # max_open_trades_same_side_strike=999 matches the production profile's
+        # resolution (a trade-count gate, unrelated to the contracts bug here —
+        # left at its class default of 1 it would block on trade count alone).
+        cfg = StrategyConfig(
+            max_open_contracts_same_strike=0,  # post-fix resolution
+            max_open_trades_same_side_strike=999,
+        )
+        cand = SimpleNamespace(
+            side="bear_call",
+            short_type="CALL",
+            short_strike=7760.0,
+            long_strike=7835.0,
+            credit_to_width=0.05,
+            contracts=2,
+            sleeve="core",
+        )
+        open_trade = SimpleNamespace(
+            side="bear_call",
+            short_type="CALL",
+            short_strike=7760.0,
+            long_strike=7835.0,
+            contracts=2,
+            exit_reason="open",
+            stopped=False,
+        )
+        reason = live_entry_risk_block(
+            cand,
+            [SimpleNamespace(candidate=open_trade, contracts=2, closed=False)],
+            now=datetime(2026, 8, 6, 10, 17, 1),
+            config=cfg,
+            side_stop_cooldown_until={},
+            side_stop_counts={},
+        )
+        self.assertFalse(reason)
+
     def test_recover_counts(self) -> None:
         events = [
             {"event": "stop", "side": "bear_call"},

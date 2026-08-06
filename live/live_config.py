@@ -91,7 +91,11 @@ class LiveConfig:
     # Fail closed for new entries if the SPX index stream has not delivered a
     # valid live-last update within this window. Open-position option marks and
     # stops continue to be managed; stale underlying alone never flattens.
-    stale_spot_halt_seconds: float = 5.0
+    # Raised 5 -> 15 on 2026-08-06 (account request): 5s was tripping on
+    # ordinary momentary quote gaps mid-session (10:37:30, resumed on its own
+    # after 31s via the stale_underlying auto-resume) rather than only on
+    # genuine feed outages.
+    stale_spot_halt_seconds: float = 15.0
     # Resume entries automatically once the SPX stream has been continuously
     # healthy for this long after a stale_underlying halt. A feed gap is a
     # transient data condition, not a risk event, so latching it for the rest of

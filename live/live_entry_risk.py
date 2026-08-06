@@ -11,6 +11,18 @@ from mbh_simulator import StrategyConfig, entry_risk_block_reason
 
 def apply_live_risk_overlays(config: StrategyConfig, live: Any) -> StrategyConfig:
     """Apply live-only stop caps and optional portfolio allocator."""
+    # max_open_same_strike_multiple is meant to supersede the static
+    # max_open_same_strike floor when set (live_config.py's own docstring says
+    # so) — but this static value feeds entry_risk_block_reason, which runs
+    # *before* open_risk_caps.open_risk_block_reason's multiplier-aware check
+    # in the tranche loop. Left nonzero here, the static floor always blocks
+    # first, so the dynamic cap could never actually apply once a session held
+    # more than max_open_same_strike lots at one strike (observed 2026-08-06:
+    # blocked at 4 contracts against an intended 12x2=24 cap). Zero it here so
+    # this gate defers to the dynamic one, matching the documented intent.
+    same_strike_static = int(getattr(live, "max_open_same_strike", 0))
+    if float(getattr(live, "max_open_same_strike_multiple", 0.0)) > 0:
+        same_strike_static = 0
     cfg = replace(
         config,
         max_stops_per_side=int(getattr(live, "live_max_stops_per_side", config.max_stops_per_side)),
@@ -19,7 +31,7 @@ def apply_live_risk_overlays(config: StrategyConfig, live: Any) -> StrategyConfi
         ),
         max_open_contracts=int(getattr(live, "max_open_contracts", 0)),
         max_open_contracts_per_side=int(getattr(live, "max_open_per_side", 0)),
-        max_open_contracts_same_strike=int(getattr(live, "max_open_same_strike", 0)),
+        max_open_contracts_same_strike=same_strike_static,
         max_open_contracts_side_cluster=int(
             getattr(live, "max_open_side_cluster", 0)
         ),
