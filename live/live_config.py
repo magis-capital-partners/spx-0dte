@@ -104,6 +104,12 @@ class LiveConfig:
     stale_underlying_resume_seconds: float = 30.0
     # A z-score this large is a feed/sentinel problem, not a tradable signal.
     signal_sanity_abs_z: float = 12.0
+    # Mark-integrity guard: reject a short-leg ask above this when the leg has
+    # no bid at all. A zero-bid option is worth ~nothing, so a large one-sided
+    # ask is a stale/garbage print; marking against it books a phantom loss that
+    # can trip the -2.25% entry halt or the -3.25% flatten on a false reading.
+    # Set 0 to disable. See _short_ask_is_implausible for the 2026-08-05 case.
+    mark_max_short_ask_without_bid: float = 5.0
 
     # --- Phase 3: adaptive polling ------------------------------------------ #
     use_adaptive_polling: bool = True

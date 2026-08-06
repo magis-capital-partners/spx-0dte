@@ -10,7 +10,9 @@ sys.path.insert(0, str(ROOT / "simulator"))
 sys.path.insert(0, str(ROOT / "live"))
 
 from datetime import datetime
+from types import SimpleNamespace
 
+import ib_executor  # noqa: E402
 from mbh_simulator import CandidateRecord, OptionQuote  # noqa: E402
 from ib_executor import (  # noqa: E402
     OpenSpread,
@@ -104,3 +106,62 @@ class ContractMatchTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ShortLegCancelIsolationTests(unittest.TestCase):
+    """Cancelling backstops must not reach other accounts or strategies.
+
+    IB error 10275 leaves the spare account's positions unreadable, so we cannot
+    observe whether it holds same-day SPXW risk on a strike this engine trades.
+    openTrades() spans every account in the gateway login, and a contract match
+    alone does not establish ownership.
+    """
+
+    def _trade(self, *, account: str, order_ref: str = "", order_id: int = 1):
+        contract = SimpleNamespace(
+            secType="OPT", symbol="SPX", localSymbol="SPXW  260806C07760000",
+            tradingClass="SPXW", lastTradeDateOrContractMonth="20260806",
+            strike=7760.0, right="C",
+        )
+        order = SimpleNamespace(orderId=order_id, account=account, orderRef=order_ref)
+        return SimpleNamespace(
+            contract=contract, order=order,
+            orderStatus=SimpleNamespace(status="Submitted"),
+        )
+
+    def _candidate(self):
+        return SimpleNamespace(short_type="CALL", short_strike=7760.0)
+
+    def _ib(self, trades):
+        cancelled = []
+        return SimpleNamespace(
+            openTrades=lambda: list(trades),
+            cancelOrder=lambda o: cancelled.append(o),
+            sleep=lambda s: None,
+        ), cancelled
+
+    def test_other_account_order_is_not_cancelled(self) -> None:
+        ib, cancelled = self._ib([self._trade(account="U27250667")])
+        n = ib_executor._cancel_open_orders_on_short_leg(
+            ib, self._candidate(), "2026-08-06", account="U805366",
+        )
+        self.assertEqual(n, 0)
+        self.assertEqual(cancelled, [])
+
+    def test_own_account_order_is_cancelled(self) -> None:
+        ib, cancelled = self._ib([self._trade(account="U805366")])
+        n = ib_executor._cancel_open_orders_on_short_leg(
+            ib, self._candidate(), "2026-08-06", account="U805366",
+        )
+        self.assertEqual(n, 1)
+        self.assertEqual(len(cancelled), 1)
+
+    def test_foreign_strategy_orderref_is_never_cancelled(self) -> None:
+        ib, cancelled = self._ib(
+            [self._trade(account="U805366", order_ref="B5P|bucket5")]
+        )
+        n = ib_executor._cancel_open_orders_on_short_leg(
+            ib, self._candidate(), "2026-08-06", account="U805366",
+        )
+        self.assertEqual(n, 0)
+        self.assertEqual(cancelled, [])

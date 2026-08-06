@@ -869,12 +869,32 @@ def _cancel_open_orders_on_short_leg(
     ib: "IB",
     candidate: CandidateRecord,
     today: str,
+    *,
+    account: Optional[str] = None,
 ) -> int:
-    """Cancel every live IB order on this short option (orphan backstops included)."""
+    """Cancel this engine's live IB orders on this short option.
+
+    Strategy/account isolation, matching cancel_orphan_open_orders: ``openTrades``
+    spans every account in the gateway login and every strategy, and the contract
+    match alone (SPX/SPXW, today's expiry, same strike and right) does not
+    identify ownership. Scope to ``account`` and never touch the ls-algo Bucket 5
+    (``B5P|``) orderRef namespace.
+
+    This matters more than the low collision odds suggest: IB error 10275 means
+    the spare account's positions are unreadable, so we cannot even observe
+    whether it holds same-day SPXW risk on a strike this engine trades.
+    """
     cancelled = 0
     for trade in list(ib.openTrades()):
         if not _contract_is_short_leg(trade.contract, candidate, today):
             continue
+        order = getattr(trade, "order", None)
+        if order is None:
+            continue
+        if account and str(getattr(order, "account", "") or "") != account:
+            continue
+        if str(getattr(order, "orderRef", "") or "").startswith("B5P|"):
+            continue  # foreign strategy namespace — never cancel
         status = _open_order_status(trade)
         if status in {"filled", "cancelled", "inactive", "apicancelled"}:
             continue
@@ -915,6 +935,7 @@ def clear_short_leg_backstops(
     *,
     dry: bool,
     reason: str,
+    account: Optional[str] = None,
 ) -> None:
     """Drop open orders on this short strike before a conflicting IB action.
 
@@ -934,7 +955,7 @@ def clear_short_leg_backstops(
                 spread.stop_order_id = None
         return
 
-    cancelled = _cancel_open_orders_on_short_leg(ib, candidate, today)
+    cancelled = _cancel_open_orders_on_short_leg(ib, candidate, today, account=account)
     for spread in open_spreads:
         if not spread.closed and _same_short_leg(spread.candidate, candidate):
             spread.stop_order_id = None
@@ -1036,6 +1057,7 @@ def place_or_replace_native_stop_for_short(
 
     clear_short_leg_backstops(
         ib, candidate, open_spreads, today, dry=dry, reason=f"pre_{reason}",
+        account=live.ib_account,
     )
     # Re-resolve after clear (same objects; stop_order_id wiped).
     siblings = active_spreads_on_short(open_spreads, candidate)
@@ -1584,6 +1606,7 @@ def submit_spread_entry(
     # before routing the additional short position.
     clear_short_leg_backstops(
         ib, candidate, open_spreads, today, dry=dry, reason="pre_entry",
+        account=live.ib_account,
     )
     combo_order = LimitOrder("BUY", contracts, -limit)
     combo_order.tif = "DAY"
@@ -1703,7 +1726,10 @@ def submit_paired_condor_entry(
     # Disarm only the two shorts the BAG will add to, then re-arm each side
     # immediately after a fill or cancellation.
     for candidate in candidates:
-        clear_short_leg_backstops(ib, candidate, open_spreads, today, dry=False, reason="paired_condor_pre_entry")
+        clear_short_leg_backstops(
+            ib, candidate, open_spreads, today, dry=False,
+            reason="paired_condor_pre_entry", account=live.ib_account,
+        )
     bag = build_paired_condor_combo(ib, put_candidate, call_candidate, today)
     order = LimitOrder("BUY", contracts, -total_limit)
     order.tif = "DAY"
@@ -1916,6 +1942,7 @@ def _buy_short_leg_stop(
     # Cancel aggregated native STP on this short before the protective BUY.
     clear_short_leg_backstops(
         ib, candidate, open_spreads, today, dry=False, reason="synthetic_stop",
+        account=live.ib_account,
     )
     short_opt = _short_option(ib, candidate, today)
     limit_px = _stop_limit_price(short_ask, live)
@@ -2266,6 +2293,7 @@ def flatten_all(
 
         clear_short_leg_backstops(
             ib, spread.candidate, [spread], today, dry=dry, reason="flatten",
+            account=cfg.ib_account,
         )
         bag, _short_leg_opt = build_combo(ib, spread.candidate, today)
         flatten_order = Order(action="SELL", totalQuantity=spread.contracts, orderType="MKT")
@@ -3933,7 +3961,12 @@ def run(live: LiveConfig = ACTIVE) -> None:
                         _trigger_flatten("account_guard", last_marked_pnl)
 
                 # --- Phase D: mark integrity + PnL governor -----------------------
-                mark = _mark_book(open_spreads, quotes, config)
+                mark = _mark_book(
+                    open_spreads,
+                    quotes,
+                    config,
+                    max_ask_without_bid=live.mark_max_short_ask_without_bid,
+                )
                 if mark.quality == "ok":
                     mark_bad_since = None
                     last_marked_pnl = mark.pnl
@@ -4142,8 +4175,30 @@ def run(live: LiveConfig = ACTIVE) -> None:
         # End of day: SPXW 0DTE is cash-settled on the close, so open defined-risk
         # spreads are left to settle (matches the backtest's settle-at-close). Only
         # the governor or an error flattens early.
+        # Only a clean final mark may replace the last good one. This used to
+        # overwrite unconditionally, so a degraded 16:00 snapshot became the
+        # session's recorded P&L: on 2026-08-05 a healthy +$4,130 (quality "ok"
+        # at 15:59:11) was replaced by -$7,890 built on a zero-bid/~60-ask print
+        # for an expiring OTM short put. The authoritative figure is the 16:15
+        # settlement reconcile; this event should not contradict it on noise.
+        final_mark_quality = "reused_last_good"
         if last_quotes:
-            last_marked_pnl = _mark_book(open_spreads, last_quotes, config).pnl
+            final_mark = _mark_book(
+                open_spreads,
+                last_quotes,
+                config,
+                max_ask_without_bid=live.mark_max_short_ask_without_bid,
+            )
+            final_mark_quality = final_mark.quality
+            if final_mark.quality == "ok":
+                last_marked_pnl = final_mark.pnl
+            else:
+                print(
+                    f"[{datetime.now().isoformat()}] final mark {final_mark.quality} "
+                    f"({final_mark.marked_count}/{final_mark.open_count} legs priced); "
+                    f"keeping last good marked_pnl ${last_marked_pnl:,.0f} "
+                    f"instead of ${final_mark.pnl:,.0f}"
+                )
         if flattened:
             run_flatten_audit(ib, today, dry=dry, live=live)
         log_event(today, {
@@ -4153,6 +4208,7 @@ def run(live: LiveConfig = ACTIVE) -> None:
             "flattened": flattened,
             "gross_credit_sold": round(gross_credit_sold, 2),
             "marked_pnl": round(last_marked_pnl, 2),
+            "final_mark_quality": final_mark_quality,
         }, live=live)
         print(f"[{datetime.now().isoformat()}] session end. spreads={len(open_spreads)} "
               f"stopped={sum(1 for s in open_spreads if s.stopped)} "
@@ -4218,10 +4274,34 @@ class MarkBookResult:
     missing_count: int
 
 
+def _short_ask_is_implausible(sq: OptionQuote, max_ask_without_bid: float) -> bool:
+    """True when a short-leg ask is too unreliable to mark against.
+
+    An option with no bid has no buyers, so its fair value is near zero; a
+    large ask alongside a zero bid is a one-sided or stale print, not a price.
+    Marking the short leg at that ask books a phantom loss of (ask - credit)
+    per contract.
+
+    2026-08-05: at 16:00:01 a chain re-subscription left a partially populated
+    snapshot in which the 7720 short put — 3.55 points OTM, settling worthless
+    — carried an ask near 60. The session mark went from a healthy +$4,130 at
+    15:59:11 to -$7,890, and the same price drove a "STOP limit unfilled @
+    63.00" backstop. The true settled result was +$5,365.
+    """
+    if max_ask_without_bid <= 0:
+        return False
+    bid = sq.bid
+    if bid is not None and float(bid) > 0:
+        return False
+    return float(sq.ask) > max_ask_without_bid
+
+
 def _mark_book(
     open_spreads: Sequence[OpenSpread],
     quotes: Sequence[OptionQuote],
     config: StrategyConfig,
+    *,
+    max_ask_without_bid: float = 0.0,
 ) -> MarkBookResult:
     active = [s for s in open_spreads if not s.closed]
     if not active:
@@ -4251,6 +4331,13 @@ def _mark_book(
         else:
             sq = lookup.get((opt_type, cand.short_strike))
             if sq is None or sq.ask is None or sq.ask <= 0:
+                missing += 1
+                continue
+            if _short_ask_is_implausible(sq, max_ask_without_bid):
+                # Unmarkable rather than mis-marked: this degrades mark quality
+                # to "partial", which halts new entries (correct while pricing
+                # is untrustworthy) without on its own tripping the flatten
+                # path, since that needs every leg to go unmarkable.
                 missing += 1
                 continue
             per_contract = spread.short_entry_sell - sq.ask - spread.long_entry_buy + float(lq.bid)
