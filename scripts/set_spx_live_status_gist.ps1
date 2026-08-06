@@ -96,13 +96,15 @@ Write-Host "Saved SPX_LIVE_STATUS_GIST_ID / SPX_LIVE_STATUS_URL -> $secretsFile"
 Write-Host "Raw URL: $rawUrl"
 
 if (-not $SkipUrlFile) {
-    @{
+    $urlDoc = @{
         schema = 1
         gist_id = $GistId
         owner = $Owner
         url = $rawUrl
         notes = "Cloud Session-now status; published by publish_live_status.ps1 via gh gist edit (not GitHub Pages)."
-    } | ConvertTo-Json | Set-Content -Path $urlPath -Encoding UTF8
+    } | ConvertTo-Json
+    # UTF-8 no BOM — a BOM breaks browser JSON.parse on github.io.
+    [System.IO.File]::WriteAllText($urlPath, $urlDoc, [System.Text.UTF8Encoding]::new($false))
     Write-Host "Wrote $urlPath"
 }
 
