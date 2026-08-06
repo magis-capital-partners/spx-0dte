@@ -1,10 +1,10 @@
 {
   "schema": 2,
   "source": "cloud",
-  "generated_at": "2026-08-06T09:49:45.027882",
+  "generated_at": "2026-08-06T09:54:44.385588",
   "date": "2026-08-06",
-  "pid_alive": true,
-  "heartbeat_ts": "2026-08-06T09:49:32.033300",
+  "pid_alive": false,
+  "heartbeat_ts": "2026-08-06T09:54:00.004620",
   "entries_halted": true,
   "flattened": false,
   "open_count": 0,
@@ -81,7 +81,7 @@
     {
       "date": "2026-08-06",
       "execution_type": "production_live",
-      "ts": "2026-08-06T09:48:32.174293",
+      "ts": "2026-08-06T09:54:00.004620",
       "marked_pnl": 0.0,
       "closed_pnl": 0.0,
       "total_pnl": 0.0,
