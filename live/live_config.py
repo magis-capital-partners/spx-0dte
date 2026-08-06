@@ -92,6 +92,12 @@ class LiveConfig:
     # valid live-last update within this window. Open-position option marks and
     # stops continue to be managed; stale underlying alone never flattens.
     stale_spot_halt_seconds: float = 5.0
+    # Resume entries automatically once the SPX stream has been continuously
+    # healthy for this long after a stale_underlying halt. A feed gap is a
+    # transient data condition, not a risk event, so latching it for the rest of
+    # the session throws the day away; requiring a sustained healthy streak
+    # keeps a flapping feed from re-arming entries. 0 disables auto-resume.
+    stale_underlying_resume_seconds: float = 30.0
     # A z-score this large is a feed/sentinel problem, not a tradable signal.
     signal_sanity_abs_z: float = 12.0
 

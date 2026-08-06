@@ -26,6 +26,14 @@ FLATTEN_HALT_REASONS = frozenset({
     "flatten_incomplete",
 })
 
+# Halts caused purely by a data feed going quiet. These carry no risk
+# implication once the feed recovers, so they are the only reasons an operator
+# clear (CLEAR_STALE_HALT) or the in-loop auto-resume may remove.
+STALE_HALT_REASONS = frozenset({
+    "stale_quotes",
+    "stale_underlying",
+})
+
 
 @dataclass(frozen=True)
 class LegKey:
@@ -255,11 +263,15 @@ def recover_governor_state(
                 halt_reasons.discard(str(reason))
             continue
         if name == "governor_clear" and event.get("reason") == "operator_clear_stale_quotes":
-            # Explicit operator resume after confirming quotes are healthy.
-            # Only stale_quotes may be removed this way — never flatten/PnL/etc.
+            # Explicit operator resume after confirming the feed is healthy.
+            # Only stale-data reasons may be removed this way — never flatten/PnL/etc.
             for reason in event.get("cleared_reasons") or []:
-                if str(reason) == "stale_quotes":
-                    halt_reasons.discard("stale_quotes")
+                if str(reason) in STALE_HALT_REASONS:
+                    halt_reasons.discard(str(reason))
+            continue
+        if name == "governor_clear" and event.get("reason") == "stale_underlying_recovered":
+            # In-loop auto-resume after the spot stream came back healthy.
+            halt_reasons.discard("stale_underlying")
             continue
         if name == "governor_clear" and event.get("reason") == "operator_clear_flatten":
             # Explicit operator resume after confirming IB holds no same-day risk.

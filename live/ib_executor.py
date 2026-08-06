@@ -481,6 +481,15 @@ class IBSignalProvider:
         if self.live.use_streaming_quotes and self._stream.spot_is_stale(
             self.live.stale_spot_halt_seconds
         ):
+            if now.time() < SESSION_OPEN:
+                # The cash index publishes no prints pre-open, so a "stale" spot
+                # anywhere in the market_data_lead_seconds warmup window is
+                # expected rather than a data fault. Reporting stale_underlying
+                # here latches the entry halt for the whole session — mirror
+                # _build_signal's pre-open guard and block benignly instead.
+                self.last_signal_block_reason = "signal_warming"
+                self.last_signal_diagnostics = {"sample_status": "pre_open"}
+                return quotes, None
             self.last_signal_block_reason = "stale_underlying"
             return quotes, None
 
@@ -3077,12 +3086,18 @@ def run(live: LiveConfig = ACTIVE) -> None:
         )
         entries_halted = governor.entries_halted
         flattened = governor.flattened
+        # Mirrors entries_halted so the in-loop auto-resume can prove a halt came
+        # from one specific reason and nothing else. Any site that halts without
+        # recording a reason leaves this empty, which fails closed: an unknown
+        # reason never auto-clears.
+        halt_reasons: set = set(governor.halt_reasons)
         if (
             recovered_halt_is_mark_only(governor)
             and missing_recovery_quotes == []
         ):
             cleared_reasons = list(governor.halt_reasons)
             entries_halted = False
+            halt_reasons.clear()
             print(
                 f"[{datetime.now().isoformat()}] governor clear — "
                 "recovered mark-only halt after all open legs warmed"
@@ -3142,6 +3157,7 @@ def run(live: LiveConfig = ACTIVE) -> None:
                 }, live=live)
                 flattened = False
                 entries_halted = bool(kept_reasons)
+                halt_reasons = set(kept_reasons)
             try:
                 clear_flatten_path.unlink()
             except OSError as exc:
@@ -3178,6 +3194,7 @@ def run(live: LiveConfig = ACTIVE) -> None:
                     "kept_reasons": other_reasons,
                 }, live=live)
                 entries_halted = flattened or bool(other_reasons)
+                halt_reasons = set(other_reasons)
             try:
                 clear_stale_path.unlink()
             except OSError as exc:
@@ -3239,6 +3256,9 @@ def run(live: LiveConfig = ACTIVE) -> None:
         mark_bad_since: Optional[datetime] = None
         disconnect_halt = False
         upstream_halt = False
+        # Start of the current uninterrupted healthy-spot streak; None while the
+        # SPX stream is stale. Gates the stale_underlying auto-resume.
+        spot_healthy_since: Optional[datetime] = None
         stale_tracker = StaleQuoteTracker()
         last_heartbeat_at = datetime.now() - timedelta(seconds=live.heartbeat_seconds)
         last_risk_snapshot_at = datetime.now() - timedelta(seconds=live.risk_snapshot_seconds)
@@ -3274,6 +3294,7 @@ def run(live: LiveConfig = ACTIVE) -> None:
             nonlocal pending_entry, flattened, entries_halted
             flattened = True
             entries_halted = True
+            halt_reasons.add(reason)
             # Book before flatten_all so a fill that beat the cancel is included
             # in the flatten set rather than surviving the flatten.
             _cancel_pending(pending_entry, reason)
@@ -3529,6 +3550,7 @@ def run(live: LiveConfig = ACTIVE) -> None:
                     and not entries_halted
                 ):
                     entries_halted = True
+                    halt_reasons.add("stale_underlying")
                     active_pending = pending_entry
                     _cancel_pending(active_pending, "stale_underlying")
                     pending_entry = None
@@ -3554,10 +3576,50 @@ def run(live: LiveConfig = ACTIVE) -> None:
                         "spot_age_seconds": round(spot_age, 3),
                         "threshold_seconds": live.stale_spot_halt_seconds,
                     }, live=live)
-                elif (
+                if ib_provider is not None:
+                    # Track how long the spot stream has been continuously healthy
+                    # so a recovered feed can lift its own halt without throwing
+                    # away the rest of the session.
+                    if ib_provider._stream.spot_is_stale(live.stale_spot_halt_seconds):
+                        spot_healthy_since = None
+                    elif spot_healthy_since is None:
+                        spot_healthy_since = now
+                resume_after = float(getattr(live, "stale_underlying_resume_seconds", 0.0) or 0.0)
+                healthy_for = (
+                    (now - spot_healthy_since).total_seconds()
+                    if spot_healthy_since is not None
+                    else 0.0
+                )
+                if (
+                    resume_after > 0
+                    and entries_halted
+                    and not flattened
+                    and not disconnect_halt
+                    and not upstream_halt
+                    # Strict equality is the safety property: any other live halt
+                    # reason (P&L, account, mark, flatten, stale quotes) keeps
+                    # entries blocked, as does a halt with no recorded reason.
+                    and halt_reasons == {"stale_underlying"}
+                    and healthy_for >= resume_after
+                ):
+                    entries_halted = False
+                    halt_reasons.clear()
+                    print(
+                        f"[{now.isoformat()}] governor clear — SPX stream healthy "
+                        f"for {healthy_for:.0f}s; resuming entries."
+                    )
+                    log_event(today, {
+                        "event": "governor_clear",
+                        "reason": "stale_underlying_recovered",
+                        "cleared_reasons": ["stale_underlying"],
+                        "healthy_for_seconds": round(healthy_for, 1),
+                        "threshold_seconds": resume_after,
+                    }, live=live)
+                if (
                     ib_provider is not None
                     and at_tranche
                     and ib_provider.last_signal_block_reason
+                    and ib_provider.last_signal_block_reason != "stale_underlying"
                 ):
                     reason = ib_provider.last_signal_block_reason
                     print(f"[{now.isoformat()}] SKIP tranche ({reason}).")
@@ -3736,6 +3798,7 @@ def run(live: LiveConfig = ACTIVE) -> None:
                 )
                 if stale.confirmed and not entries_halted:
                     entries_halted = True
+                    halt_reasons.add("stale_quotes")
                     print(
                         f"[{now.isoformat()}] HALT (stale quotes ×{stale.consecutive}) — "
                         f"{', '.join(stale.stale_legs[:4])}"
@@ -3809,6 +3872,7 @@ def run(live: LiveConfig = ACTIVE) -> None:
                     )
                     if loop_guard.halt_entries and not entries_halted:
                         entries_halted = True
+                        halt_reasons.add("account_guard")
                         print(
                             f"[{now.isoformat()}] HALT (account guard): {loop_guard.reason}"
                         )
@@ -3830,6 +3894,7 @@ def run(live: LiveConfig = ACTIVE) -> None:
                     last_marked_pnl = mark.pnl
                     if not entries_halted and mark.pnl <= halt_limit:
                         entries_halted = True
+                        halt_reasons.add("daily_loss")
                         print(
                             f"[{now.isoformat()}] HALT new entries "
                             f"(marked ${mark.pnl:,.0f} <= ${halt_limit:,.0f})."
@@ -3861,6 +3926,7 @@ def run(live: LiveConfig = ACTIVE) -> None:
                     if live.mark_degraded_halt and mark.open_count > 0:
                         if not entries_halted:
                             entries_halted = True
+                            halt_reasons.add(f"mark_{mark.quality}")
                             print(
                                 f"[{now.isoformat()}] HALT (mark {mark.quality}) — "
                                 f"missing quotes on {mark.missing_count}/{mark.open_count} spread(s)."
@@ -3888,6 +3954,7 @@ def run(live: LiveConfig = ACTIVE) -> None:
                         last_marked_pnl = mark.pnl
                         if not entries_halted and mark.pnl <= halt_limit:
                             entries_halted = True
+                            halt_reasons.add("partial_mark")
                             log_event(today, {
                                 "event": "halt_entries",
                                 "marked_pnl": round(mark.pnl, 2),
