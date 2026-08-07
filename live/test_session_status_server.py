@@ -73,6 +73,44 @@ class LiveStatusTests(unittest.TestCase):
         self.assertEqual(cloud["total_pnl"], 387.5)
         self.assertEqual(cloud["contracts_traded"], 3)
 
+    def test_config_summary_curates_and_excludes_connection_details(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            live_dir = Path(tmp)
+            day_dir = live_dir / "2026-08-07"
+            day_dir.mkdir()
+            (day_dir / "config.json").write_text(json.dumps({
+                "git_commit": "abc123",
+                "live_config": {
+                    "profile": "p3_poststop_cooldown_120",
+                    "mode": "live",
+                    "contracts_per_tranche": 4,
+                    "max_contracts_per_tranche": 5,
+                    "host": "127.0.0.1",
+                    "port": 7496,
+                    "ib_account": "U805366",
+                    "client_id": 17,
+                },
+                "strategy_config": {
+                    "put_wing_width": 150.0,
+                    "call_wing_width": 75.0,
+                    "daily_loss_limit_pct": 0.0225,
+                },
+            }), encoding="utf-8")
+            with mock.patch.object(sss, "LIVE_DIR", live_dir):
+                summary = sss._config_summary("2026-08-07")
+        self.assertEqual(summary["profile"], "p3_poststop_cooldown_120")
+        self.assertEqual(summary["contracts_per_tranche"], 4)
+        self.assertEqual(summary["put_wing_width"], 150.0)
+        self.assertEqual(summary["git_commit"], "abc123")
+        self.assertNotIn("host", summary)
+        self.assertNotIn("ib_account", summary)
+        self.assertNotIn("client_id", summary)
+
+    def test_config_summary_missing_file_returns_none(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            with mock.patch.object(sss, "LIVE_DIR", Path(tmp)):
+                self.assertIsNone(sss._config_summary("2026-08-07"))
+
     def test_write_cloud_status_roundtrip(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             out = Path(tmp) / "live_status.json"

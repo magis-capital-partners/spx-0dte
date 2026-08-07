@@ -131,6 +131,93 @@ function ageLabel(ts) {
   return Math.round(s / 3600) + "h ago";
 }
 
+// Reference taxonomy for console/event reasons. Mirrors the tables in README.md
+// ("Entry block & rejection reasons"); keep the two in sync.
+const REASON_GROUPS = [
+  {
+    title: "Quote / market quality",
+    note: "Re-checked on every poll while an order works, so a working entry can still be pulled.",
+    rows: [
+      ["quote_desync", "Legs' quote timestamps >1.0s apart — credit would be stitched from non-simultaneous quotes. Common right after the open."],
+      ["stale_quote", "A leg's quote older than 5s."],
+      ["stale_spot", "SPX spot tick older than 5s."],
+      ["signal_expired", "Signal snapshot older than 75s at submit."],
+      ["spot_drift", "SPX moved >8pt (or >0.15%) from the strike-selection reference."],
+      ["credit_deterioration", "Credit fell below 80% of, or >$0.50 from, the reference credit."],
+      ["short_delta_out_of_range", "Short delta outside the 0.15–0.25 band."],
+      ["short_delta_drift", "Short delta moved >0.05 from the reference."],
+      ["short_quote_wide", "Short-leg bid/ask wider than $0.50."],
+      ["long_quote_wide", "Long-leg bid/ask wider than $0.30."],
+      ["insufficient_credit", "Natural credit below the $0.20 floor."],
+    ],
+  },
+  {
+    title: "Order lifecycle",
+    rows: [
+      ["entry_unfilled", "Worked the full 870s without filling; cancelled."],
+      ["entry_terminal_*", "IB moved the order to a terminal status (Cancelled / ApiCancelled)."],
+      ["entry_working", "Tranche skipped — an entry from a prior tranche was still working."],
+    ],
+  },
+  {
+    title: "Risk governors",
+    note: "Book-level caps. These block new entries; open positions keep being managed.",
+    rows: [
+      ["side_stop_cooldown", "That side stopped within the last 120 min."],
+      ["side_stop_limit / day_stop_limit", "Hit 2 stops on a side / 4 stops on the day."],
+      ["side_mtm_halt", "That side is halted on mark-to-market loss."],
+      ["adverse_sequence_brake", "Consecutive-adverse-outcome brake active."],
+      ["max_open_contracts", "Would exceed 48 open contracts book-wide."],
+      ["max_open_per_side", "Would exceed 36 open contracts on that side."],
+      ["max_open_same_strike", "Would exceed the same-strike cap (12x current sell size)."],
+      ["max_open_side_cluster", "Would exceed 24 contracts within a 25pt strike cluster."],
+      ["post_stop_thin_credit", "Credit-to-width too thin for a post-stop re-entry."],
+    ],
+  },
+  {
+    title: "Session halts",
+    note: "halt_entries stops new entries only and never closes positions; flatten closes the book.",
+    rows: [
+      ["daily_loss_limit", "-2.25% MTM — halt new entries."],
+      ["flatten_loss_limit", "-3.25% MTM — close everything."],
+      ["stale_quotes", "3 consecutive polls with short-leg quote age >20s — halt only."],
+      ["mark_unavailable", "Missing marks on open risk (60s → flatten)."],
+      ["account_guard", "IB NetLiq below 90% of configured equity."],
+      ["ib_disconnected", "Disconnect breaker; reconnects with backoff, re-arms native STPs."],
+      ["kill_switch", "data/live/KILL present — confirmed flatten, then exit."],
+    ],
+  },
+];
+
+function ReasonReference() {
+  const [open, setOpen] = useState(false);
+  return (
+    <div className="panel">
+      <h2 style={{cursor:"pointer", margin:0}} onClick={()=>setOpen(o=>!o)}>
+        Entry block &amp; rejection reasons
+        <span className="pill" style={{marginLeft:10}}>{open ? "hide" : "show"}</span>
+      </h2>
+      {open && (
+        <div style={{marginTop:14}}>
+          <p className="sub" style={{margin:"0 0 14px"}}>
+            These are named guards declining a specific trade — routine operating output, not faults.
+            {" "}<code>policy=N</code> in a tranche line is the sized contract count for that tranche, not an error code.
+          </p>
+          {REASON_GROUPS.map((g,gi)=>(
+            <div key={gi} style={{marginBottom:16}}>
+              <div className="muted" style={{marginBottom:6, fontSize:11, textTransform:"uppercase"}}>{g.title}</div>
+              {g.note && <p className="sub" style={{margin:"0 0 8px"}}>{g.note}</p>}
+              <table><thead><tr><th style={{width:"32%"}}>Reason</th><th>Meaning</th></tr></thead>
+                <tbody>{g.rows.map((r,ri)=><tr key={ri}><td><code>{r[0]}</code></td><td>{r[1]}</td></tr>)}</tbody>
+              </table>
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
 function SessionNow() {
   const [local, setLocal] = useState(null);
   const [cloud, setCloud] = useState(null);
@@ -259,6 +346,28 @@ function SessionNow() {
             </table>
             <p className="sub" style={{margin:"8px 0 0"}}>Session P&amp;L = realized on spreads closed out + mark on whatever is still open. Marked-only columns read 0 for a day that ended flat, which is why realized is shown separately; 0DTE positions settle after the session.</p>
           </div>}
+          {src.config && (
+            <div style={{marginTop:16}}>
+              <div className="muted" style={{marginBottom:6, fontSize:11, textTransform:"uppercase"}}>Live config</div>
+              <div className="cards">
+                <div className="card"><div className="k">Profile</div><div className="v" style={{fontSize:14}}>{src.config.profile || MISSING}</div></div>
+                <div className="card"><div className="k">Mode</div><div className="v" style={{fontSize:14}}>{src.config.mode || MISSING}{src.config.allow_live === false ? " (live disabled)" : ""}</div></div>
+                <div className="card"><div className="k">Equity ref</div><div className="v">{src.config.account_equity==null?MISSING:fmt$(src.config.account_equity)}</div></div>
+                <div className="card"><div className="k">Contracts / tranche</div><div className="v">{src.config.contracts_per_tranche ?? MISSING}{src.config.max_contracts_per_tranche!=null?` (max ${src.config.max_contracts_per_tranche})`:""}</div></div>
+                <div className="card"><div className="k">Put / call wing</div><div className="v">{src.config.put_wing_width ?? MISSING} / {src.config.call_wing_width ?? MISSING}</div></div>
+                <div className="card"><div className="k">Stop / confirm</div><div className="v">{src.config.stop_multiple ?? MISSING}x · {src.config.stop_confirm_seconds ?? MISSING}s</div></div>
+                <div className="card"><div className="k">Native STP backstop</div><div className="v">{src.config.native_stop_multiple ?? MISSING}x</div></div>
+                <div className="card"><div className="k">Same-side cooldown</div><div className="v">{src.config.same_side_stop_cooldown_minutes ?? MISSING}min</div></div>
+                <div className="card"><div className="k">Daily halt / flatten</div><div className="v neg">{src.config.daily_loss_limit_pct!=null?fmtPct(src.config.daily_loss_limit_pct*100):MISSING} / {src.config.flatten_loss_limit_pct!=null?fmtPct(src.config.flatten_loss_limit_pct*100):MISSING}</div></div>
+                <div className="card"><div className="k">VIX skip / elevated</div><div className="v">{"> "}{src.config.vix_skip_open_above ?? MISSING} skip · {src.config.vix_elevated_min ?? "–"}–{src.config.vix_elevated_max ?? "–"} @ {src.config.vix_elevated_scale ?? "–"}x</div></div>
+                <div className="card"><div className="k">FOMC cutoff</div><div className="v">{src.config.use_fomc_entry_cutoff ? (src.config.fomc_entry_end || "on") : "off"}</div></div>
+                <div className="card"><div className="k">Open-risk cap</div><div className="v">{src.config.max_open_contracts ?? MISSING} total / {src.config.max_open_per_side ?? MISSING} side</div></div>
+                <div className="card"><div className="k">Live stop caps</div><div className="v">{src.config.live_max_stops_per_side ?? MISSING}/side · {src.config.live_max_stops_per_day ?? MISSING}/day</div></div>
+                <div className="card"><div className="k">Entry concession</div><div className="v">${src.config.entry_limit_concession ?? MISSING} · work {src.config.entry_work_seconds ?? MISSING}s</div></div>
+              </div>
+              <p className="sub" style={{margin:"8px 0 0"}}>Snapshot from <code>data/live/{src.date}/config.json</code> at session start ({src.config.git_commit || MISSING}). Reflects the deployed config as of that startup, not any intra-session KILL/CLEAR overrides.</p>
+            </div>
+          )}
           {usingLocal && local?.recent_events?.length ? (
             <p className="sub" style={{margin:"0 0 10px"}}>
               Last event: <code>{local.recent_events[local.recent_events.length-1].event}</code>
@@ -1167,6 +1276,7 @@ function App({ viewer }) {
       </div>
       <main>
         <SessionNow />
+        <ReasonReference />
         {tab==="overview"? <Overview data={data}/> : tab==="factors"? <MarketFactors data={data}/> : <Daily data={data}/>}
       </main>
     </div>

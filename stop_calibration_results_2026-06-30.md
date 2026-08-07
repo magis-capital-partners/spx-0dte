@@ -1,5 +1,16 @@
 # Stop Calibration Results — Test 3A–3F
 
+> ⚠️ **VOID — DO NOT USE (marked 2026-08-06, plan E2).** This report was generated
+> from 3-day smoke-test artifacts after the accidental 5-day overwrite noted in
+> `full_test_suite_report_2026-06-30.md` — its header claims 391 OOS days but
+> `data/stop_calibration/phase_winners.json` shows `"days": 3`. The 576–689% CAGRs,
+> the 3A/3C/3D phase winners, and the `3F_gated_2.50` "final recommendation"
+> (a zero-trade config selected by a ranking bug) are all artifacts. The
+> authoritative results are `data/stop_calibration/calibration_summary.csv` and
+> `full_test_suite_report_2026-06-30.md`. The Wave 4 suite (`scripts/
+> merge_calmar_wave4_shards.py`) now asserts day counts and minimum trade counts
+> so this bug class cannot recur.
+
 Generated: 2026-06-30 21:52
 
 Substrate: wide wings (put 200pt / call 75pt), 391 OOS days, gates off except 3F.

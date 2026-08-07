@@ -8,8 +8,8 @@ three share one canonical config in `simulator/profiles.py`.
 
 **Profile:** `p3_poststop_cooldown_120` (`simulator/profiles.py::build_p3_poststop_cooldown_config`)
 **Sizing:** `linear_decay_downsize`
-**Account reference:** $13M (backtest/dashboard); $500k pilot (live paper default, hard-capped
-at 2 contracts/tranche regardless of the size formula below)
+**Account reference:** $13M (backtest/dashboard); $500k pilot (live default **4 contracts**
+per tranche, capped at **5** — the 1.25× elevated-VIX band — regardless of the size formula below)
 
 | Parameter | Value |
 |-----------|--------|
@@ -83,9 +83,11 @@ scaled by three independent multipliers:
   expectancy band).
 - **VIX skip:** the entire session is skipped (no entries at all) when VIX opens **> 35**.
 
-The $500k live/paper pilot additionally hard-caps every tranche at **2 contracts**
-(`contracts_per_tranche` / `max_contracts_per_tranche` in `live/live_config.py`) —
-none of the scaling above can push a live tranche above that cap; it only affects the
+The $500k live pilot runs a **4-contract** baseline per tranche and caps every tranche at
+**5 contracts** (`contracts_per_tranche=4` / `max_contracts_per_tranche=5` in
+`live/live_config.py`, raised from 2/2 on 2026-08-06). The cap is set exactly at the
+1.25× elevated-VIX band (`round(4×1.25)=5`), so the VIX upsize can apply but nothing
+above it can; the 31-contract baseline and full time-of-day ladder only affect the
 $13M backtest/dashboard reference book.
 
 **Risk governors (whole-book, independent of any single position's stop).**
@@ -192,6 +194,85 @@ stop above), and "very likely to fill" is a more honest description than "no ris
 
 ---
 
+## Entry block & rejection reasons (reading the console)
+
+A tranche line like `[tranche] 09:32 SKIP entry_working (policy=5)` and an entry line like
+`ENTRY failed bear_call 7775.0/7850.0 reason=entry_quality_quote_desync` are **routine
+operating output, not errors**. Nothing below indicates a crash or a broken session; each
+is a named guard declining a specific trade. `policy=N` in a tranche line is **not** an
+error code — it is the contract count the sizing policy computed for that tranche
+(4-contract baseline × the time-of-day multiplier, e.g. `4 × 1.25 = 5` before 10:30).
+
+### Quote / market-quality vetoes (`entry_quality_*`)
+
+Evaluated in `evaluate_entry_quality` (`live/entry_execution.py`) once before submitting
+and again on **every poll while the order is working**, so a working order can be pulled
+after submission if conditions decay. Thresholds are the `entry_*` fields in
+`live/live_config.py`.
+
+| Reason | Fires when | Governing knob (default) |
+|---|---|---|
+| `insufficient_credit` | Natural credit below the floor | `entry_min_credit` (0.20) |
+| `stale_quote` | A leg's quote is older than the age limit | `max_leg_quote_age_seconds` (5s) |
+| `stale_spot` | The SPX spot tick is older than the age limit | `max_leg_quote_age_seconds` (5s) |
+| `signal_expired` | Signal snapshot older than the limit at submit time | `entry_max_signal_age_seconds` (75s) |
+| `quote_desync` | The two legs' quote timestamps differ by more than the limit — the combo credit would be stitched from **non-simultaneous** quotes | `entry_max_leg_timestamp_dispersion_seconds` (1.0s) |
+| `spot_drift` | SPX moved too far from the strike-selection reference | `entry_max_spot_drift_points` (8.0) / `entry_max_spot_drift_pct` (0.15%) |
+| `credit_deterioration` | Credit fell below a fraction of, or too far from, the reference credit | `entry_min_credit_ratio` (0.80) / `entry_max_credit_drop` (0.50) |
+| `short_delta_out_of_range` | Short-leg delta outside the accepted band | `min_abs_delta` / `max_abs_delta` (0.15–0.25) |
+| `short_delta_drift` | Short delta moved too far from the reference delta | `entry_max_short_delta_drift` (0.05) |
+| `short_quote_wide` | Short-leg bid/ask wider than the limit | `entry_max_short_bid_ask_width` (0.50) |
+| `long_quote_wide` | Long-leg bid/ask wider than the limit | `entry_max_long_bid_ask_width` (0.30) |
+
+`quote_desync` is the most common benign rejection in the first minutes after the open,
+when OPRA lines are still warming up and the two legs tick at different times. It is a
+**correctness guard**: it prevents pricing a spread off a stale leg paired with a fresh one.
+
+### Order-lifecycle outcomes
+
+| Reason | Meaning |
+|---|---|
+| `entry_unfilled` | Worked the full `entry_work_seconds` (870s) without filling; cancelled |
+| `entry_terminal_<status>` | IB moved the order to a terminal status (e.g. `Cancelled`, `ApiCancelled`) |
+| `entry_working` | Tranche skipped because an entry from a prior tranche was still working |
+
+### Risk-governor blocks (`entry_blocked`)
+
+From `entry_risk_block_reason` (`simulator/mbh_simulator.py`, reused live via
+`live/live_entry_risk.py`). These are the **book-level** governors.
+
+| Reason | Meaning |
+|---|---|
+| `side_stop_cooldown` | Same side stopped within the last 120 min (`same_side_stop_cooldown_minutes`) |
+| `side_stop_limit` / `day_stop_limit` | Hit 2 stops on a side / 4 stops on the day |
+| `side_mtm_halt` | That side is halted on mark-to-market loss |
+| `adverse_sequence_brake` | Consecutive-adverse-outcome brake active |
+| `max_open_contracts` | Would exceed 48 open contracts book-wide |
+| `max_open_per_side` | Would exceed 36 open contracts on that side |
+| `max_open_same_strike` | Would exceed the same-strike cap (12× the current sell size) |
+| `max_open_side_cluster` | Would exceed 24 contracts within a 25-pt strike cluster |
+| `post_stop_thin_credit` | Credit-to-width too thin for a post-stop re-entry |
+| `global_stop_cooldown` | Global (both-side) stop cooldown active |
+
+### Session-level halts
+
+`halt_entries` stops **new entries only** and never closes existing positions;
+`flatten` force-closes the book. See [Operator safeties](live/README.md#operator-safeties)
+for the full table, including which halts auto-clear and which require an explicit
+`CLEAR_*` file plus a restart.
+
+| Reason | Trigger |
+|---|---|
+| `daily_loss_limit` | −2.25% MTM — halt new entries |
+| `flatten_loss_limit` | −3.25% MTM — close everything |
+| `stale_quotes` | 3 consecutive polls with short-leg quote age >20s — halt only, never flatten |
+| `mark_unavailable` | Missing marks on open risk (60s → flatten) |
+| `account_guard` | IB NetLiq below 90% of configured equity |
+| `ib_disconnected` | Disconnect breaker; reconnects with backoff, re-arms native STPs |
+| `kill_switch` | `data/live/KILL` present — confirmed flatten, then exit |
+
+---
+
 ## Quick start — what to run
 
 ### Live / paper trading (Interactive Brokers)
@@ -222,6 +303,43 @@ stop above), and "very likely to fill" is a more honest description than "no ris
    The executor automatically mirrors this manual command's console output to
    `data/live/<YYYY-MM-DD>/executor-console.log`, which is the stream shown in
    the local dashboard's **Executor stdout** panel.
+
+   **Or run it supervised (recommended for a real session):**
+
+   ```powershell
+   .\scripts\run_ib_executor_supervised.ps1
+   ```
+
+   This is the same `live/ib_executor.py` process, wrapped in a restart supervisor
+   (`scripts/run_ib_executor_supervised.ps1`). Use it instead of the bare command when
+   you want the session to survive a crash without you watching the terminal. It:
+
+   - **Loads the Magis Slack secrets** first (`scripts/load_spx_live_env.ps1`), so
+     `SPX_SLACK_WEBHOOK_URL` is set and failures actually notify you.
+   - **Respects the single-instance lock.** If `data/live/<date>/executor.lock` names a
+     live PID, the supervisor waits 60s and re-checks rather than starting a second
+     executor against the same account.
+   - **Restarts on crash** — up to `-MaxRestarts` (default 50), waiting
+     `-RestartDelaySeconds` (default 20) between attempts, then posts a Slack message
+     and stops if it exhausts them.
+   - **Knows the difference between a crash and the end of the day.** It stops cleanly
+     on exit code 0, on `session end` in stdout, or any exit after 16:00 — so it does
+     not relaunch the executor after `force_flat_time`.
+   - **Logs to `data/live/supervisor/`** — `executor-<date>.log` for supervisor
+     decisions, plus `executor-stdout.log` / `executor-stderr.log` for the child process.
+
+   Optional tuning:
+
+   ```powershell
+   .\scripts\run_ib_executor_supervised.ps1 -MaxRestarts 20 -RestartDelaySeconds 15
+   ```
+
+   Note the supervisor writes the child's stdout to `data/live/supervisor/executor-stdout.log`
+   rather than the terminal, so the dashboard's **Executor stdout** panel reads that file
+   for a supervised session. For a fully unattended setup (daily 09:15 + at-logon tasks
+   covering executor, watchdog, status API, and cloud publish) use
+   `.\scripts\install_live_supervisor_tasks.ps1 -StartNow` instead — see
+   [`live/README.md`](live/README.md).
 
 4. **Session logs:** `data/live/<YYYY-MM-DD>/` (`fills.jsonl`, `tranches.jsonl`,
    `config.json`, `ib.log`).

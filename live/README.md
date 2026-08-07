@@ -53,6 +53,14 @@ Refresh calendar: `python scripts/download_vix_daily.py`.
 Events: `side_stop_cooldown_start` and `entry_blocked` with `reason=side_stop_cooldown`
 in `data/live/<date>/fills.jsonl`.
 
+## Entry block & rejection reasons
+
+Console lines like `reason=entry_quality_quote_desync` and
+`[tranche] 09:32 SKIP entry_working (policy=5)` are routine guard output, not faults —
+`policy=N` is the tranche's sized contract count, not an error code. Full taxonomy of
+every `entry_quality_*`, `entry_blocked`, and halt reason:
+[README.md → Entry block & rejection reasons](../README.md#entry-block--rejection-reasons-reading-the-console).
+
 ## Before each session
 
 ```powershell
@@ -200,6 +208,15 @@ Manual / second terminal (loads the same Magis secrets):
 .\scripts\run_ib_executor_supervised.ps1
 .\scripts\run_live_watchdog_supervised.ps1 -WriteKill
 ```
+
+`run_ib_executor_supervised.ps1` runs the ordinary `live/ib_executor.py` under a restart
+supervisor: it sources the Magis secrets, waits instead of double-starting when
+`executor.lock` holds a live PID, relaunches on crash (`-MaxRestarts` 50,
+`-RestartDelaySeconds` 20), and stops cleanly on exit 0 / `session end` in stdout / any
+exit after 16:00 so it never relaunches past `force_flat_time`. Exhausting the restart
+budget posts to Slack. Supervisor decisions land in
+`data/live/supervisor/executor-<date>.log`; the child's streams go to
+`executor-stdout.log` / `executor-stderr.log` in the same directory.
 
 Heartbeat: `data/live/<date>/heartbeat.json` (updated every `heartbeat_seconds`).
 
