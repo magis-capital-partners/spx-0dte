@@ -61,6 +61,10 @@ class LiveConfig:
     max_chain_lines: int = 80
     chain_points_below: float = 350.0
     chain_points_above: float = 150.0
+    # Record the per-minute sampler chain to data/live/<date>/chain_minutes.jsonl
+    # (~2 MB/day). This is the post-ThetaData data source: processed days are
+    # rebuilt from these recordings by scripts/build_processed_from_ib.py.
+    record_chain_minutes: bool = True
     delayed_quote_fallback: bool = False
 
     # --- Pre-open launch ---------------------------------------------------- #

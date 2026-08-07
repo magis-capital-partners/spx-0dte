@@ -117,6 +117,7 @@ from live_features import (  # noqa: E402
     validate_baselines_freshness,
 )
 from feature_state_io import load_feature_state, save_feature_state  # noqa: E402
+from chain_recorder import ChainMinuteRecorder  # noqa: E402
 from ib_market_data import IBStreamingMarketData  # noqa: E402
 from loop_timing import (  # noqa: E402
     adaptive_sleep_seconds,
@@ -247,6 +248,11 @@ def load_baselines_file(path: Path, max_age_days: int) -> tuple[dict, dict]:
     """Return (full payload, core baselines dict for z-scoring)."""
     payload = json.loads(path.read_text(encoding="utf-8"))
     validate_baselines_freshness(payload, max_age_days)
+    note = payload.get("train_note")
+    if note:
+        # Post-vendor transition: baselines are a frozen prior-source window
+        # until enough IB-recorded days exist. Loud, but not fatal.
+        print(f"[baselines] {note}")
     return payload, extract_baselines_core(payload)
 
 
@@ -474,6 +480,14 @@ class IBSignalProvider:
             min_observations=live.signal_sample_min_observations,
             max_wait_seconds=live.signal_sample_max_wait_seconds,
         )
+        # Post-ThetaData data source: capture the exact minute samples the
+        # features consume so processed days can be rebuilt from IB data.
+        # Internally exception-proof; can never disturb the trading loop.
+        self._chain_recorder = (
+            ChainMinuteRecorder(LIVE_DIR / self.today / "chain_minutes.jsonl")
+            if getattr(live, "record_chain_minutes", False)
+            else None
+        )
 
     @staticmethod
     def load_baselines(path: Path, max_age_days: int) -> tuple[dict, dict]:
@@ -667,6 +681,11 @@ class IBSignalProvider:
         if sample is None:
             self.last_signal_block_reason = "signal_inputs_unavailable"
             return None
+        if self._chain_recorder is not None:
+            # Recorded pre-health so the offline rebuild sees every canonical
+            # minute the sampler produced, healthy or not (vendor data had no
+            # health gate either). Exception-proof inside the recorder.
+            self._chain_recorder.record_sample(sample)
         health = self._stream.feature_input_health(
             sample.spot,
             max_age_seconds=self.live.signal_max_feature_quote_age_seconds,
@@ -688,6 +707,10 @@ class IBSignalProvider:
         if at_tranche:
             self._stream.refresh_next_expiry_at_tranche(now)
         next_q = self._stream.next_expiry_quotes() if at_tranche else None
+        if self._chain_recorder is not None and next_q:
+            # Upgrade this minute's recording with the tranche-time next-expiry
+            # quotes so the offline replay reproduces term_ratio_z.
+            self._chain_recorder.record_next_expiry(sample, next_q)
         previous_sample_minute = self._feature_state.last_sample_minute
         raw = compute_raw_features_once_per_minute(
             sample.quotes,

@@ -322,3 +322,27 @@ python simulator/test_profile_regression.py
 python simulator/test_live_signal_parity.py
 python simulator/reconcile_live.py --date YYYY-MM-DD
 ```
+
+## Data after ThetaData (IB chain recordings)
+
+The vendor subscription ended in August 2026. The executor now records its own
+sampler-aggregated minute chain to `data/live/<date>/chain_minutes.jsonl`
+(`live/chain_recorder.py`, `LiveConfig.record_chain_minutes`, ~2 MB/day,
+exception-proof — can never disturb the trading loop).
+
+`scripts/build_processed_from_ib.py --auto` (run by both the 09:25 preflight
+and the 16:15 daily job) replays each recording through the **live feature
+code path** and emits a vendor-schema processed day
+(`signals.csv` + `normalized_option_quotes.csv` + `source.json{"source":"ib_live"}`),
+so `refresh_live_baselines.py`, `reconcile_live.py`, and the backtest keep
+working unchanged. Because baselines and live share one IV source after
+cutover, the vendor-vs-IB skew parity gap disappears by construction.
+
+**Baseline windows never mix sources** (`simulator/data_sources.py`): the two
+IV engines differ by 0.15-0.5 z on skew. During the transition the 40-day
+window stays frozen on the final vendor days — the executor banner prints a
+`SOURCE CUTOVER PENDING m/40` countdown — then cuts over automatically once
+40 IB-recorded sessions exist. A day only records when the executor runs, so
+every skipped session extends the transition by one day.
+
+Rehearsal test for the whole transition: `simulator/test_subscription_cutover.py`.

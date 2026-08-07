@@ -18,6 +18,7 @@ from expiry_calendar import (
 from historical_baselines import write_csv
 from mbh_simulator import read_quotes_csv, read_signals_csv, simulate_day, stop_diagnostics_to_rows, trades_to_rows
 from portfolio_metrics import portfolio_stats
+from data_sources import resolve_homogeneous_train_dates
 from regime_validation import apply_rolling_baseline, discover_dates
 from stop_calibration_runner import (
     DEFAULT_PROCESSED,
@@ -268,7 +269,12 @@ def export_historical_3d_variant(
 
     for index in range(start_index, len(eligible_dates)):
         test_date = eligible_dates[index]
-        train_dates = eligible_dates[index - train_count : index]
+        # Single-source window (vendor XOR ib_live): during the post-vendor
+        # transition this replays against the frozen vendor window — exactly
+        # what the live baselines use — instead of mixing IV engines.
+        train_dates, _src, _note = resolve_homogeneous_train_dates(
+            processed_dir, symbol, list(eligible_dates[:index]), train_count,
+        )
         apply_rolling_baseline(processed_dir, symbol, train_dates, test_date, signals_filename)
         day_dir = processed_dir / f"symbol={symbol}" / f"date={test_date}"
         close_spot = (settlement_spot_overrides or {}).get(test_date)

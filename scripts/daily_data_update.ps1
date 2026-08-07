@@ -95,10 +95,13 @@ try {
 
     Write-Log "Window: $StartDate .. $EndDate"
 
+    if (-not $SkipDownload -and -not $env:THETADATA_API_KEY) {
+        # Post-subscription mode: vendor download unavailable. Sessions are
+        # rebuilt from the executor's IB chain recordings further below.
+        Write-Log "WARNING: THETADATA_API_KEY not set - skipping vendor download (subscription ended?). Processed days now come from IB chain recordings."
+        $SkipDownload = $true
+    }
     if (-not $SkipDownload) {
-        if (-not $env:THETADATA_API_KEY) {
-            throw "THETADATA_API_KEY is not set. Set a User environment variable or pass it in this shell."
-        }
         Write-Log "=== ThetaData download + build ==="
         Invoke-Py -PyArgs @(
             (Join-Path $Root "simulator\backfill_history.py"),
@@ -121,6 +124,13 @@ try {
             "--build"
         )
     }
+
+    Write-Log "=== Convert IB-recorded sessions to processed days (missing only) ==="
+    Invoke-Py -PyArgs @(
+        (Join-Path $Root "scripts\build_processed_from_ib.py"),
+        "--auto",
+        "--symbol", $Symbol
+    )
 
     # Discover which dates in the window now have processed output (for targeted enrich).
     $processedBase = Join-Path $Root "data\processed\symbol=$Symbol"

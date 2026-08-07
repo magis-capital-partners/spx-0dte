@@ -432,7 +432,7 @@ def baselines_payload_for_live(baselines: dict, train_dates: Sequence[str]) -> d
 
 def extract_baselines_core(payload: dict) -> dict:
     """Strip metadata keys; return the object ``zscore_raw_features`` expects."""
-    meta_keys = {"generated_at", "train_dates", "train_count"}
+    meta_keys = {"generated_at", "train_dates", "train_count", "train_source", "train_note"}
     return {k: v for k, v in payload.items() if k not in meta_keys}
 
 

@@ -19,6 +19,7 @@ ROOT = Path(__file__).resolve().parents[1]
 SIMULATOR = ROOT / "simulator"
 sys.path.insert(0, str(SIMULATOR))
 
+from data_sources import resolve_homogeneous_train_dates  # noqa: E402
 from expiry_calendar import (  # noqa: E402
     DEFAULT_RULES,
     discover_eligible_dates,
@@ -39,16 +40,20 @@ def resolve_train_dates(
     *,
     as_of: str,
     train_count: int,
-) -> list[str]:
-    """Last ``train_count`` eligible dates strictly before ``as_of``."""
+    processed_dir: Path,
+    symbol: str,
+) -> tuple[list[str], str, str]:
+    """Last ``train_count`` SAME-SOURCE eligible dates strictly before ``as_of``.
+
+    Vendor (ThetaData) and IB-recorded days must never share one window —
+    their IV engines carry a systematic offset that corrupts z-scores across
+    the seam. During the post-vendor transition this returns the frozen final
+    vendor window until enough IB days exist, then cuts over automatically.
+    """
     prior = [d for d in eligible if d < as_of]
-    if len(prior) >= train_count:
-        return prior[-train_count:]
-    if len(eligible) >= train_count:
-        return eligible[-train_count:]
-    raise SystemExit(
-        f"Need at least {train_count} eligible dates for baselines; have {len(eligible)}"
-    )
+    if len(prior) < train_count and len(eligible) >= train_count:
+        prior = list(eligible)
+    return resolve_homogeneous_train_dates(processed_dir, symbol, prior, train_count)
 
 
 def main() -> None:
@@ -75,9 +80,18 @@ def main() -> None:
         end=resolved_end,
         eras=eras,
     )
-    train_dates = resolve_train_dates(eligible, as_of=args.as_of, train_count=args.train_count)
+    train_dates, train_source, note = resolve_train_dates(
+        eligible,
+        as_of=args.as_of,
+        train_count=args.train_count,
+        processed_dir=processed,
+        symbol=args.symbol,
+    )
     baselines = compute_baselines(processed, args.symbol, train_dates)
     payload = baselines_payload_for_live(baselines, train_dates)
+    payload["train_source"] = train_source
+    if note:
+        payload["train_note"] = note
 
     out = Path(args.out)
     out.parent.mkdir(parents=True, exist_ok=True)
@@ -85,6 +99,9 @@ def main() -> None:
 
     print(f"Wrote {out}")
     print(f"  train_dates: {train_dates[0]} -> {train_dates[-1]} ({len(train_dates)} days)")
+    print(f"  train_source: {train_source}")
+    if note:
+        print(f"  WARNING: {note}")
     print(f"  as_of: {args.as_of}")
     for feature in baselines["features"]:
         g = baselines["global"][feature]

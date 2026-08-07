@@ -37,6 +37,7 @@ from mbh_simulator import (  # noqa: E402
 from regime_validation import apply_rolling_baseline, discover_dates  # noqa: E402
 from index_daily import csv_path_for_symbol, load_index_daily  # noqa: E402
 from profiles import PRODUCTION_SKEW_GATE  # noqa: E402
+from data_sources import resolve_homogeneous_train_dates  # noqa: E402
 
 LIVE_DIR = ROOT / "data" / "live"
 DEFAULT_PROCESSED = ROOT / "data" / "processed"
@@ -465,7 +466,17 @@ def replay_backtest(
     if idx < train_count:
         return {"available": False, "reason": f"need {train_count} prior eligible days; have {idx}"}
 
-    train_dates = eligible[idx - train_count : idx]
+    # Same single-source window rule the live baselines use (data_sources):
+    # during the vendor->IB transition this is the frozen vendor window, which
+    # is exactly what live z-scored against — so parity stays apples-to-apples.
+    try:
+        train_dates, _train_source, train_note = resolve_homogeneous_train_dates(
+            processed_dir, "SPXW", eligible[:idx], train_count,
+        )
+    except SystemExit as exc:
+        return {"available": False, "reason": str(exc)}
+    if train_note:
+        print(f"[replay] {train_note}")
     apply_rolling_baseline(processed_dir, "SPXW", train_dates, day, "signals_unconditional.csv")
     day_dir = processed_dir / "symbol=SPXW" / f"date={day}"
     quotes = read_quotes_csv(day_dir / "normalized_option_quotes.csv")

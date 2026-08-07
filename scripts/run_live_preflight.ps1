@@ -22,6 +22,18 @@ if ($LASTEXITCODE -ne 0) {
     exit 0
 }
 
+# VIX first: the IB-session converter below enriches signals.csv from this
+# calendar, so yesterday's close must already be present.
+Write-Host "Refreshing VIX daily calendar..."
+& $Python "scripts/download_vix_daily.py"
+if ($LASTEXITCODE -ne 0) { throw "VIX calendar refresh failed (exit $LASTEXITCODE)" }
+
+Write-Host "Converting any IB-recorded sessions to processed days..."
+& $Python "scripts/build_processed_from_ib.py" --auto
+if ($LASTEXITCODE -ne 0) {
+    Write-Warning "IB chain conversion reported a failure; baselines will use previously processed days."
+}
+
 Write-Host "Refreshing live signal baselines..."
 & $Python "scripts/refresh_live_baselines.py"
 if ($LASTEXITCODE -ne 0) { throw "Live baseline refresh failed (exit $LASTEXITCODE)" }
@@ -31,9 +43,5 @@ Write-Host "Compressing completed IB session logs..."
 if ($LASTEXITCODE -ne 0) {
     Write-Warning "IB log compression reported a failure; continuing preflight."
 }
-
-Write-Host "Refreshing VIX daily calendar..."
-& $Python "scripts/download_vix_daily.py"
-if ($LASTEXITCODE -ne 0) { throw "VIX calendar refresh failed (exit $LASTEXITCODE)" }
 
 Write-Host "Live preflight complete. Start the executor manually when ready: python live/ib_executor.py"
