@@ -671,6 +671,8 @@ def build_live(live_dir: Path, account_equity: float) -> dict:
             try:
                 raw = json.loads(recon_path.read_text(encoding="utf-8"))
                 reconcile = {
+                    "signal_parity": raw.get("signal_parity"),
+                    "tranche_signals": raw.get("tranche_signals"),
                     "diff_paper_scale": raw.get("diff_paper_scale"),
                     "diff_normalized_13m": raw.get("diff_normalized_13m"),
                     "backtest_paper_scale": {
@@ -722,6 +724,8 @@ def build_live(live_dir: Path, account_equity: float) -> dict:
             "reconcile": reconcile,
         }
         if resolved_pnl is not None:
+            parity = (reconcile or {}).get("signal_parity") or {}
+            skew_parity = parity.get("skew") or {}
             history.append({
                 "date": d,
                 "execution_type": execution,
@@ -731,6 +735,13 @@ def build_live(live_dir: Path, account_equity: float) -> dict:
                 "pnl_source": pnl_source,
                 "entries": len(entry_rows),
                 "stops": len(stops),
+                # Side mix + signal-parity scalars for the SignalParity panel.
+                "entries_bull_put": sum(1 for r in entry_rows if r.get("side") == "bull_put"),
+                "entries_bear_call": sum(1 for r in entry_rows if r.get("side") == "bear_call"),
+                "skew_parity_mean_abs": skew_parity.get("mean_abs_delta"),
+                "skew_parity_max_abs": skew_parity.get("max_abs_delta"),
+                "skew_gate_flips": skew_parity.get("gate_flips"),
+                "signal_parity_alert": parity.get("alert"),
             })
     totals: Dict[str, dict] = {}
     for row in history:

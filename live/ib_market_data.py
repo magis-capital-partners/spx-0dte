@@ -34,6 +34,10 @@ class CachedQuote:
     delta: Optional[float] = None
     iv: Optional[float] = None
     updated_at: float = 0.0
+    # When delta/iv last CHANGED. ib_insync retains the last modelGreeks object
+    # on the ticker, so every bid/ask tick re-delivers minutes-old greeks;
+    # updated_at alone cannot distinguish fresh IV from a re-stamped relic.
+    greeks_updated_at: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -43,6 +47,9 @@ class FeatureInputHealth:
     max_age_seconds: float = math.inf
     timestamp_dispersion_seconds: float = math.inf
     quote_count: int = 0
+    # Diagnostics-only (no gate): oldest greeks age among the selected
+    # ATM/25-delta quotes. Drives the feature_max_greeks_age_seconds telemetry.
+    greeks_max_age_seconds: float = math.inf
 
 
 def _nearest_listed_strike(listed: Sequence[float], target: float) -> Optional[float]:
@@ -549,11 +556,26 @@ class IBStreamingMarketData:
         updates = [row.updated_at for row in selected]
         max_age = max(ages)
         dispersion = max(updates) - min(updates)
+        # Warn-only telemetry: how old the IV/delta actually are, as opposed to
+        # updated_at which any bid tick refreshes. Enforcement deliberately
+        # deferred until live distributions are known.
+        greeks_stamps = [row.greeks_updated_at for row in selected if row.greeks_updated_at > 0]
+        greeks_max_age = (
+            max(max(0.0, now - stamp) for stamp in greeks_stamps)
+            if len(greeks_stamps) == len(selected)
+            else math.inf
+        )
         if max_age_seconds > 0 and max_age > max_age_seconds:
-            return FeatureInputHealth(False, "stale_feature_quotes", max_age, dispersion, 4)
+            return FeatureInputHealth(False, "stale_feature_quotes", max_age, dispersion, 4, greeks_max_age)
         if max_dispersion_seconds > 0 and dispersion > max_dispersion_seconds:
-            return FeatureInputHealth(False, "unsynchronized_feature_quotes", max_age, dispersion, 4)
-        return FeatureInputHealth(True, max_age_seconds=max_age, timestamp_dispersion_seconds=dispersion, quote_count=4)
+            return FeatureInputHealth(False, "unsynchronized_feature_quotes", max_age, dispersion, 4, greeks_max_age)
+        return FeatureInputHealth(
+            True,
+            max_age_seconds=max_age,
+            timestamp_dispersion_seconds=dispersion,
+            quote_count=4,
+            greeks_max_age_seconds=greeks_max_age,
+        )
 
     def refresh_spread_legs(
         self,
@@ -949,7 +971,22 @@ class IBStreamingMarketData:
         key: QuoteKey = (self.expiry_0dte_iso, opt_type, float(contract.strike))
         bid, ask = _ticker_bid_ask(ticker, delayed_fallback=self._delayed_fallback)
         delta, iv = _ticker_greeks(ticker)
-        self._cache[key] = CachedQuote(bid=bid, ask=ask, delta=delta, iv=iv, updated_at=_time.time())
+        now_ts = _time.time()
+        prev = self._cache.get(key)
+        # Advance greeks_updated_at only when the values actually moved: a
+        # retained modelGreeks object re-delivered on a bid tick compares
+        # equal and keeps its original stamp. (A genuine tick to identical
+        # values also keeps the old stamp — conservative, diagnostics-only.)
+        if delta is None and iv is None:
+            greeks_ts = prev.greeks_updated_at if prev is not None else 0.0
+        elif prev is not None and prev.delta == delta and prev.iv == iv:
+            greeks_ts = prev.greeks_updated_at or now_ts
+        else:
+            greeks_ts = now_ts
+        self._cache[key] = CachedQuote(
+            bid=bid, ask=ask, delta=delta, iv=iv,
+            updated_at=now_ts, greeks_updated_at=greeks_ts,
+        )
         self._check_stop_wake(opt_type, float(contract.strike), ask)
 
     def _log_chain_health(self, spot: float, quotes: Sequence[OptionQuote]) -> None:

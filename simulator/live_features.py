@@ -118,6 +118,14 @@ class SessionFeatureState:
     spot_history: List[float] = field(default_factory=list)
     last_sample_minute: Optional[str] = None
     last_raw_features: Dict[str, float] = field(default_factory=dict)
+    # True once the cached minute's term_ratio_z was computed with next-expiry
+    # quotes. Non-tranche polls have no next-expiry chain, so the first poll of
+    # a minute can cache term_ratio_z=0.0; the tranche poll must be able to
+    # upgrade it in place (see compute_raw_features_once_per_minute).
+    last_minute_had_next_expiry: bool = False
+    # Forensic skew-leg snapshot for the canonical minute (strikes/IVs/spot).
+    # Telemetry only — deliberately not persisted by to_dict/from_dict.
+    last_raw_components: Dict[str, object] = field(default_factory=dict)
 
     def to_dict(self) -> dict:
         return {
@@ -128,6 +136,7 @@ class SessionFeatureState:
             "spot_history": list(self.spot_history[-390:]),
             "last_sample_minute": self.last_sample_minute,
             "last_raw_features": dict(self.last_raw_features),
+            "last_minute_had_next_expiry": self.last_minute_had_next_expiry,
         }
 
     @classmethod
@@ -145,6 +154,9 @@ class SessionFeatureState:
                 str(k): float(v)
                 for k, v in (payload.get("last_raw_features") or {}).items()
             },
+            last_minute_had_next_expiry=bool(
+                payload.get("last_minute_had_next_expiry", False)
+            ),
         )
 
 
@@ -185,14 +197,33 @@ def choose_atm_pair(
 
 
 def choose_delta(
-    quotes: Sequence[OptionQuote], option_type: str, target_abs_delta: float
+    quotes: Sequence[OptionQuote],
+    option_type: str,
+    target_abs_delta: float,
+    *,
+    require_iv: bool = False,
 ) -> Optional[OptionQuote]:
+    """Nearest-|delta| quote of the given right.
+
+    ``require_iv`` restricts candidates to quotes with a usable implied vol.
+    The skew feature is ``put_iv - call_iv``: without the filter, a leg whose
+    IV the feed withheld selects normally and then contributes 0.0, collapsing
+    skew to ±other_leg_iv (~0.20 raw ≈ +6-8 z) — under the sanity bound, so it
+    would trade. It also aligns this selector's pool with the one
+    ``feature_input_health`` validates (which is already IV-filtered).
+    """
     right = option_type.upper()
     candidates = [
         q
         for q in quotes
         if q.option_type.upper() == right and q.delta is not None and not math.isnan(q.delta)
     ]
+    if require_iv:
+        candidates = [
+            q
+            for q in candidates
+            if q.iv is not None and math.isfinite(float(q.iv)) and float(q.iv) > 0
+        ]
     if not candidates:
         return None
     return min(candidates, key=lambda row: abs(abs(float(row.delta)) - target_abs_delta))
@@ -230,8 +261,10 @@ def compute_raw_features(
         baseline = state.first_straddle * (mins / state.first_minutes)
     straddle_residual_z = (straddle - baseline) / max(state.first_straddle, 1e-9)
 
-    put_25 = choose_delta(quotes, "PUT", 0.25)
-    call_25 = choose_delta(quotes, "CALL", 0.25)
+    # require_iv: an IV-less leg must fail selection (skew falls back to 0.0)
+    # rather than silently zeroing one side of the difference.
+    put_25 = choose_delta(quotes, "PUT", 0.25, require_iv=True)
+    call_25 = choose_delta(quotes, "CALL", 0.25, require_iv=True)
     skew_z = 0.0
     if put_25 and call_25:
         put_iv = float(put_25.iv or 0.0)
@@ -256,6 +289,20 @@ def compute_raw_features(
     realized = realized_vs_implied_raw(
         state.spot_history, spot=spot, straddle=straddle, atm_iv=atm_iv
     )
+
+    # Forensic snapshot of the skew inputs. skew_z is IV-source-sensitive
+    # (IB modelGreeks live vs ThetaData in the backtest baselines), and the
+    # legs are otherwise discarded here — without this record a post-session
+    # parity investigation cannot tell WHICH strike/IV produced the z-score.
+    state.last_raw_components = {
+        "put25_strike": put_25.strike if put_25 else None,
+        "put25_iv": float(put_25.iv) if put_25 and put_25.iv is not None else None,
+        "call25_strike": call_25.strike if call_25 else None,
+        "call25_iv": float(call_25.iv) if call_25 and call_25.iv is not None else None,
+        "atm_straddle": round(straddle, 4),
+        "atm_iv": round(atm_iv, 6) if atm_iv is not None and math.isfinite(atm_iv) else None,
+        "spot": round(float(spot), 3),
+    }
 
     return {
         "straddle_residual_z": straddle_residual_z,
@@ -283,6 +330,20 @@ def compute_raw_features_once_per_minute(
     sample_ts = ts.replace(second=0, microsecond=0, tzinfo=None)
     minute = sample_ts.isoformat(timespec="minutes")
     if state.last_sample_minute == minute and state.last_raw_features:
+        if next_expiry_quotes and not state.last_minute_had_next_expiry:
+            # The canonical observation for this minute came from a poll with
+            # no next-expiry chain, so term_ratio_z was cached as 0.0 — which
+            # z-scores far from 0 (e.g. +3.86 at 09:32) and can spuriously
+            # gate every candidate with term_structure_dislocation. Upgrade
+            # just the term ratio in place; never re-advance session state.
+            straddle, _, _ = _atm_straddle_from_quotes(quotes, spot)
+            next_straddle, _, _ = _atm_straddle_from_quotes(next_expiry_quotes, spot)
+            if (
+                math.isfinite(straddle) and straddle > 0
+                and math.isfinite(next_straddle) and next_straddle > 0
+            ):
+                state.last_raw_features["term_ratio_z"] = (straddle / next_straddle) - 1.0
+                state.last_minute_had_next_expiry = True
         return dict(state.last_raw_features)
 
     before = len(state.spot_history)
@@ -298,6 +359,7 @@ def compute_raw_features_once_per_minute(
     if len(state.spot_history) > before:
         state.last_sample_minute = minute
         state.last_raw_features = dict(raw)
+        state.last_minute_had_next_expiry = bool(next_expiry_quotes)
     return raw
 
 
@@ -390,3 +452,16 @@ def validate_baselines_freshness(payload: dict, max_age_days: int) -> None:
         )
     if not payload.get("train_dates"):
         raise ValueError("baselines file missing train_dates — run scripts/refresh_live_baselines.py")
+    # zscore_raw_features subscripts baselines["global"][feature] unguarded on
+    # every minute; a structurally broken payload must die here at startup,
+    # not as a mid-session KeyError.
+    global_stats = payload.get("global")
+    if not isinstance(global_stats, dict) or not global_stats:
+        raise ValueError("baselines file missing global stats — run scripts/refresh_live_baselines.py")
+    missing = [feature for feature in FEATURES if feature not in global_stats]
+    if missing:
+        raise ValueError(
+            f"baselines global stats missing features {missing} — run scripts/refresh_live_baselines.py"
+        )
+    if not isinstance(payload.get("minutes"), dict):
+        raise ValueError("baselines file missing minutes map — run scripts/refresh_live_baselines.py")

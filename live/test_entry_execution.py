@@ -16,12 +16,14 @@ sys.path.insert(0, str(ROOT / "live"))
 from live_config import LiveConfig  # noqa: E402
 from mbh_simulator import CandidateRecord, OptionQuote  # noqa: E402
 from entry_execution import (  # noqa: E402
+    EntryQualityResult,
     PendingEntry,
     evaluate_entry_quality,
     entry_limit_credit,
     entry_quote_block_reason,
     natural_credit,
     poll_pending_entry,
+    refresh_pending_entry_quality,
     work_deadline,
 )
 
@@ -584,6 +586,125 @@ class PollPendingEntryTests(unittest.TestCase):
         self.assertEqual(resolution["contracts"], 1)
         self.assertEqual(resolution["tranche_time"], "2026-07-29T09:49:00")
         self.assertEqual(ib.place_calls, 0)
+
+
+class _FakeQualityProvider:
+    """Returns a scripted sequence of quality results, one per evaluate call."""
+
+    def __init__(self, results: List[EntryQualityResult]):
+        self._results = results
+        self.refresh_calls = 0
+        self.evaluate_calls = 0
+
+    def refresh_candidate_legs(self, _candidate, _now):
+        self.refresh_calls += 1
+
+    def evaluate_candidate_quality(
+        self, _candidate, _now, *, reference_spot, reference_credit, reference_short_delta,
+    ):
+        result = self._results[min(self.evaluate_calls, len(self._results) - 1)]
+        self.evaluate_calls += 1
+        return result
+
+
+class RefreshPendingEntryQualityTests(unittest.TestCase):
+    def test_diagnostics_freeze_once_cancel_is_requested(self) -> None:
+        """Regression: a rejection logged for quote_desync must carry the
+        diagnostics that actually triggered the cancel, not values from a
+        later poll that would have passed."""
+        now = datetime(2026, 7, 29, 9, 49, 0)
+        ib = _FakeIB()
+        trade = _FakeTrade("Submitted")
+        pending = _pending(trade, now=now, next_ladder_in=-1.0)
+        pending.reference_spot = 7500.0
+        pending.reference_natural_credit = 3.15
+        pending.reference_short_delta = 0.15
+        live = LiveConfig(entry_ladder_step=0.05)
+
+        desync_result = EntryQualityResult(
+            False,
+            "quote_desync",
+            {
+                "entry_quality_reason": "quote_desync",
+                "entry_quality_quote_dispersion_seconds": 2.4,
+            },
+        )
+        ok_result = EntryQualityResult(
+            True,
+            diagnostics={
+                "entry_quality_reason": "ok",
+                "entry_quality_quote_dispersion_seconds": 0.26,
+            },
+        )
+        provider = _FakeQualityProvider([desync_result, ok_result, ok_result])
+
+        # Poll 1: the quote-desync check fails and a cancel is requested.
+        quality_block = refresh_pending_entry_quality(provider, pending, now)
+        self.assertEqual(quality_block, "entry_quality_quote_desync")
+        remaining, resolution = poll_pending_entry(
+            ib, pending, live, "2026-07-29", now,
+            log_event=lambda *_a, **_k: None,
+            quality_block_reason=quality_block,
+        )
+        self.assertIsNone(resolution)
+        assert remaining is not None
+        self.assertIsNotNone(remaining.cancel_requested_at)
+        self.assertEqual(remaining.entry_diagnostics["entry_quality_reason"], "quote_desync")
+
+        # Poll 2: cancel is in flight. A fresh quote check would now pass, but
+        # it must not run — the diagnostics that justified the cancel stay frozen.
+        later = now + timedelta(seconds=0.3)
+        quality_block2 = refresh_pending_entry_quality(provider, remaining, later)
+        self.assertEqual(quality_block2, "")
+        self.assertEqual(provider.evaluate_calls, 1)
+        self.assertEqual(provider.refresh_calls, 1)
+        self.assertEqual(remaining.entry_diagnostics["entry_quality_reason"], "quote_desync")
+        self.assertEqual(
+            remaining.entry_diagnostics["entry_quality_quote_dispersion_seconds"], 2.4,
+        )
+
+        # IB confirms the cancel: the logged rejection must be self-consistent.
+        trade.orderStatus.status = "Cancelled"
+        final, res_final = poll_pending_entry(
+            ib, remaining, live, "2026-07-29", later + timedelta(seconds=0.5),
+            log_event=lambda *_a, **_k: None,
+            quality_block_reason=quality_block2,
+        )
+        self.assertIsNone(final)
+        assert res_final is not None
+        self.assertEqual(res_final["event"], "order_rejected")
+        self.assertEqual(res_final["reason"], "entry_quality_quote_desync")
+        self.assertEqual(res_final["entry_quality_reason"], "quote_desync")
+        self.assertEqual(res_final["entry_quality_quote_dispersion_seconds"], 2.4)
+
+    def test_no_active_pending_still_refreshes_when_not_cancelling(self) -> None:
+        now = datetime(2026, 7, 29, 9, 49, 0)
+        trade = _FakeTrade("Submitted")
+        pending = _pending(trade, now=now, next_ladder_in=-1.0)
+        pending.reference_spot = 7500.0
+        pending.reference_natural_credit = 3.15
+        pending.reference_short_delta = 0.15
+        ok_result = EntryQualityResult(True, diagnostics={"entry_quality_reason": "ok"})
+        provider = _FakeQualityProvider([ok_result])
+
+        quality_block = refresh_pending_entry_quality(provider, pending, now)
+
+        self.assertEqual(quality_block, "")
+        self.assertEqual(provider.refresh_calls, 1)
+        self.assertEqual(provider.evaluate_calls, 1)
+        self.assertEqual(pending.entry_diagnostics["entry_quality_reason"], "ok")
+
+    def test_missing_reference_data_skips_refresh(self) -> None:
+        now = datetime(2026, 7, 29, 9, 49, 0)
+        trade = _FakeTrade("Submitted")
+        pending = _pending(trade, now=now, next_ladder_in=-1.0)
+        provider = _FakeQualityProvider([EntryQualityResult(True)])
+
+        quality_block = refresh_pending_entry_quality(provider, pending, now)
+
+        self.assertEqual(quality_block, "")
+        self.assertEqual(provider.refresh_calls, 0)
+        self.assertEqual(provider.evaluate_calls, 0)
 
 
 if __name__ == "__main__":

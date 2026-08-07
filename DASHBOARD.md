@@ -12,6 +12,25 @@ The interactive site is deployed from the **`docs/`** folder on **`main`** (GitH
 
 **Live Session-now (cloud):** sanitized status is **not** deployed via Pages. Trading PCs upload `live_status.json` to a public gist; the dashboard reads the URL in [`docs/data/live_status_url.json`](docs/data/live_status_url.json). See [`live/README.md`](live/README.md) → Dashboard Session now.
 
+## Signal parity monitoring
+
+`simulator/reconcile_live.py` (run per session by `daily_data_update.ps1`) writes a
+`signal_parity` block into each day's `reconcile.json`: live-vs-backtest z tracking for
+`skew_z`/`trend_score` over all matched minutes, plus **gate flips** — tranches where the
+two paths sat on opposite sides of the ±0.65 skew side-gate. Surfaced in three places:
+
+- **Overview → "Signal parity"** panel: per-day mean/max |Δz| chart with the 0.30 alert
+  bar and 0.65 gate reference, side mix (bull_put/bear_call), and per-day ALERT badges.
+- **Daily drill-down → "Tranche signal parity"** table: minute-matched live/backtest
+  z-scores; rows highlighted when they straddle the gate.
+- **Session now → "Skew z (last tranche)"** chip: intraday gate proximity from the gist
+  (`last_tranche`, published by the Status API).
+
+The post-close job logs `WARNING SIGNAL_PARITY_ALERT <date>` when a day's skew mean|Δz|
+exceeds 0.30 or gate flips ≥ 3. Raw skew-leg forensics (25Δ strikes + IB IVs per tranche)
+land in `tranches.jsonl` (`raw_features` / `raw_components` / `baseline_stats`) for
+offline vendor-IV comparison.
+
 ## GitHub Pages settings
 
 **Settings → Pages → Build and deployment:**

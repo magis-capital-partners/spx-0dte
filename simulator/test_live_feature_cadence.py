@@ -58,6 +58,46 @@ class LiveFeatureCadenceTests(unittest.TestCase):
         self.assertEqual(state.spot_history, [100.0, 102.0])
         self.assertAlmostEqual(raw["trend_score"], 0.2, places=6)
 
+    def test_tranche_poll_upgrades_cached_term_ratio(self) -> None:
+        """A non-tranche poll caching term_ratio_z=0.0 must not poison the
+        tranche poll landing later in the same minute (raw 0.0 z-scores to
+        ~+3.9 and would gate every candidate term_structure_dislocation)."""
+        state = SessionFeatureState()
+        first = datetime(2026, 8, 3, 10, 2, 1)
+        # Poll without next-expiry quotes establishes the canonical minute.
+        raw_first = compute_raw_features_once_per_minute(
+            _quotes(first, 100.0), 100.0, first, state
+        )
+        self.assertEqual(raw_first["term_ratio_z"], 0.0)
+        self.assertFalse(state.last_minute_had_next_expiry)
+
+        # Tranche poll in the same minute supplies the next-expiry chain:
+        # 0DTE straddle mid = 10.0, next-expiry straddle mid = 16.0.
+        next_expiry = [
+            OptionQuote(first, "2026-08-05", "CALL", 100.0, 7.9, 8.1, 0.50, 0.22, 100.0),
+            OptionQuote(first, "2026-08-05", "PUT", 100.0, 7.9, 8.1, -0.50, 0.22, 100.0),
+        ]
+        raw_tranche = compute_raw_features_once_per_minute(
+            _quotes(first.replace(second=30), 100.0),
+            100.0,
+            first.replace(second=30),
+            state,
+            next_expiry_quotes=next_expiry,
+        )
+        self.assertAlmostEqual(raw_tranche["term_ratio_z"], 10.0 / 16.0 - 1.0, places=6)
+        self.assertTrue(state.last_minute_had_next_expiry)
+        # State advanced exactly once for the minute.
+        self.assertEqual(state.spot_history, [100.0])
+
+        # A later poll without next-expiry data keeps the upgraded value.
+        raw_again = compute_raw_features_once_per_minute(
+            _quotes(first.replace(second=50), 100.0),
+            100.0,
+            first.replace(second=50),
+            state,
+        )
+        self.assertAlmostEqual(raw_again["term_ratio_z"], 10.0 / 16.0 - 1.0, places=6)
+
 
 if __name__ == "__main__":
     unittest.main()

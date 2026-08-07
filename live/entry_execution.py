@@ -364,6 +364,48 @@ def _resolve_terminal_or_reject(
     return None, _entry_reject_event(pending, reason=reason)
 
 
+def refresh_pending_entry_quality(
+    ib_provider: Any,
+    pending: PendingEntry,
+    now: datetime,
+) -> str:
+    """Re-evaluate live quote quality for a still-working entry.
+
+    A no-op once ``pending.cancel_requested_at`` is set: a cancel already in
+    flight owns the pending (see ``poll_pending_entry``), and refreshing legs
+    here would overwrite ``pending.entry_diagnostics`` with fresh, possibly
+    passing values on later polls — making the eventual rejection log
+    self-contradictory (reason says one thing, attached diagnostics say
+    another). Freezing the snapshot that triggered the cancel also skips
+    pointless IB quote work while the order is on its way out.
+    """
+    if pending.cancel_requested_at is not None:
+        return ""
+    if (
+        ib_provider is None
+        or pending.reference_spot is None
+        or pending.reference_natural_credit is None
+        or pending.reference_short_delta is None
+    ):
+        return ""
+    ib_provider.refresh_candidate_legs(pending.candidate, now)
+    quality = ib_provider.evaluate_candidate_quality(
+        pending.candidate,
+        now,
+        reference_spot=pending.reference_spot,
+        reference_credit=pending.reference_natural_credit,
+        reference_short_delta=pending.reference_short_delta,
+    )
+    if quality.diagnostics:
+        pending.entry_diagnostics = {
+            **(pending.entry_diagnostics or {}),
+            **quality.diagnostics,
+        }
+    if not quality.ok:
+        return f"entry_quality_{quality.reason}"
+    return ""
+
+
 def poll_pending_entry(
     ib,
     pending: PendingEntry,

@@ -100,11 +100,13 @@ from entry_execution import (  # noqa: E402
     pending_is_awaiting_cancel,
     pending_trade_is_active,
     poll_pending_entry,
+    refresh_pending_entry_quality,
     round_spx_premium,
     teardown_fill_event,
     work_deadline,
 )
 from live_features import (  # noqa: E402
+    FEATURES,
     DeterministicMinuteSampler,
     SessionFeatureState,
     compute_raw_features_once_per_minute,
@@ -477,6 +479,39 @@ class IBSignalProvider:
     def load_baselines(path: Path, max_age_days: int) -> tuple[dict, dict]:
         return load_baselines_file(path, max_age_days)
 
+    def signal_forensics(self) -> Dict[str, Any]:
+        """Raw pre-zscore features + skew-leg components + the baseline stats
+        actually used — the other half of every logged z-score. Attached to
+        tranche rows so post-session parity work (IB modelGreeks IV vs vendor
+        IV) has a per-minute record instead of only the z-space output."""
+        state = self._feature_state
+        if not state.last_raw_features or not state.last_sample_minute:
+            return {}
+        out: Dict[str, Any] = {
+            "sample_minute": state.last_sample_minute,
+            "raw_features": {
+                key: round(float(value), 6)
+                for key, value in state.last_raw_features.items()
+            },
+        }
+        if state.last_raw_components:
+            out["raw_components"] = dict(state.last_raw_components)
+        if self.baselines:
+            minute = state.last_sample_minute.split("T", 1)[-1][:5]
+            minute_stats = (self.baselines.get("minutes") or {}).get(minute, {})
+            global_stats = self.baselines.get("global") or {}
+            stats: Dict[str, Any] = {}
+            for feature in FEATURES:
+                entry = minute_stats.get(feature) or global_stats.get(feature)
+                if entry:
+                    stats[feature] = {
+                        "mean": round(float(entry["mean"]), 6),
+                        "std": round(float(entry["std"]), 6),
+                    }
+            if stats:
+                out["baseline_stats"] = stats
+        return out
+
     def start(self) -> None:
         self._stream.start()
 
@@ -643,6 +678,10 @@ class IBSignalProvider:
             "feature_max_age_seconds": round(health.max_age_seconds, 3),
             "feature_timestamp_dispersion_seconds": round(health.timestamp_dispersion_seconds, 3),
         })
+        if math.isfinite(health.greeks_max_age_seconds):
+            self.last_signal_diagnostics["feature_max_greeks_age_seconds"] = round(
+                health.greeks_max_age_seconds, 3,
+            )
         if not health.ok:
             self.last_signal_block_reason = health.reason
             return None
@@ -2908,6 +2947,10 @@ def _process_tranche(
     tranche_row = _tranche_log_dict(summary)
     tranche_row["executed"] = executed
     tranche_row["entry_working"] = entry_working
+    if provider is not None:
+        # Raw features / skew legs / baseline stats — additive keys so the
+        # reconcile reader and any jsonl consumer are unaffected.
+        tranche_row.update(provider.signal_forensics())
     log_tranche(today, tranche_row)
     print(f"[{now.isoformat()}] {_format_tranche_console(summary, executed)}")
 
@@ -3722,29 +3765,9 @@ def run(live: LiveConfig = ACTIVE) -> None:
                     active_pending = pending_entry
                     resolution = None
                     try:
-                        quality_block = ""
-                        if (
-                            ib_provider is not None
-                            and active_pending.reference_spot is not None
-                            and active_pending.reference_natural_credit is not None
-                            and active_pending.reference_short_delta is not None
-                        ):
-                            check_now = datetime.now()
-                            ib_provider.refresh_candidate_legs(active_pending.candidate, check_now)
-                            quality = ib_provider.evaluate_candidate_quality(
-                                active_pending.candidate,
-                                check_now,
-                                reference_spot=active_pending.reference_spot,
-                                reference_credit=active_pending.reference_natural_credit,
-                                reference_short_delta=active_pending.reference_short_delta,
-                            )
-                            if quality.diagnostics:
-                                active_pending.entry_diagnostics = {
-                                    **(active_pending.entry_diagnostics or {}),
-                                    **quality.diagnostics,
-                                }
-                            if not quality.ok:
-                                quality_block = f"entry_quality_{quality.reason}"
+                        quality_block = refresh_pending_entry_quality(
+                            ib_provider, active_pending, datetime.now(),
+                        )
                         pending_entry, resolution = poll_pending_entry(
                             ib,
                             active_pending,

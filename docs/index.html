@@ -224,6 +224,19 @@ function SessionNow() {
             <div className="card"><div className="k">Marked return / margin</div><div className={"v "+cls(risk.marked_return_on_margin_pct)}>{risk.marked_return_on_margin_pct==null?MISSING:fmtPct(risk.marked_return_on_margin_pct)}</div></div>
             <div className="card"><div className="k">Halted</div><div className="v">{halted ? <span className="pill halt">Yes</span> : "No"}</div></div>
             <div className="card"><div className="k">Flattened</div><div className="v">{flat ? <span className="pill halt">Yes</span> : "No"}</div></div>
+            {src.last_tranche && src.last_tranche.skew_z != null && (()=>{
+              const GATE = 0.65;
+              const z = Number(src.last_tranche.skew_z);
+              const dist = GATE - Math.abs(z);
+              const nearGate = dist <= 0.10;
+              const side = z <= -GATE ? "bull_put blocked" : (z >= GATE ? "bear_call blocked" : (dist<=0.10 ? "near gate" : "both sides open"));
+              return (
+                <div className="card"><div className="k">Skew z (last tranche)</div>
+                  <div className={"v" + (nearGate ? " neg" : "")} style={{fontSize:16}}>{z.toFixed(2)}</div>
+                  <div className="sub">{side} · gate ±{GATE}</div>
+                </div>
+              );
+            })()}
             <div className="card"><div className="k">Heartbeat</div><div className="v" style={{fontSize:15}}>{ageLabel(src.heartbeat_ts)}</div></div>
             <div className="card"><div className="k">Status as of</div><div className="v" style={{fontSize:15}}>{ageLabel(src.generated_at || src.heartbeat_ts)}</div></div>
           </div>
@@ -542,6 +555,7 @@ function Overview({data}) {
         <BarChart data={dailyBars}/>
       </div>
       <VolPanel run={focusRun} targets={data.mbh_targets}/>
+      <SignalParity data={data}/>
       <BenchmarkPanel data={{...data, runs:[focusRun].filter(Boolean)}}/>
       {multi && (
         <div className="panel">
@@ -748,6 +762,7 @@ function Daily({data}) {
           </p>
         </div>
       )}
+      {liveEnabled && liveDay && <TrancheParityTable recon={recon}/>}
       {executionHistory.length > 0 && <div className="panel">
         <h2>Recorded execution P&amp;L ledger</h2>
         <p className="sub" style={{marginTop:0}}>
@@ -766,6 +781,95 @@ function Daily({data}) {
           </tr>)}</tbody>
         </table>
       </div>}
+    </div>
+  );
+}
+
+function SignalParity({data}) {
+  // Live-vs-backtest signal tracking: skew_z drives side selection through a
+  // hard +/-gate, and live IV (IB modelGreeks) does not perfectly track the
+  // vendor IV the baselines/backtest use. reconcile_live.py measures the
+  // divergence per session; this panel makes it visible before it becomes a
+  // "why is live all bear_call?" investigation.
+  const hist = (data.live?.history || []).filter(r => r.skew_parity_mean_abs != null);
+  if (!hist.length) return null;
+  const days = data.live?.days || {};
+  const lastDate = hist[hist.length-1].date;
+  const gate = days[lastDate]?.reconcile?.signal_parity?.skew?.gate ?? 0.65;
+  const alertBar = 0.30;
+  const series = [
+    {name:"mean |Δz| (day)", color:COLORS[0], points:hist.map(r=>({x:r.date,y:r.skew_parity_mean_abs}))},
+    {name:"max |Δz| (day)", color:COLORS[3], points:hist.map(r=>({x:r.date,y:r.skew_parity_max_abs}))},
+    {name:`alert ${alertBar}`, color:"#8a5a00", points:hist.map(r=>({x:r.date,y:alertBar}))},
+    {name:`side gate ${gate}`, color:"#f85149", points:hist.map(r=>({x:r.date,y:gate}))},
+  ];
+  const alerts = hist.filter(r=>r.signal_parity_alert).length;
+  return (
+    <div className="panel">
+      <h2>Signal parity — live skew_z vs backtest replay</h2>
+      <p className="sub" style={{marginTop:0}}>
+        Per-day tracking error of the live skew signal against the same-minute backtest replay.
+        A |Δz| above the side gate ({gate}) means live and backtest could pick opposite sides
+        from the same market. {alerts>0 ? <>Alert days: <span className="pill halt">{alerts}</span></> : "No alert days."}
+      </p>
+      <div className="legend" style={{marginBottom:10}}>
+        {series.map((s,i)=>(
+          <span key={i}><span className="swatch" style={{background:s.color}}></span>{s.name}</span>
+        ))}
+      </div>
+      <LineChart series={series} height={240} yLabel="|Δ z|" formatY={(y)=>Number(y).toFixed(2)}/>
+      <table style={{marginTop:12}}>
+        <thead><tr><th>Date</th><th>Sides P/C</th><th>mean |Δz|</th><th>max |Δz|</th><th>Gate flips</th><th>Status</th></tr></thead>
+        <tbody>{hist.slice(-10).reverse().map((row,i)=>(
+          <tr key={i}>
+            <td>{row.date}</td>
+            <td>{row.entries_bull_put ?? 0} / {row.entries_bear_call ?? 0}</td>
+            <td>{row.skew_parity_mean_abs==null?MISSING:Number(row.skew_parity_mean_abs).toFixed(2)}</td>
+            <td>{row.skew_parity_max_abs==null?MISSING:Number(row.skew_parity_max_abs).toFixed(2)}</td>
+            <td>{row.skew_gate_flips ?? MISSING}</td>
+            <td>{row.signal_parity_alert ? <span className="pill halt">ALERT</span> : <span className="pill">ok</span>}</td>
+          </tr>
+        ))}</tbody>
+      </table>
+      <p className="sub" style={{margin:"8px 0 0"}}>
+        Sides P/C = bull_put / bear_call entries. Gate flips = tranches where live and backtest
+        z-scores sat on opposite sides of the ±{gate} skew gate. Source: reconcile.json signal_parity
+        (all matched minutes, computed daily post-close).
+      </p>
+    </div>
+  );
+}
+
+function TrancheParityTable({recon}) {
+  const rows = recon?.tranche_signals || [];
+  if (!rows.length) return null;
+  const gate = recon?.signal_parity?.skew?.gate ?? 0.65;
+  const flip = (lv, bt) => lv!=null && bt!=null && (((lv < -gate) !== (bt < -gate)) || ((lv > gate) !== (bt > gate)));
+  return (
+    <div className="panel">
+      <h2>Tranche signal parity — live vs backtest replay</h2>
+      <p className="sub" style={{marginTop:0}}>
+        Minute-matched z-scores. Rows highlighted when live and backtest straddle the ±{gate} skew gate —
+        those are minutes where side selection could have diverged.
+      </p>
+      <table>
+        <thead><tr><th>Time</th><th>Live action</th><th>Skew live</th><th>Skew BT</th><th>Δ</th><th>Trend live</th><th>Trend BT</th><th>Δ</th></tr></thead>
+        <tbody>{rows.map((r,i)=>{
+          const isFlip = flip(r.live_skew_z, r.backtest_skew_z);
+          return (
+            <tr key={i} style={isFlip?{background:"rgba(248,81,73,0.12)"}:undefined}>
+              <td>{r.time}</td>
+              <td className="muted">{r.live_executed>0 ? `entry ×${r.live_executed}` : (r.live_skip || "—")}</td>
+              <td>{fmtNum(r.live_skew_z,2)}</td>
+              <td>{fmtNum(r.backtest_skew_z,2)}</td>
+              <td className={Math.abs(r.skew_delta||0)>gate?"neg":""}>{fmtNum(r.skew_delta,2)}</td>
+              <td>{fmtNum(r.live_trend_z,2)}</td>
+              <td>{fmtNum(r.backtest_trend_z,2)}</td>
+              <td>{fmtNum(r.trend_delta,2)}</td>
+            </tr>
+          );
+        })}</tbody>
+      </table>
     </div>
   );
 }

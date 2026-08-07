@@ -36,10 +36,18 @@ from mbh_simulator import (  # noqa: E402
 )
 from regime_validation import apply_rolling_baseline, discover_dates  # noqa: E402
 from index_daily import csv_path_for_symbol, load_index_daily  # noqa: E402
+from profiles import PRODUCTION_SKEW_GATE  # noqa: E402
 
 LIVE_DIR = ROOT / "data" / "live"
 DEFAULT_PROCESSED = ROOT / "data" / "processed"
 NORMALIZED_EQUITY = 13_000_000.0
+# Live tracking-error alert bar: mean |live - backtest| z-delta per day. The
+# Aug 2026 investigation measured 0.735 z per-minute tracking error against a
+# 0.65 gate half-width; 0.30 flags roughly the worst one-third of those days.
+PARITY_MEAN_DELTA_ALERT = 0.30
+PARITY_GATE_FLIPS_ALERT = 3
+# Trend gate in the production profile (candidate_max_adverse_trend).
+PRODUCTION_TREND_GATE = 1.0
 
 
 def settlement_close(day: str) -> Optional[float]:
@@ -236,20 +244,74 @@ def _tranche_signal_diffs(
         snap = replay_by_minute.get(ts)
         if snap is None:
             continue
-        diffs.append(
-            {
-                "time": ts.strftime("%H:%M"),
-                "live_skip": row.get("skip_reason") or ("entry" if row.get("executed") else ""),
-                "live_executed": executed_by_tranche.get(ts, row.get("executed", 0)),
-                "live_trend_z": round(float(row.get("trend_score", 0.0)), 3),
-                "backtest_trend_z": round(snap.trend_score, 3),
-                "trend_delta": round(float(row.get("trend_score", 0.0)) - snap.trend_score, 3),
-                "live_skew_z": round(float(row.get("skew_z", 0.0)), 3),
-                "backtest_skew_z": round(snap.skew_z, 3),
-                "skew_delta": round(float(row.get("skew_z", 0.0)) - snap.skew_z, 3),
-            }
-        )
+        entry = {
+            "time": ts.strftime("%H:%M"),
+            "live_skip": row.get("skip_reason") or ("entry" if row.get("executed") else ""),
+            "live_executed": executed_by_tranche.get(ts, row.get("executed", 0)),
+            "live_trend_z": round(float(row.get("trend_score", 0.0)), 3),
+            "backtest_trend_z": round(snap.trend_score, 3),
+            "trend_delta": round(float(row.get("trend_score", 0.0)) - snap.trend_score, 3),
+            "live_skew_z": round(float(row.get("skew_z", 0.0)), 3),
+            "backtest_skew_z": round(snap.skew_z, 3),
+            "skew_delta": round(float(row.get("skew_z", 0.0)) - snap.skew_z, 3),
+        }
+        # Raw-space forensics ride along when the executor logged them
+        # (post-Aug-2026 sessions): the direct record of which IB IVs
+        # produced the live z, joinable against vendor IV offline.
+        raw = row.get("raw_features") or {}
+        components = row.get("raw_components") or {}
+        if raw.get("skew_z") is not None:
+            entry["live_raw_skew"] = raw["skew_z"]
+        for key in ("put25_iv", "call25_iv", "put25_strike", "call25_strike"):
+            if components.get(key) is not None:
+                entry[f"live_{key}"] = components[key]
+        diffs.append(entry)
     return diffs
+
+
+def _gate_flip(live_z: float, backtest_z: float, gate: float) -> bool:
+    """True when live and backtest sit on opposite sides of a ±gate cliff.
+
+    That is the failure mode that matters: the two paths would have made
+    different side-selection decisions from the same market.
+    """
+    return (
+        (live_z < -gate) != (backtest_z < -gate)
+        or (live_z > gate) != (backtest_z > gate)
+    )
+
+
+def _signal_parity_summary(diffs: List[dict]) -> dict:
+    """Per-feature live-vs-backtest tracking stats over ALL matched minutes.
+
+    Feeds the dashboard SignalParity panel and the post-close alert; computed
+    before the 50-row table cap so the stats never silently lose coverage.
+    """
+    summary: dict = {"n": len(diffs)}
+    for feature, live_key, bt_key, delta_key, gate in (
+        ("skew", "live_skew_z", "backtest_skew_z", "skew_delta", PRODUCTION_SKEW_GATE),
+        ("trend", "live_trend_z", "backtest_trend_z", "trend_delta", PRODUCTION_TREND_GATE),
+    ):
+        deltas = [float(d[delta_key]) for d in diffs if d.get(delta_key) is not None]
+        flips = sum(
+            1
+            for d in diffs
+            if d.get(live_key) is not None and d.get(bt_key) is not None
+            and _gate_flip(float(d[live_key]), float(d[bt_key]), gate)
+        )
+        summary[feature] = {
+            "gate": gate,
+            "mean_delta": round(sum(deltas) / len(deltas), 4) if deltas else None,
+            "mean_abs_delta": round(sum(abs(x) for x in deltas) / len(deltas), 4) if deltas else None,
+            "max_abs_delta": round(max(abs(x) for x in deltas), 4) if deltas else None,
+            "gate_flips": flips,
+        }
+    skew = summary["skew"]
+    summary["alert"] = bool(
+        (skew["mean_abs_delta"] or 0.0) > PARITY_MEAN_DELTA_ALERT
+        or skew["gate_flips"] >= PARITY_GATE_FLIPS_ALERT
+    )
+    return summary
 
 
 def _executed_by_tranche(events: List[dict]) -> Dict[datetime, int]:
@@ -522,6 +584,8 @@ def main() -> None:
         "diff_paper_scale": _diff_block(live_summary, paper_bt),
         "diff_normalized_13m": _diff_block(live_summary, norm_bt),
         "tranche_signals": signal_diffs[:50],
+        # Aggregated over ALL matched minutes (not just the 50-row table).
+        "signal_parity": _signal_parity_summary(signal_diffs),
     }
     out_path = LIVE_DIR / args.date / "reconcile.json"
     out_path.write_text(json.dumps(report, indent=2, default=str), encoding="utf-8")
@@ -558,6 +622,22 @@ def main() -> None:
             print(f"{label:9}: unavailable — {bt.get('reason')}")
     if signal_diffs:
         print(f"TRANCHES : {len(signal_diffs)} live tranche rows with replayed trend/skew z-scores")
+        parity = report["signal_parity"]
+        skew = parity["skew"]
+        # ASCII only: the scheduled task logs through a cp1252 console.
+        line = (
+            f"PARITY   : skew mean|d|={skew['mean_abs_delta']} max|d|={skew['max_abs_delta']} "
+            f"gate_flips={skew['gate_flips']} (gate +/-{skew['gate']}) n={parity['n']}"
+        )
+        print(line)
+        if parity["alert"]:
+            # daily_data_update.ps1 greps this token for the post-close alert.
+            print(
+                f"WARNING  : SIGNAL_PARITY_ALERT {args.date} - live skew_z is tracking the "
+                f"backtest badly (mean|d|>{PARITY_MEAN_DELTA_ALERT} or "
+                f"gate_flips>={PARITY_GATE_FLIPS_ALERT}); side selection may diverge. "
+                "See tranche_signals in reconcile.json."
+            )
     print(f"Wrote {out_path}")
 
 

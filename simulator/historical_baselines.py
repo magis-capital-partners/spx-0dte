@@ -16,6 +16,16 @@ DEFAULT_MODEL_DIR = ROOT / "data" / "models"
 
 FEATURES = ["straddle_residual_z", "skew_z", "term_ratio_z", "trend_score", "realized_vs_implied_z"]
 
+# Statistical floor on per-minute std, as a fraction of the feature's global std.
+# Early-session minutes are structurally constant across every training day
+# (trend/straddle at 09:31; realized-vs-implied until 6 spot observations), so
+# their pstdev is exactly 0 and the old 1e-9 divide-by-zero guard turned any
+# nonzero live raw value into a z-score on the order of 1e6 (2026-08-04:
+# realized_vs_implied_z = -1.29M at 09:32). Flooring at 10% of the global std
+# keeps healthy minutes untouched while making degenerate minutes produce
+# finite, meaningful z-scores on both the live and backtest paths.
+STD_FLOOR_FRAC = 0.10
+
 
 def read_csv(path: Path) -> List[dict]:
     with path.open(newline="", encoding="utf-8-sig") as handle:
@@ -81,9 +91,10 @@ def compute_baselines(processed_dir: Path, symbol: str, train_dates: Iterable[st
         for feature in FEATURES:
             series = feature_map.get(feature, [])
             fallback = baselines["global"][feature]
+            std_floor = STD_FLOOR_FRAC * fallback["std"]
             baselines["minutes"][key][feature] = {
                 "mean": mean(series) if series else fallback["mean"],
-                "std": max(pstdev(series), 1e-9) if len(series) > 1 else fallback["std"],
+                "std": max(pstdev(series), std_floor, 1e-9) if len(series) > 1 else fallback["std"],
                 "count": len(series),
             }
     return baselines

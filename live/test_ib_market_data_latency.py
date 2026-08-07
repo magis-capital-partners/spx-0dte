@@ -184,6 +184,81 @@ class TrancheMarketDataLatencyTests(unittest.TestCase):
         )
         self.assertFalse(stream.stop_wake_pending())
 
+    def test_greeks_stamp_advances_only_on_value_change(self) -> None:
+        """A bid tick re-delivering ib_insync's retained modelGreeks must not
+        re-freshen the greeks stamp; a genuine greeks change must."""
+        stream = _stream()
+        contract = SimpleNamespace(right="P", strike=7500.0)
+        key = ("2026-08-03", "PUT", 7500.0)
+
+        stream._update_cache_from_ticker(
+            contract,
+            SimpleNamespace(bid=3.0, ask=3.1, modelGreeks=SimpleNamespace(delta=-0.25, impliedVol=0.21)),
+        )
+        first = stream._cache[key]
+        self.assertGreater(first.greeks_updated_at, 0.0)
+
+        time.sleep(0.005)
+        # Same greeks values (retained object re-delivered on a bid tick).
+        stream._update_cache_from_ticker(
+            contract,
+            SimpleNamespace(bid=3.05, ask=3.15, modelGreeks=SimpleNamespace(delta=-0.25, impliedVol=0.21)),
+        )
+        second = stream._cache[key]
+        self.assertGreater(second.updated_at, first.updated_at)
+        self.assertEqual(second.greeks_updated_at, first.greeks_updated_at)
+
+        time.sleep(0.005)
+        # IV actually moved: the greeks stamp advances.
+        stream._update_cache_from_ticker(
+            contract,
+            SimpleNamespace(bid=3.05, ask=3.15, modelGreeks=SimpleNamespace(delta=-0.25, impliedVol=0.22)),
+        )
+        third = stream._cache[key]
+        self.assertGreater(third.greeks_updated_at, second.greeks_updated_at)
+
+    def test_greeks_dropout_preserves_last_stamp(self) -> None:
+        stream = _stream()
+        contract = SimpleNamespace(right="P", strike=7500.0)
+        key = ("2026-08-03", "PUT", 7500.0)
+        stream._update_cache_from_ticker(
+            contract,
+            SimpleNamespace(bid=3.0, ask=3.1, modelGreeks=SimpleNamespace(delta=-0.25, impliedVol=0.21)),
+        )
+        stamp = stream._cache[key].greeks_updated_at
+        stream._update_cache_from_ticker(
+            contract,
+            SimpleNamespace(bid=3.05, ask=3.15, modelGreeks=None),
+        )
+        cached = stream._cache[key]
+        self.assertIsNone(cached.iv)
+        self.assertEqual(cached.greeks_updated_at, stamp)
+
+    def test_feature_health_reports_greeks_age(self) -> None:
+        stream = _stream()
+        now = time.time()
+        stream._cache = {
+            ("2026-08-03", "CALL", 7500.0): CachedQuote(10.0, 10.2, 0.50, 0.20, now - 0.2, now - 1.0),
+            ("2026-08-03", "PUT", 7500.0): CachedQuote(9.8, 10.0, -0.50, 0.21, now - 0.3, now - 2.0),
+            ("2026-08-03", "CALL", 7525.0): CachedQuote(3.0, 3.1, 0.25, 0.19, now - 0.4, now - 45.0),
+            ("2026-08-03", "PUT", 7475.0): CachedQuote(3.1, 3.2, -0.25, 0.22, now - 0.5, now - 3.0),
+        }
+        health = stream.feature_input_health(
+            7500.0, max_age_seconds=5.0, max_dispersion_seconds=1.0,
+        )
+        # Diagnostics only: stale greeks do NOT fail health...
+        self.assertTrue(health.ok)
+        # ...but the age is reported for telemetry.
+        self.assertAlmostEqual(health.greeks_max_age_seconds, 45.0, delta=1.0)
+
+        # A missing stamp on any selected quote reports inf (unknown).
+        stream._cache[("2026-08-03", "PUT", 7475.0)].greeks_updated_at = 0.0
+        unknown = stream.feature_input_health(
+            7500.0, max_age_seconds=5.0, max_dispersion_seconds=1.0,
+        )
+        self.assertTrue(unknown.ok)
+        self.assertEqual(unknown.greeks_max_age_seconds, float("inf"))
+
     def test_entry_leg_refresh_reads_existing_stream_cache(self) -> None:
         stream = _stream()
         stream._cache = {

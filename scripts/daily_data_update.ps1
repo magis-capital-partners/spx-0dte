@@ -201,6 +201,28 @@ try {
     }
     Write-Log ("Live sessions reconciled: " + $reconciled)
 
+    # Post-reconcile signal-parity alert: reconcile.json carries a
+    # signal_parity block (live-vs-backtest z tracking, gate flips). A day
+    # whose skew_z tracked the backtest badly gets a loud WARNING here so it
+    # is visible in the scheduled-task log without opening the JSON.
+    if (Test-Path $liveRoot) {
+        foreach ($day in $liveDays) {
+            $reconPath = Join-Path (Join-Path $liveRoot $day) "reconcile.json"
+            if (-not (Test-Path $reconPath)) { continue }
+            try {
+                $recon = Get-Content $reconPath -Raw | ConvertFrom-Json
+            } catch { continue }
+            $parity = $recon.signal_parity
+            if ($null -ne $parity -and $parity.alert) {
+                Write-Log ("WARNING SIGNAL_PARITY_ALERT " + $day + `
+                    ": skew mean|d|=" + $parity.skew.mean_abs_delta + `
+                    " max|d|=" + $parity.skew.max_abs_delta + `
+                    " gate_flips=" + $parity.skew.gate_flips + `
+                    " (n=" + $parity.n + ") - side selection may have diverged from backtest")
+            }
+        }
+    }
+
     $doDeploy = $Deploy -and -not $SkipDeploy
     if ($doDeploy) {
         Write-Log "=== Rebuild + deploy dashboard (Pages branch deploy; no Actions minutes) ==="

@@ -75,6 +75,27 @@ def _executor_console_path(today: str) -> Path:
     return session_log
 
 
+def _last_tranche(today: str) -> Optional[dict]:
+    """Latest tranche's signal snapshot for the gate-proximity chip.
+
+    z-scores and the skip reason only — no strikes, safe for the public gist.
+    """
+    lines = _tail_lines(LIVE_DIR / today / "tranches.jsonl", 1)
+    if not lines:
+        return None
+    try:
+        row = json.loads(lines[-1])
+    except json.JSONDecodeError:
+        return None
+    return {
+        "ts": row.get("ts"),
+        "skew_z": row.get("skew_z"),
+        "trend_score": row.get("trend_score"),
+        "skip_reason": row.get("skip_reason") or None,
+        "executed": row.get("executed"),
+    }
+
+
 def _recent_events(today: str, limit: int = 12) -> List[dict]:
     events = load_fills_events(today)
     out: List[dict] = []
@@ -219,6 +240,7 @@ def build_status(*, today: Optional[str] = None) -> Dict[str, Any]:
         "risk": hb.get("risk") or {},
         "risk_history": _risk_history(),
         "recent_events": _recent_events(day),
+        "last_tranche": _last_tranche(day),
         "stdout_path": str(_executor_console_path(day)),
     }
 
@@ -250,6 +272,7 @@ def build_sanitized_cloud_status(*, today: Optional[str] = None) -> Dict[str, An
             if key != "positions"
         },
         "risk_history": full.get("risk_history") or [],
+        "last_tranche": full.get("last_tranche"),
         "last_event": (
             {"ts": last_ev.get("ts"), "event": last_ev.get("event")}
             if last_ev
